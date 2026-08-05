@@ -1,0 +1,25 @@
+pandas>=2.2,<3
+pyarrow>=17,<22             # parquet writer + the Arrow types the ingest lane expects
+openpyxl>=3.1,<4            # .xlsx reader — handles sparse cells correctly (see bathing_water/README.md)
+xlrd>=2.0,<3                # legacy .xls, some older SDI deliveries
+lxml>=5.2,<7                # ISO 19115-3 metadata records
+duckdb>=1.1,<2              # validate parquet with SQL before it ever leaves the machine
+
+# --- geometry: source encoding in, WKB out (see CLAUDE.md) -----------------
+# shapely 2.x only — the from_wkt/from_geojson/to_wkb vectorised API the
+# prepare step uses does not exist in 1.x. No GDAL/geopandas: reading a
+# GeoPackage or GDB companion is a separate, heavier problem than converting a
+# WKT column, and nothing in the repo needs it yet.
+shapely>=2.0,<3
+pyproj>=3.6,<4              # only where a reprojection is a deliberate, documented step
+
+# --- acquire ---------------------------------------------------------------
+requests>=2.32,<3
+httpx>=0.28,<1              # also the dds_ingest dependency
+beautifulsoup4>=4.12,<5     # SDI "direct download" is an HTML landing page, not a file
+tqdm>=4.66,<5
+
+# --- build backend for the mounted dds_ingest source -----------------------
+# Present so the entrypoint can install /opt/dds_ingest offline, with
+# --no-build-isolation, without pip reaching out to PyPI on every start.
+hatchling>=1.25,<2
