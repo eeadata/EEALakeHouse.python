@@ -97,14 +97,14 @@ pytest
 
 1. Update `version` in `pyproject.toml` (e.g. `0.2.0`).
 2. Commit and push to `main`.
-3. Tag the commit and push the tag:
-   ```bash
-   git tag v0.2.0
-   git push origin v0.2.0
-   ```
-4. The `Release` GitHub Actions workflow builds the package and publishes a
-   GitHub Release for the tag, with notes auto-generated from merged PRs since
-   the previous release (categorized via `.github/release.yml`).
+3. The `Release` GitHub Actions workflow runs on every push to `main`: it reads
+   the version from `pyproject.toml`, builds the package, and publishes a
+   `v0.2.0` GitHub Release (creating the matching tag automatically), with
+   notes auto-generated from merged PRs since the previous release
+   (categorized via `.github/release.yml`).
+
+   Pushing to `main` without bumping the version re-publishes the release for
+   the current version with the latest build artifacts.
 
 ## Install in JupyterLab
 
