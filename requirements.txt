@@ -1,4 +1,4 @@
-pandas>=2.2,<3
+#pandas>=2.2,<3
 #pyarrow>=17                 # parquet writer + the Arrow types the ingest lane expects
 openpyxl>=3.1,<4            # .xlsx reader — handles sparse cells correctly (see bathing_water/README.md)
 xlrd>=2.0,<3                # legacy .xls, some older SDI deliveries
