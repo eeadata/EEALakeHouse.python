@@ -3,15 +3,16 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "EEADataLakehouseIngestion"
+name = "EEADataLakehouse"
 version = "0.1.0"
 description = "Data preparation and validation utilities for the EEA data lakehouse ingestion pipeline."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
+license = { text = "EUPL-1.2" }
 authors = [{ name = "EEA Data Hub" }]
 dependencies = [
-    "pandas>=2.2,<3",
-    "pyarrow>=17,<22",           # parquet writer + the Arrow types the ingest lane expects
+    "pandas>=3",
+    "pyarrow>=25",               # parquet writer + the Arrow types the ingest lane expects
     "openpyxl>=3.1,<4",          # .xlsx reader — handles sparse cells correctly (see bathing_water/README.md)
     "xlrd>=2.0,<3",              # legacy .xls, some older SDI deliveries
     "lxml>=5.2,<7",              # ISO 19115-3 metadata records
@@ -29,10 +30,38 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = [
+    "pytest>=7",
+    "ruff>=0.15",
+    "mypy>=2.1",
+    "respx>=0.23",       # mocks httpx for the ingestion test suite
+    "types-tqdm",
+]
 
 [project.urls]
 Repository = "https://github.com/eeadata/EEALakeHouse.python"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = false
+
+[[tool.mypy.overrides]]
+module = ["respx.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
