@@ -1,5 +1,5 @@
-#pandas>=2.2,<3
-#pyarrow>=17                 # parquet writer + the Arrow types the ingest lane expects
+pandas>=3
+pyarrow>=25                 # parquet writer + the Arrow types the ingest lane expects
 openpyxl>=3.1,<4            # .xlsx reader — handles sparse cells correctly (see bathing_water/README.md)
 xlrd>=2.0,<3                # legacy .xls, some older SDI deliveries
 lxml>=5.2,<7                # ISO 19115-3 metadata records
@@ -15,11 +15,6 @@ pyproj>=3.6,<4              # only where a reprojection is a deliberate, documen
 
 # --- acquire ---------------------------------------------------------------
 requests>=2.32,<3
-#httpx>=0.28,<1              # also the dds_ingest dependency
-#beautifulsoup4>=4.12,<5     # SDI "direct download" is an HTML landing page, not a file
-#tqdm>=4.66,<5
-
-# --- build backend for the mounted dds_ingest source -----------------------
-# Present so the entrypoint can install /opt/dds_ingest offline, with
-# --no-build-isolation, without pip reaching out to PyPI on every start.
-hatchling>=1.25,<2
+httpx>=0.28,<1              # also the ingestion (DDS) client dependency
+beautifulsoup4>=4.12,<5     # SDI "direct download" is an HTML landing page, not a file
+tqdm>=4.66,<5
