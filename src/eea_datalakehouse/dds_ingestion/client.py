@@ -62,6 +62,11 @@ class IngestClient:
         # Bearer PAT, applied per-request to DDS calls only (not the S3 upload).
         self._auth_headers = {"Authorization": f"Bearer {creds.password}"}
 
+    def __repr__(self) -> str:
+        # Deliberately omits _auth_headers: printing/logging the client must
+        # never render the Bearer PAT, even via a debugger or unhandled traceback.
+        return f"IngestClient(base_url={self._base_url!r})"
+
     # -- lifecycle --------------------------------------------------------
 
     def close(self) -> None:

@@ -133,6 +133,14 @@ def test_upload_file_multipart_rejects_non_multipart(creds: DremioCreds) -> None
         client.upload_file_multipart(target, b"x")
 
 
+def test_repr_does_not_expose_bearer_token(creds: DremioCreds) -> None:
+    with IngestClient(BASE_URL, creds) as client:
+        rendered = repr(client)
+    assert creds.password not in rendered
+    assert "Bearer" not in rendered
+    assert "Authorization" not in rendered
+
+
 @respx.mock
 def test_commit_returns_table_path(creds: DremioCreds) -> None:
     respx.post(f"{BASE_URL}/api/v1/ingest/commit").mock(
