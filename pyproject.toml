@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "EEA Data Hub" }]
 dependencies = [
-    "pandas>=2.2,<3",
+    #"pandas>=2.2,<3",
     # "pyarrow>=17,<22",         # parquet writer + the Arrow types the ingest lane expects
     "openpyxl>=3.1,<4",          # .xlsx reader — handles sparse cells correctly (see bathing_water/README.md)
     "xlrd>=2.0,<3",              # legacy .xls, some older SDI deliveries
