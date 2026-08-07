@@ -9,8 +9,9 @@ flow for a local folder:
 * show a progress bar (tqdm, degrading gracefully if absent);
 * resume — re-running skips files already uploaded for the session.
 
-The class depends only on :class:`~eea_datalakehouse.dds_ingestion.client.IngestClient`,
-so the HTTP layer can be mocked or swapped in tests.
+The class depends only on
+:class:`~eea_datalakehouse.dds_ingestion.client.IngestClient`, so the HTTP
+layer can be mocked or swapped in tests.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from .client import IngestClient
 from .credentials import DremioCreds, load_base_url, load_creds
@@ -26,8 +28,10 @@ from .models import (
     BeginResult,
     CommitResult,
     DataFormat,
+    EstimateResult,
     FileSpec,
     Intent,
+    StatusResult,
     UploadTarget,
 )
 from .progress import make_progress_bar
@@ -42,15 +46,29 @@ _FORMAT_EXTENSIONS: dict[DataFormat, tuple[str, ...]] = {
 }
 
 
+class IngestStateError(RuntimeError):
+    """An operation was asked for in a state that cannot support it.
+
+    Raised locally, before any HTTP call — e.g. committing a transfer that never
+    began, or retrying one that is still running.
+    """
+
+
 @dataclass(slots=True)
 class IngestOutcome:
-    """Summary returned by :meth:`FolderIngest.run`."""
+    """Summary returned by :meth:`FolderIngest.run` and :meth:`FolderIngest.retry`.
 
-    begin: BeginResult
+    ``begin`` is ``None`` when the transfer was resumed rather than started here
+    (:meth:`FolderIngest.attach` had no ``begin`` of its own to report), and
+    ``resumed`` says which happened.
+    """
+
+    begin: BeginResult | None
     commit: CommitResult
     files_uploaded: int
     files_skipped: int
     etags: dict[str, str] = field(default_factory=dict)
+    resumed: bool = False
 
 
 def scan_folder(folder: Path, data_format: DataFormat) -> list[FileSpec]:
@@ -108,6 +126,11 @@ class FolderIngest:
         self.multipart = multipart
         self.show_progress = show_progress
 
+        # Set once ``begin`` runs (or by ``attach``); the handle every session
+        # command below works from.
+        self._session_id: str | None = None
+        self._begin: BeginResult | None = None
+
         # The client owns the credentials; if the caller did not inject one we
         # build it from the kernel environment. Creds never leave the client.
         if client is not None:
@@ -119,51 +142,192 @@ class FolderIngest:
             self._client = IngestClient(resolved_url, resolved_creds)
             self._owns_client = True
 
+    # -- session handle ---------------------------------------------------
+
+    @property
+    def session_id(self) -> str | None:
+        """Id of the transfer this object is driving, once ``begin`` has run."""
+        return self._session_id
+
+    @classmethod
+    def attach(
+        cls,
+        session_id: str,
+        folder: str | Path,
+        target_catalog_path: str,
+        *,
+        data_format: DataFormat,
+        **kwargs: Any,
+    ) -> FolderIngest:
+        """Bind to an EXISTING session instead of starting a new one.
+
+        For picking a transfer back up in a later kernel — inspect it with
+        :meth:`status`, resume it with :meth:`retry`, or abandon it with
+        :meth:`cancel`. ``folder`` still has to point at the same local data, so
+        a re-upload is possible if the staged copy is gone.
+        """
+        job = cls(folder, target_catalog_path, data_format=data_format, **kwargs)
+        job._session_id = session_id
+        return job
+
+    def close(self) -> None:
+        """Release the HTTP client, if this object created it."""
+        if self._owns_client:
+            self._client.close()
+
+    def __enter__(self) -> FolderIngest:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.close()
+
     # -- orchestration ----------------------------------------------------
 
     def run(self) -> IngestOutcome:
-        """Execute the full begin → upload → commit flow."""
+        """Execute the full begin → upload → commit flow.
 
-        try:
-            files = scan_folder(self.folder, self.data_format)
-            if not files:
-                raise FileNotFoundError(
-                    f"no {self.data_format} files found under {self.folder}"
-                )
-            begin = self._client.begin(
-                target_catalog_path=self.target_catalog_path,
-                intent=self.intent,
-                data_format=self.data_format,
-                conflict_mode=self.conflict_mode,
-                files=files,
-                table_name=self.table_name,
-                idempotency_key=self.idempotency_key,
-                multipart=self.multipart,
+        The client is left open afterwards so the same object can still
+        :meth:`status`, :meth:`retry` or :meth:`cancel` the transfer. Use it as a
+        context manager (or call :meth:`close`) to release it.
+        """
+        begin = self.begin()
+        etags, multipart_etags, uploaded, skipped = self._upload_all(begin)
+        commit = self.commit(multipart_etags=multipart_etags or None)
+        return IngestOutcome(
+            begin=begin,
+            commit=commit,
+            files_uploaded=uploaded,
+            files_skipped=skipped,
+            etags=etags,
+        )
+
+    def begin(self) -> BeginResult:
+        """Open the transfer and get the presigned upload targets (step 1 of 3).
+
+        The server validates the target here — an unauthorised or non-existent
+        catalog folder fails now, before a single byte is uploaded.
+        """
+        files = scan_folder(self.folder, self.data_format)
+        if not files:
+            raise FileNotFoundError(
+                f"no {self.data_format} files found under {self.folder}"
             )
-            etags, multipart_etags, uploaded, skipped = self._upload_all(begin)
-            commit = self._client.commit(
-                session_id=begin.session_id,
-                multipart_etags=multipart_etags or None,
+        begin = self._client.begin(
+            target_catalog_path=self.target_catalog_path,
+            intent=self.intent,
+            data_format=self.data_format,
+            conflict_mode=self.conflict_mode,
+            files=files,
+            table_name=self.table_name,
+            idempotency_key=self.idempotency_key,
+            multipart=self.multipart,
+        )
+        self._session_id = begin.session_id
+        self._begin = begin
+        return begin
+
+    def commit(
+        self, *, multipart_etags: list[dict[str, object]] | None = None
+    ) -> CommitResult:
+        """Finalise the transfer: load the staged files into the table (step 3).
+
+        This is where the Dremio work happens (``CREATE TABLE`` + ``COPY INTO``
+        on a managed catalog), so it is the step most likely to fail — see
+        :meth:`retry`.
+        """
+        if self._session_id is None:
+            raise IngestStateError("no session to commit — call begin() or run() first")
+        return self._client.commit(
+            session_id=self._session_id, multipart_etags=multipart_etags
+        )
+
+    # -- session management -----------------------------------------------
+
+    def status(self) -> StatusResult:
+        """Current server-side state of this transfer."""
+        if self._session_id is None:
+            raise IngestStateError("no session yet — call begin() or run() first")
+        return self._client.get_status(self._session_id)
+
+    def estimate(self) -> EstimateResult:
+        """Row count + size class of the staged data, between upload and commit."""
+        if self._session_id is None:
+            raise IngestStateError("no session yet — call begin() or run() first")
+        return self._client.estimate(self._session_id)
+
+    def cancel(self) -> None:
+        """Abandon this transfer and delete its staged data.
+
+        Does not drop a table an earlier successful commit already created.
+        """
+        if self._session_id is None:
+            raise IngestStateError("no session to cancel")
+        self._client.cancel(self._session_id)
+        self._session_id = None
+
+    def retry(self) -> IngestOutcome:
+        """Re-run this transfer from the step that failed.
+
+        Two cases, decided by the server's own report of where it broke:
+
+        * **The load failed** (``CREATE TABLE`` / ``COPY INTO``) and the staged
+          files were kept — the common case, e.g. Dremio was briefly unavailable
+          or the target folder was fixed afterwards. Only that step re-runs; the
+          upload is NOT repeated.
+        * **Anything else** — the upload never finished, or the failure was one a
+          re-run cannot fix (an unresolved collision, an unreadable file), so the
+          staged copy is gone. A fresh session is opened and the folder is
+          uploaded again. Any ``idempotency_key`` is dropped for that attempt, or
+          the server would just replay the failed session.
+
+        Raises :class:`IngestStateError` if there is nothing to retry — no
+        session, one that is still running, or one that already succeeded.
+        """
+        if self._session_id is None:
+            raise IngestStateError("no session to retry — call run() first")
+        status = self._client.get_status(self._session_id)
+        if status.status == "done":
+            raise IngestStateError(
+                f"transfer {self._session_id} already succeeded; nothing to retry"
             )
+        if status.status in ("pending", "uploading", "committing"):
+            raise IngestStateError(
+                f"transfer {self._session_id} is {status.status}; wait for it to "
+                "finish before retrying"
+            )
+        if status.is_resumable:
+            logger.info("resuming the load step of %s", self._session_id)
+            resumed = self._client.retry(self._session_id)
             return IngestOutcome(
-                begin=begin,
-                commit=commit,
-                files_uploaded=uploaded,
-                files_skipped=skipped,
-                etags=etags,
+                begin=self._begin,
+                commit=CommitResult.from_json(resumed.raw),
+                files_uploaded=0,
+                files_skipped=len(self._begin.s3.uploads) if self._begin else 0,
+                resumed=True,
             )
-        finally:
-            if self._owns_client:
-                self._client.close()
+        # Nothing to resume server-side: start over with a new session, which
+        # means dropping the idempotency key that would replay the failed one.
+        logger.info(
+            "transfer %s cannot be resumed (%s); re-uploading under a new session",
+            self._session_id,
+            status.raw.get("failed_stage") or status.status,
+        )
+        self._session_id = None
+        self._begin = None
+        self.idempotency_key = None
+        return self.run()
 
     # -- upload phase -----------------------------------------------------
 
     def _already_done(self, session_id: str) -> set[str]:
         """Return rel_paths already uploaded for this session (resume support).
 
-        Queries the session status; the server reports ``files_done`` and may
-        list completed rel_paths under ``raw["uploaded"]``. We only skip files
-        the server explicitly names, so resume never wrongly drops a file.
+        Queries the session status and skips only the files the server
+        explicitly names under ``raw["uploaded"]``, so resume never wrongly drops
+        a file. NOTE: the server populates that list for **server-run** transfers
+        (``POST /ingest/folder``); a client-uploaded session reports nothing
+        there, so re-running one uploads every file again (an S3 overwrite of the
+        identical key, which is harmless).
         """
 
         try:
@@ -242,11 +406,15 @@ def ingest_folder(
     data_format: DataFormat,
     **kwargs: object,
 ) -> IngestOutcome:
-    """Convenience wrapper: build a :class:`FolderIngest` and run it."""
+    """Convenience wrapper: build a :class:`FolderIngest`, run it, close it.
 
-    return FolderIngest(
+    One-shot. If the transfer might need a :meth:`FolderIngest.retry`, drive the
+    class directly (ideally as a context manager) so the session handle survives.
+    """
+    with FolderIngest(
         folder,
         target_catalog_path,
         data_format=data_format,
         **kwargs,  # type: ignore[arg-type]
-    ).run()
+    ) as job:
+        return job.run()

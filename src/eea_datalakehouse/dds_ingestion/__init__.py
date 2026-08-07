@@ -1,4 +1,5 @@
-"""Ingestion into DDS (Dremio Document Service), notebook-side (DI-8.4/8.5).
+"""eea_datalakehouse.dds_ingestion — notebook-side client for the Dremio
+Document Service Ingest API.
 
 A generated Jupyter notebook imports :class:`FolderIngest` to transfer a folder
 of data files to S3 (via DDS-issued presigned URLs only) and register it as a
@@ -31,6 +32,7 @@ from .folder import (
     DEFAULT_PARALLELISM,
     FolderIngest,
     IngestOutcome,
+    IngestStateError,
     ingest_folder,
     scan_folder,
 )
@@ -38,10 +40,12 @@ from .models import (
     BeginResult,
     CommitResult,
     DataFormat,
+    EstimateResult,
     FileSpec,
     Intent,
     Progress,
     S3Plan,
+    StageResult,
     StatusResult,
     UploadPart,
     UploadTarget,
@@ -53,15 +57,18 @@ __all__ = [
     "CommitResult",
     "DataFormat",
     "DremioCreds",
+    "EstimateResult",
     "FileSpec",
     "FolderIngest",
     "IngestApiError",
     "IngestClient",
     "IngestOutcome",
+    "IngestStateError",
     "Intent",
     "MissingCredentialsError",
     "Progress",
     "S3Plan",
+    "StageResult",
     "StatusResult",
     "UploadPart",
     "UploadTarget",
