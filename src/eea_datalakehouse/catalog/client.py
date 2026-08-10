@@ -123,6 +123,27 @@ class Catalog:
             self._executor, table_path, idempotency_key=idempotency_key
         )
 
+    def getwikifrom(self, path: str, *, idempotency_key: str) -> str:
+        return operations.getwikifrom(self._catalog_rest, path, idempotency_key=idempotency_key)
+
+    def gettagsfrom(self, path: str, *, idempotency_key: str) -> list[str]:
+        return operations.gettagsfrom(self._catalog_rest, path, idempotency_key=idempotency_key)
+
+    def assignwikito(self, path: str, text: str, *, idempotency_key: str) -> None:
+        return operations.assignwikito(
+            self._catalog_rest, path, text, idempotency_key=idempotency_key
+        )
+
+    def assigntagsto(self, path: str, tags: list[str], *, idempotency_key: str) -> None:
+        return operations.assigntagsto(
+            self._catalog_rest, path, tags, idempotency_key=idempotency_key
+        )
+
+    def deletetags(self, path: str, tags: list[str], *, idempotency_key: str) -> None:
+        return operations.deletetags(
+            self._catalog_rest, path, tags, idempotency_key=idempotency_key
+        )
+
     def retry_pending(self, idempotency_key: str) -> SqlResult | list[Any]:
         return operations.retry_pending(
             self._executor, idempotency_key, catalog_rest=self._catalog_rest

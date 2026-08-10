@@ -134,6 +134,51 @@ def test_retry_pending_delegates_to_operations() -> None:
     ]
 
 
+def test_getwikifrom_delegates_to_operations() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, wikis={"a.b": "# Docs"})
+    catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=fake_rest)
+
+    text = catalog.getwikifrom("a.b", idempotency_key="k")
+
+    assert text == "# Docs"
+
+
+def test_gettagsfrom_delegates_to_operations() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, tags={"a.b": ["pii"]})
+    catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=fake_rest)
+
+    tags = catalog.gettagsfrom("a.b", idempotency_key="k")
+
+    assert tags == ["pii"]
+
+
+def test_assignwikito_delegates_to_operations() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"})
+    catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=fake_rest)
+
+    catalog.assignwikito("a.b", "# New docs", idempotency_key="k")
+
+    assert fake_rest._wikis["a.b"] == "# New docs"
+
+
+def test_assigntagsto_delegates_to_operations() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"})
+    catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=fake_rest)
+
+    catalog.assigntagsto("a.b", ["pii"], idempotency_key="k")
+
+    assert fake_rest._tags["a.b"] == ["pii"]
+
+
+def test_deletetags_delegates_to_operations() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, tags={"a.b": ["pii", "gold"]})
+    catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=fake_rest)
+
+    catalog.deletetags("a.b", ["pii"], idempotency_key="k")
+
+    assert fake_rest._tags["a.b"] == ["gold"]
+
+
 def test_repr_does_not_expose_the_token() -> None:
     catalog = Catalog(BASE_URL, "super-secret-pat")
 
