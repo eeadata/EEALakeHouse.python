@@ -10,3 +10,6 @@ venv/
 .mypy_cache/
 .ruff_cache/
 .claude/
+debugger/
+.env
+.env.*

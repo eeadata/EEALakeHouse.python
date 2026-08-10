@@ -1,16 +1,19 @@
 # EEADataLakehouse
 
-Two main areas of concern and class domains for the EEA data lakehouse:
+Two main class domains for the EEA data lakehouse:
 
-- `eea_datalakehouse.data_preparation` — data acquisition, vocabulary
-  acquisition, data exploration, and transformation to parquet. Each stage is
-  an abstract base class; concrete per-dataset pipelines subclass them since
-  the actual logic varies by dataset and data flow.
 - `eea_datalakehouse.dds_ingestion` — notebook-side client for the Dremio Document
   Service (DDS) Ingest API (DI-8.4/8.5). `FolderIngest` transfers a folder of
   data files to S3 (via DDS-issued presigned URLs only — never an S3 SDK or
   S3 credentials) and registers it as a Dremio table, coordinated entirely
   through the DDS REST API.
+- `eea_datalakehouse.catalog` — Dremio catalog operations once data has
+  landed: promoting a draft table to a version, publishing a version to a
+  consumer view, moving/copying/deleting catalog entries, and listing what's
+  there. Runs over Dremio's REST SQL Jobs API by default, or Arrow Flight SQL
+  opt-in — and treats a stalled call as a Dremio engine cold-starting rather
+  than a failure, so it can be remembered and retried later instead of
+  blocking.
 
 ## Install
 
@@ -21,28 +24,6 @@ pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.0"
 ```
 
 ## Usage
-
-```python
-from pathlib import Path
-
-from eea_datalakehouse.data_preparation import DataValidationError, ParquetTransformer
-
-
-class MyDatasetTransformer(ParquetTransformer):
-    def to_parquet(self, records, destination: Path) -> Path:
-        ...  # dataset-specific parquet write
-
-
-transformer = MyDatasetTransformer(required_fields=["id", "value"])
-
-raw_source = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}]
-records = transformer.prepare(raw_source)
-
-try:
-    transformer.validate(records)
-except DataValidationError as exc:
-    print(f"Invalid data: {exc}")
-```
 
 Dremio credentials are read from the injected kernel env vars `_DREMIO_USER` /
 `_DREMIO_PWD`, and the service URL from `DDS_BASE_URL`. None of these are ever
@@ -66,25 +47,62 @@ print(outcome.commit.table_path, outcome.commit.record_count)
 `run()` performs `begin → upload(all files) → commit`. Re-running the same
 session resumes by skipping files the server reports as already uploaded.
 
-- `prepare(source)` normalizes an iterable of raw records into a list of plain dicts.
-- `validate(records)` checks that every record contains the configured `required_fields`,
-  raising `DataValidationError` on the first invalid record.
-- `to_parquet(records, destination)` is where a concrete subclass writes its own dataset's
-  schema out to parquet.
+```python
+from eea_datalakehouse.catalog import Catalog, EngineStartingError
+
+# base_url/token are Dremio's own (not DDS) — REST by default; set
+# EEA_CATALOG_TRANSPORT=flight in the environment to use Arrow Flight SQL instead.
+catalog = Catalog(DREMIO_BASE_URL, DREMIO_TOKEN)
+
+try:
+    catalog.draft2version(
+        "bwd.draft.bw_assessment", "bwd.versions.v2025_1", idempotency_key="bwd-v2025_1"
+    )
+    catalog.publishversion(
+        "bwd.consumer", "bwd.versions.v2025_1", idempotency_key="bwd-v2025_1-publish"
+    )
+except EngineStartingError:
+    # A cold Dremio engine looks like a stalled call, not a failure — the
+    # attempt is remembered under its idempotency_key; call it again later:
+    catalog.retry_pending("bwd-v2025_1-publish")
+
+info = catalog.gettableitemsfrom("bwd.versions.v2025_1.assessments", idempotency_key="check-1")
+print(info.schema, info.row_count)             # schema + row count, no rows fetched
+
+catalog.gettablesfrom("bwd", idempotency_key="list-1")   # recurses into every subfolder
+```
+
+- `table2view(view_path, source_path)` — the one-time `DROP TABLE` + `CREATE VIEW` transition
+  for a location that started as a physical table (straight off ingest) and is moving to being
+  a view; checks `source_path` exists first, and (by default) creates `view_path`'s containing
+  folder if it's missing.
+- `draft2version(draft_path, version_path)` — promotes a draft table into a permanent version
+  (CTAS; the draft itself is untouched).
+- `publishversion(consumer_view_path, version_path)` — repoints a consumer-facing view at a
+  version (`CREATE OR REPLACE VIEW`, idempotent).
+- `datacopy(source_path, target_path, mode="create"|"replace")` / `datamove(...)` — copy or
+  move a table/view between catalog paths.
+- `deleteview(view_path)` — `DROP VIEW IF EXISTS`.
+- `gettablesfrom(schema_path)` / `gettableitemsfrom(table_path)` — list every table/view under
+  a path (recursively), or get one table's schema and row count without fetching any rows.
+- `retry_pending(idempotency_key)` — re-attempt whatever last stalled on an `EngineStartingError`,
+  using the same arguments it was originally called with.
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
-| `data_preparation/acquisition.py` | `DataAcquirer` — fetch a dataset's raw source data |
-| `data_preparation/vocabulary.py` | `VocabularyLoader` — load the controlled vocabulary to validate against |
-| `data_preparation/exploration.py` | `Explorer` — inspect acquired data before transformation |
-| `data_preparation/transformation.py` | `ParquetTransformer` — prepare/validate/write to parquet |
 | `dds_ingestion/credentials.py` | env-var creds + redacted `DremioCreds` |
 | `dds_ingestion/models.py` | typed request/response models for the DDS ingest contract |
 | `dds_ingestion/client.py` | thin, unit-testable HTTP client (`IngestClient`) |
 | `dds_ingestion/progress.py` | tqdm progress bar with graceful fallback |
 | `dds_ingestion/folder.py` | `FolderIngest` orchestration (scan/parallel/resume) |
+| `catalog/client.py` | `Catalog` — one connection, every operation as a method |
+| `catalog/operations.py` | the operations themselves (table2view, draft2version, ...), as functions taking an executor |
+| `catalog/sql.py` | `SqlExecutor` protocol + REST/Flight implementations, `resolve_executor()` (transport env var) |
+| `catalog/rest.py` | `CatalogRestClient` — Dremio's native `/api/v3/catalog` for folder existence/creation (no SQL equivalent) |
+| `catalog/retry_state.py` | persisted memory of stalled attempts, for `retry_pending()` |
+| `catalog/errors.py` | `CatalogOperationError`, `EngineStartingError` |
 
 ## Development
 
@@ -120,7 +138,7 @@ first on `PATH`. After installing, restart the kernel (**Kernel > Restart
 Kernel...**) so the import below picks up the newly installed package:
 
 ```python
-from eea_datalakehouse.data_preparation import ParquetTransformer
+from eea_datalakehouse.dds_ingestion import FolderIngest
 ```
 
 Alternatively, download the wheel attached to the GitHub Release page for

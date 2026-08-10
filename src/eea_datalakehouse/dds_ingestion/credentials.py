@@ -54,14 +54,13 @@ def load_creds(env: dict[str, str] | None = None) -> DremioCreds:
         Mapping to read from; defaults to :data:`os.environ`. Passing an
         explicit mapping keeps this testable without mutating process state.
     """
-
     source = os.environ if env is None else env
     user = source.get(ENV_USER)
     pwd = source.get(ENV_PWD)
     if not user or not pwd:
         raise MissingCredentialsError(
             f"missing Dremio credentials in environment "
-            f"({ENV_USER}/{ENV_PWD} must both be set)"
+            f"({ENV_USER}/{ENV_PWD} must both be set 11"
         )
     return DremioCreds(username=user, _password=pwd)
 

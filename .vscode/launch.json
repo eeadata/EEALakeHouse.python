@@ -1,0 +1,13 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug src (mocked)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/debugger/debug_run.py",
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}

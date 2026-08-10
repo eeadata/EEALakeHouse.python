@@ -17,11 +17,29 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Read package version
+      - name: Bump patch version (0.{y}.{z} -> 0.{y}.{z+1})
         id: version
         run: |
-          PKG_VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+          NEW_VERSION="$(python3 - <<'PY'
+          import re
+
+          path = "pyproject.toml"
+          text = open(path).read()
+          match = re.search(r'(?m)^version = "(\d+)\.(\d+)\.(\d+)"', text)
+          major, minor, patch = match.groups()
+          new_version = f"{major}.{minor}.{int(patch) + 1}"
+          text = text[: match.start()] + f'version = "{new_version}"' + text[match.end() :]
+          open(path, "w").write(text)
+          print(new_version)
+          PY
+          )"
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml
+          git commit -m "Bump version to $NEW_VERSION [skip ci]"
+          git push
 
       - name: Install build tool
         run: pip install build
