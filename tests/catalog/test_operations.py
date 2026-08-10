@@ -276,3 +276,174 @@ def test_gettablesfrom_engine_starting_is_remembered_and_retryable() -> None:
     fake._fail_on = {}
     fake._rows = [{"TABLE_SCHEMA": "bwd.versions", "TABLE_NAME": "assessments"}]
     assert operations.retry_pending(fake, "k") == ["bwd.versions.assessments"]
+
+
+def test_getwikifrom_returns_the_wiki_text() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, wikis={"a.b": "# Docs"})
+
+    text = operations.getwikifrom(fake_rest, "a.b", idempotency_key="k")
+
+    assert text == "# Docs"
+
+
+def test_getwikifrom_engine_starting_is_remembered_and_retryable(executor) -> None:
+    fake_rest = FakeCatalogRest(
+        raise_on_get_wiki=EngineStartingError("stalled", idempotency_key="k")
+    )
+
+    with pytest.raises(EngineStartingError):
+        operations.getwikifrom(fake_rest, "a.b", idempotency_key="k")
+
+    pending = retry_state.get("k")
+    assert pending is not None
+    assert pending.operation == "getwikifrom"
+    assert pending.params == {"path": "a.b"}
+
+    fake_rest._raise_on_get_wiki = None
+    fake_rest.existing.add("a.b")
+    fake_rest._wikis["a.b"] = "# Docs"
+    # retry_pending's dispatch must not require an `executor` at all for an
+    # operation that never declared one — getwikifrom's first parameter is
+    # `catalog_rest`, not `executor`.
+    assert operations.retry_pending(executor, "k", catalog_rest=fake_rest) == "# Docs"
+
+
+def test_gettagsfrom_returns_the_tags() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, tags={"a.b": ["pii", "reviewed"]})
+
+    tags = operations.gettagsfrom(fake_rest, "a.b", idempotency_key="k")
+
+    assert tags == ["pii", "reviewed"]
+
+
+def test_gettagsfrom_returns_empty_list_when_entity_has_no_tags() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"})
+
+    assert operations.gettagsfrom(fake_rest, "a.b", idempotency_key="k") == []
+
+
+def test_gettagsfrom_raises_when_path_does_not_exist() -> None:
+    fake_rest = FakeCatalogRest()
+
+    with pytest.raises(CatalogOperationError, match="does not exist"):
+        operations.gettagsfrom(fake_rest, "a.missing", idempotency_key="k")
+
+
+def test_gettagsfrom_engine_starting_is_remembered_and_retryable(executor) -> None:
+    fake_rest = FakeCatalogRest(
+        raise_on_get_tags=EngineStartingError("stalled", idempotency_key="k")
+    )
+
+    with pytest.raises(EngineStartingError):
+        operations.gettagsfrom(fake_rest, "a.b", idempotency_key="k")
+
+    pending = retry_state.get("k")
+    assert pending is not None
+    assert pending.operation == "gettagsfrom"
+    assert pending.params == {"path": "a.b"}
+
+    fake_rest._raise_on_get_tags = None
+    fake_rest.existing.add("a.b")
+    fake_rest._tags["a.b"] = ["pii"]
+    assert operations.retry_pending(executor, "k", catalog_rest=fake_rest) == ["pii"]
+
+
+def test_assignwikito_sets_the_wiki() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"})
+
+    operations.assignwikito(fake_rest, "a.b", "# New docs", idempotency_key="k")
+
+    assert fake_rest._wikis["a.b"] == "# New docs"
+
+
+def test_assignwikito_raises_when_path_does_not_exist() -> None:
+    fake_rest = FakeCatalogRest()
+
+    with pytest.raises(CatalogOperationError, match="does not exist"):
+        operations.assignwikito(fake_rest, "a.missing", "text", idempotency_key="k")
+
+
+def test_assignwikito_engine_starting_is_remembered_and_retryable(executor) -> None:
+    fake_rest = FakeCatalogRest(
+        existing={"a.b"}, raise_on_set_wiki=EngineStartingError("stalled", idempotency_key="k")
+    )
+
+    with pytest.raises(EngineStartingError):
+        operations.assignwikito(fake_rest, "a.b", "# New docs", idempotency_key="k")
+
+    pending = retry_state.get("k")
+    assert pending is not None
+    assert pending.operation == "assignwikito"
+    assert pending.params == {"path": "a.b", "text": "# New docs"}
+
+    fake_rest._raise_on_set_wiki = None
+    operations.retry_pending(executor, "k", catalog_rest=fake_rest)
+    assert fake_rest._wikis["a.b"] == "# New docs"
+
+
+def test_assigntagsto_sets_the_tags() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"})
+
+    operations.assigntagsto(fake_rest, "a.b", ["pii", "reviewed"], idempotency_key="k")
+
+    assert fake_rest._tags["a.b"] == ["pii", "reviewed"]
+
+
+def test_assigntagsto_raises_when_path_does_not_exist() -> None:
+    fake_rest = FakeCatalogRest()
+
+    with pytest.raises(CatalogOperationError, match="does not exist"):
+        operations.assigntagsto(fake_rest, "a.missing", ["pii"], idempotency_key="k")
+
+
+def test_assigntagsto_engine_starting_is_remembered_and_retryable(executor) -> None:
+    fake_rest = FakeCatalogRest(
+        existing={"a.b"}, raise_on_set_tags=EngineStartingError("stalled", idempotency_key="k")
+    )
+
+    with pytest.raises(EngineStartingError):
+        operations.assigntagsto(fake_rest, "a.b", ["pii"], idempotency_key="k")
+
+    pending = retry_state.get("k")
+    assert pending is not None
+    assert pending.operation == "assigntagsto"
+    assert pending.params == {"path": "a.b", "tags": ["pii"]}
+
+    fake_rest._raise_on_set_tags = None
+    operations.retry_pending(executor, "k", catalog_rest=fake_rest)
+    assert fake_rest._tags["a.b"] == ["pii"]
+
+
+def test_deletetags_removes_only_the_specified_tags() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, tags={"a.b": ["pii", "reviewed", "gold"]})
+
+    operations.deletetags(fake_rest, "a.b", ["pii", "reviewed"], idempotency_key="k")
+
+    assert fake_rest._tags["a.b"] == ["gold"]
+
+
+def test_deletetags_raises_when_path_does_not_exist() -> None:
+    fake_rest = FakeCatalogRest()
+
+    with pytest.raises(CatalogOperationError, match="does not exist"):
+        operations.deletetags(fake_rest, "a.missing", ["pii"], idempotency_key="k")
+
+
+def test_deletetags_engine_starting_is_remembered_and_retryable(executor) -> None:
+    fake_rest = FakeCatalogRest(
+        existing={"a.b"},
+        tags={"a.b": ["pii", "gold"]},
+        raise_on_set_tags=EngineStartingError("stalled", idempotency_key="k"),
+    )
+
+    with pytest.raises(EngineStartingError):
+        operations.deletetags(fake_rest, "a.b", ["pii"], idempotency_key="k")
+
+    pending = retry_state.get("k")
+    assert pending is not None
+    assert pending.operation == "deletetags"
+    assert pending.params == {"path": "a.b", "tags": ["pii"]}
+
+    fake_rest._raise_on_set_tags = None
+    operations.retry_pending(executor, "k", catalog_rest=fake_rest)
+    assert fake_rest._tags["a.b"] == ["gold"]

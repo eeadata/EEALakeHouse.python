@@ -1,5 +1,6 @@
 """The catalog operations: table2view, draft2version, publishversion,
-datacopy, datamove, deleteview, gettablesfrom, gettableitemsfrom.
+datacopy, datamove, deleteview, gettablesfrom, gettableitemsfrom,
+getwikifrom, gettagsfrom, assignwikito, assigntagsto, deletetags.
 
 Each takes a :class:`~eea_datalakehouse.catalog.sql.SqlExecutor` (REST or
 Flight — the operation doesn't care which) and an `idempotency_key`. On
@@ -38,6 +39,17 @@ relying on this:
   to check/create the view's containing folder — folder creation has no SQL
   or Flight equivalent. Pass ``create_target_folder=False`` if you don't
   have one and know the folder already exists.
+* ``getwikifrom`` / ``gettagsfrom`` / ``assignwikito`` / ``assigntagsto`` are
+  REST-only for the same reason: Dremio wikis/tags have no SQL or Flight
+  equivalent, so they take a ``catalog_rest`` directly rather than a
+  ``SqlExecutor``. ``getwikifrom`` raises if the entity has no wiki at all;
+  ``gettagsfrom`` doesn't — zero tags is normal, only a missing path raises.
+* ``assignwikito``/``assigntagsto`` create the wiki/tags if the entity has
+  none yet, or overwrite them if it already has some — Dremio's
+  collaboration API is versioned for optimistic concurrency, and the exact
+  semantics of that version field are unverified against a real deployment
+  (see rest.py's docstring). ``assigntagsto`` *replaces* the tag set, it
+  doesn't merge with the existing tags.
 """
 
 from __future__ import annotations
@@ -486,6 +498,121 @@ def gettableitemsfrom(
     return TableInfo(schema=schema, row_count=row_count)
 
 
+def getwikifrom(
+    catalog_rest: CatalogRestClient,
+    path: str,
+    *,
+    idempotency_key: str,
+) -> str:
+    """The Dremio wiki text attached to the catalog entity at `path`.
+
+    REST-only (see module docstring) — takes `catalog_rest` directly rather
+    than a `SqlExecutor`. Raises `CatalogOperationError` if `path` doesn't
+    exist or has no wiki.
+    """
+    try:
+        wiki = catalog_rest.get_wiki(path)
+    except EngineStartingError as exc:
+        retry_state.record(idempotency_key, "getwikifrom", path, str(exc), params={"path": path})
+        raise
+    retry_state.clear(idempotency_key)
+    return wiki
+
+
+def gettagsfrom(
+    catalog_rest: CatalogRestClient,
+    path: str,
+    *,
+    idempotency_key: str,
+) -> list[str]:
+    """The Dremio tags attached to the catalog entity at `path`.
+
+    REST-only (see module docstring) — takes `catalog_rest` directly rather
+    than a `SqlExecutor`. Raises `CatalogOperationError` only if `path`
+    itself doesn't exist; an entity with zero tags is a normal state and
+    returns an empty list, not an error (unlike `getwikifrom`).
+    """
+    try:
+        tags = catalog_rest.get_tags(path)
+    except EngineStartingError as exc:
+        retry_state.record(idempotency_key, "gettagsfrom", path, str(exc), params={"path": path})
+        raise
+    retry_state.clear(idempotency_key)
+    return tags
+
+
+def assignwikito(
+    catalog_rest: CatalogRestClient,
+    path: str,
+    text: str,
+    *,
+    idempotency_key: str,
+) -> None:
+    """Create or overwrite the Dremio wiki text on the catalog entity at `path`.
+
+    REST-only (see module docstring) — takes `catalog_rest` directly rather
+    than a `SqlExecutor`. Raises `CatalogOperationError` if `path` doesn't
+    exist.
+    """
+    try:
+        catalog_rest.set_wiki(path, text)
+    except EngineStartingError as exc:
+        retry_state.record(
+            idempotency_key, "assignwikito", path, str(exc), params={"path": path, "text": text}
+        )
+        raise
+    retry_state.clear(idempotency_key)
+
+
+def assigntagsto(
+    catalog_rest: CatalogRestClient,
+    path: str,
+    tags: list[str],
+    *,
+    idempotency_key: str,
+) -> None:
+    """Replace the Dremio tags on the catalog entity at `path` with `tags`.
+
+    REST-only (see module docstring) — takes `catalog_rest` directly rather
+    than a `SqlExecutor`. Raises `CatalogOperationError` if `path` doesn't
+    exist. This *replaces* the tag set — pass the union of old and new tags
+    if you want to keep the existing ones (e.g. via `gettagsfrom` first).
+    """
+    try:
+        catalog_rest.set_tags(path, tags)
+    except EngineStartingError as exc:
+        retry_state.record(
+            idempotency_key, "assigntagsto", path, str(exc), params={"path": path, "tags": tags}
+        )
+        raise
+    retry_state.clear(idempotency_key)
+
+
+def deletetags(
+    catalog_rest: CatalogRestClient,
+    path: str,
+    tags: list[str],
+    *,
+    idempotency_key: str,
+) -> None:
+    """Remove `tags` from the catalog entity at `path`, leaving any others intact.
+
+    REST-only (see module docstring) — fetches the current tag set via
+    `get_tags` and calls `set_tags` with `tags` removed from it, since
+    Dremio's collaboration API has no separate delete-tags endpoint to
+    speak of. Raises `CatalogOperationError` if `path` doesn't exist.
+    """
+    try:
+        remaining = [tag for tag in catalog_rest.get_tags(path) if tag not in tags]
+        catalog_rest.set_tags(path, remaining)
+    except EngineStartingError as exc:
+        retry_state.record(
+            idempotency_key, "deletetags", path, str(exc), params={"path": path, "tags": tags}
+        )
+        raise
+    retry_state.clear(idempotency_key)
+
+
 _OPERATIONS = {
     "table2view": table2view,
     "draft2version": draft2version,
@@ -495,27 +622,40 @@ _OPERATIONS = {
     "deleteview": deleteview,
     "gettablesfrom": gettablesfrom,
     "gettableitemsfrom": gettableitemsfrom,
+    "getwikifrom": getwikifrom,
+    "gettagsfrom": gettagsfrom,
+    "assignwikito": assignwikito,
+    "assigntagsto": assigntagsto,
+    "deletetags": deletetags,
 }
 
 
-def retry_pending(executor: SqlExecutor, idempotency_key: str, **extra: Any) -> SqlResult | list[Any]:
+def retry_pending(
+    executor: SqlExecutor, idempotency_key: str, **extra: Any
+) -> SqlResult | list[Any] | str:
     """Re-attempt whatever `idempotency_key` last stalled on.
 
     Looks up the remembered operation and params (retry_state.get) and
     dispatches back to the same function that recorded it. Raises
     ``KeyError`` if nothing is pending under that key.
 
-    `**extra` (e.g. `catalog_rest=...`) is only forwarded to whichever
-    operation actually declares that parameter — table2view's retry needs
-    `catalog_rest`, draft2version's doesn't, and neither has to know about
-    the other's dependencies. Nothing here is persisted to retry_state:
-    credentials/clients are never JSON-serializable and never should be
-    written to that file.
+    `executor` and `**extra` (e.g. `catalog_rest=...`) are matched to the
+    dispatched operation's parameters *by name*, not position — some
+    operations (getwikifrom) don't take an `executor` at all, so it's only
+    passed when the operation actually declares that parameter. Nothing
+    here is persisted to retry_state: credentials/clients are never
+    JSON-serializable and never should be written to that file.
     """
     pending = retry_state.get(idempotency_key)
     if pending is None:
         raise KeyError(f"no pending operation remembered for {idempotency_key!r}")
     operation = _OPERATIONS[pending.operation]
     accepted = set(inspect.signature(operation).parameters)
-    kwargs = {key: value for key, value in extra.items() if key in accepted}
-    return operation(executor, **pending.params, idempotency_key=idempotency_key, **kwargs)
+    kwargs: dict[str, Any] = dict(pending.params)
+    kwargs["idempotency_key"] = idempotency_key
+    if "executor" in accepted:
+        kwargs["executor"] = executor
+    for key, value in extra.items():
+        if key in accepted:
+            kwargs[key] = value
+    return operation(**kwargs)
