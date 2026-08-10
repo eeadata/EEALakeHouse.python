@@ -5,9 +5,10 @@ dds_ingestion's IngestClient/FolderIngest):
     catalog.draft2version("bwd.draft.bw", "bwd.versions.v1", idempotency_key="bwd-v2025_1")
 
 table2view, draft2version, publishversion, datacopy, datamove, deleteview,
-gettablesfrom, gettableitemsfrom — over REST (the default) or Arrow Flight
-(opt in via EEA_CATALOG_TRANSPORT=flight in .env), with retry-later error
-handling for a Dremio engine that's still starting up.
+gettablesfrom, gettableitemsfrom, getwikifrom, gettagsfrom, assignwikito,
+assigntagsto, deletetags — over REST (the default) or Arrow Flight (opt in
+via EEA_CATALOG_TRANSPORT=flight in .env), with retry-later error handling
+for a Dremio engine that's still starting up.
 
 The module-level functions in `operations` (table2view(executor, ...) etc.)
 are what `Catalog`'s methods delegate to — call them directly if you'd
@@ -20,12 +21,17 @@ from .client import Catalog
 from .errors import CatalogOperationError, EngineStartingError
 from .operations import (
     TableInfo,
+    assigntagsto,
+    assignwikito,
     datacopy,
     datamove,
+    deletetags,
     deleteview,
     draft2version,
     gettableitemsfrom,
     gettablesfrom,
+    gettagsfrom,
+    getwikifrom,
     publishversion,
     retry_pending,
     table2view,
@@ -53,12 +59,17 @@ __all__ = [
     "SqlExecutor",
     "SqlResult",
     "TableInfo",
+    "assigntagsto",
+    "assignwikito",
     "datacopy",
     "datamove",
+    "deletetags",
     "deleteview",
     "draft2version",
     "gettableitemsfrom",
     "gettablesfrom",
+    "gettagsfrom",
+    "getwikifrom",
     "publishversion",
     "resolve_executor",
     "retry_pending",

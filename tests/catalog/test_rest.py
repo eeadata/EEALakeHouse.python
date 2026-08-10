@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
@@ -104,3 +106,275 @@ def test_repr_does_not_expose_the_token() -> None:
 
     assert "super-secret-pat" not in rendered
     assert "Bearer" not in rendered
+
+
+@respx.mock
+def test_get_wiki_looks_up_id_then_fetches_wiki_text() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "entity-123", "path": ["a", "b"]})
+    )
+    respx.get(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/wiki").mock(
+        return_value=httpx.Response(200, json={"text": "# Docs\n\nSome wiki content.", "version": 2})
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    text = client.get_wiki("a.b")
+
+    assert text == "# Docs\n\nSome wiki content."
+
+
+@respx.mock
+def test_get_wiki_raises_when_path_does_not_exist() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/missing").mock(return_value=httpx.Response(404))
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(CatalogOperationError, match="does not exist"):
+        client.get_wiki("a.missing")
+
+
+@respx.mock
+def test_get_wiki_raises_when_entity_has_no_wiki() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "entity-123"})
+    )
+    respx.get(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/wiki").mock(
+        return_value=httpx.Response(404)
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(CatalogOperationError, match="has no wiki"):
+        client.get_wiki("a.b")
+
+
+@respx.mock
+def test_get_wiki_raises_engine_starting_on_wiki_fetch_timeout() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "entity-123"})
+    )
+    respx.get(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/wiki").mock(
+        side_effect=httpx.TimeoutException("t")
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(EngineStartingError):
+        client.get_wiki("a.b")
+
+
+@respx.mock
+def test_get_tags_looks_up_id_then_fetches_tags() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "entity-123"})
+    )
+    respx.get(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/tag").mock(
+        return_value=httpx.Response(200, json={"tags": ["pii", "reviewed"], "version": 1})
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    tags = client.get_tags("a.b")
+
+    assert tags == ["pii", "reviewed"]
+
+
+@respx.mock
+def test_get_tags_raises_when_path_does_not_exist() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/missing").mock(return_value=httpx.Response(404))
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(CatalogOperationError, match="does not exist"):
+        client.get_tags("a.missing")
+
+
+@respx.mock
+def test_get_tags_returns_empty_list_when_no_tag_record_yet() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "entity-123"})
+    )
+    respx.get(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/tag").mock(
+        return_value=httpx.Response(404)
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    # No tags is normal, not an error — unlike get_wiki's "has no wiki" case.
+    assert client.get_tags("a.b") == []
+
+
+@respx.mock
+def test_get_tags_raises_engine_starting_on_tag_fetch_timeout() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "entity-123"})
+    )
+    respx.get(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/tag").mock(
+        side_effect=httpx.TimeoutException("t")
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(EngineStartingError):
+        client.get_tags("a.b")
+
+
+@respx.mock
+def test_set_wiki_creates_new_wiki_on_the_first_try_no_version_field() -> None:
+    # The common case: create succeeds immediately, no GET needed at all.
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "entity-123"})
+    )
+    post_route = respx.post(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/wiki").mock(
+        return_value=httpx.Response(200, json={"text": "# Docs", "version": 0})
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    client.set_wiki("a.b", "# Docs")
+
+    assert post_route.call_count == 1
+    body = json.loads(post_route.calls.last.request.content)
+    assert body == {"text": "# Docs"}
+
+
+@respx.mock
+def test_set_wiki_falls_back_to_update_when_create_is_rejected() -> None:
+    # A wiki already exists (Dremio's GET can answer 200-with-defaults even
+    # when nothing was ever set, so we can't tell from a GET beforehand —
+    # this is confirmed by trying the create and reacting to its failure).
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "entity-123"})
+    )
+    post_route = respx.post(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/wiki").mock(
+        side_effect=[
+            httpx.Response(409, json={"errorMessage": "already exists"}),
+            httpx.Response(200, json={"text": "new text", "version": 4}),
+        ]
+    )
+    respx.get(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/wiki").mock(
+        return_value=httpx.Response(200, json={"text": "old text", "version": 3})
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    client.set_wiki("a.b", "new text")
+
+    assert post_route.call_count == 2
+    first_body = json.loads(post_route.calls[0].request.content)
+    second_body = json.loads(post_route.calls[1].request.content)
+    assert first_body == {"text": "new text"}
+    assert second_body == {"text": "new text", "version": 3}
+
+
+@respx.mock
+def test_set_wiki_raises_when_path_does_not_exist() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/missing").mock(return_value=httpx.Response(404))
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(CatalogOperationError, match="does not exist"):
+        client.set_wiki("a.missing", "text")
+
+
+@respx.mock
+def test_set_wiki_raises_when_the_fallback_retry_also_fails() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "entity-123"})
+    )
+    respx.post(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/wiki").mock(
+        return_value=httpx.Response(500, text="boom")
+    )
+    respx.get(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/wiki").mock(
+        return_value=httpx.Response(404)
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(CatalogOperationError):
+        client.set_wiki("a.b", "text")
+
+
+@respx.mock
+def test_set_wiki_raises_engine_starting_on_first_post_timeout() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "entity-123"})
+    )
+    respx.post(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/wiki").mock(
+        side_effect=httpx.TimeoutException("t")
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(EngineStartingError):
+        client.set_wiki("a.b", "text")
+
+
+@respx.mock
+def test_set_tags_creates_new_tag_record_on_the_first_try_no_version_field() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "entity-123"})
+    )
+    post_route = respx.post(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/tag").mock(
+        return_value=httpx.Response(200, json={"tags": ["pii"], "version": 0})
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    client.set_tags("a.b", ["pii"])
+
+    assert post_route.call_count == 1
+    body = json.loads(post_route.calls.last.request.content)
+    assert body == {"tags": ["pii"]}
+
+
+@respx.mock
+def test_set_tags_falls_back_to_update_when_create_is_rejected() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "entity-123"})
+    )
+    post_route = respx.post(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/tag").mock(
+        side_effect=[
+            httpx.Response(409, json={"errorMessage": "already exists"}),
+            httpx.Response(200, json={"tags": ["pii", "reviewed"], "version": 3}),
+        ]
+    )
+    respx.get(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/tag").mock(
+        return_value=httpx.Response(200, json={"tags": ["pii"], "version": 2})
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    client.set_tags("a.b", ["pii", "reviewed"])
+
+    assert post_route.call_count == 2
+    first_body = json.loads(post_route.calls[0].request.content)
+    second_body = json.loads(post_route.calls[1].request.content)
+    assert first_body == {"tags": ["pii", "reviewed"]}
+    assert second_body == {"tags": ["pii", "reviewed"], "version": 2}
+
+
+@respx.mock
+def test_set_tags_raises_when_path_does_not_exist() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/missing").mock(return_value=httpx.Response(404))
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(CatalogOperationError, match="does not exist"):
+        client.set_tags("a.missing", ["pii"])
+
+
+@respx.mock
+def test_set_tags_raises_when_the_fallback_retry_also_fails() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "entity-123"})
+    )
+    respx.post(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/tag").mock(
+        return_value=httpx.Response(500, text="boom")
+    )
+    respx.get(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/tag").mock(
+        return_value=httpx.Response(404)
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(CatalogOperationError):
+        client.set_tags("a.b", ["pii"])
+
+
+@respx.mock
+def test_set_tags_raises_engine_starting_on_first_post_timeout() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "entity-123"})
+    )
+    respx.post(f"{BASE_URL}/api/v3/catalog/entity-123/collaboration/tag").mock(
+        side_effect=httpx.TimeoutException("t")
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(EngineStartingError):
+        client.set_tags("a.b", ["pii"])
