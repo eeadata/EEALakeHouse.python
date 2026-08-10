@@ -72,12 +72,65 @@ class FakeCatalogRest:
     should succeed rather than raise on a missing space.
     """
 
-    def __init__(self, existing: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        existing: set[str] | None = None,
+        wikis: dict[str, str] | None = None,
+        tags: dict[str, list[str]] | None = None,
+        raise_on_get_wiki: Exception | None = None,
+        raise_on_get_tags: Exception | None = None,
+        raise_on_set_wiki: Exception | None = None,
+        raise_on_set_tags: Exception | None = None,
+    ) -> None:
         self.existing = set(existing or set())
         self.created: list[str] = []
+        self._wikis = dict(wikis or {})
+        self._tags = dict(tags or {})
+        self._raise_on_get_wiki = raise_on_get_wiki
+        self._raise_on_get_tags = raise_on_get_tags
+        self._raise_on_set_wiki = raise_on_set_wiki
+        self._raise_on_set_tags = raise_on_set_tags
 
     def exists(self, path: str) -> bool:
         return path in self.existing
+
+    def get_wiki(self, path: str) -> str:
+        from eea_datalakehouse.catalog.errors import CatalogOperationError
+
+        if self._raise_on_get_wiki is not None:
+            raise self._raise_on_get_wiki
+        if path not in self.existing:
+            raise CatalogOperationError(f"{path!r} does not exist")
+        if path not in self._wikis:
+            raise CatalogOperationError(f"{path!r} has no wiki")
+        return self._wikis[path]
+
+    def get_tags(self, path: str) -> list[str]:
+        from eea_datalakehouse.catalog.errors import CatalogOperationError
+
+        if self._raise_on_get_tags is not None:
+            raise self._raise_on_get_tags
+        if path not in self.existing:
+            raise CatalogOperationError(f"{path!r} does not exist")
+        return self._tags.get(path, [])
+
+    def set_wiki(self, path: str, text: str) -> None:
+        from eea_datalakehouse.catalog.errors import CatalogOperationError
+
+        if self._raise_on_set_wiki is not None:
+            raise self._raise_on_set_wiki
+        if path not in self.existing:
+            raise CatalogOperationError(f"{path!r} does not exist")
+        self._wikis[path] = text
+
+    def set_tags(self, path: str, tags: list[str]) -> None:
+        from eea_datalakehouse.catalog.errors import CatalogOperationError
+
+        if self._raise_on_set_tags is not None:
+            raise self._raise_on_set_tags
+        if path not in self.existing:
+            raise CatalogOperationError(f"{path!r} does not exist")
+        self._tags[path] = list(tags)
 
     def ensure_folder_path(self, path: str) -> list[str]:
         from eea_datalakehouse.catalog.errors import CatalogOperationError
