@@ -69,12 +69,16 @@ class FakeCatalogRest:
 
     `existing` seeds which dot-paths already "exist" — include the
     space/source segment (e.g. "a") if a test's ensure_folder_path call
-    should succeed rather than raise on a missing space.
+    should succeed rather than raise on a missing space. `folders` seeds
+    which of those paths are specifically folders (for `is_folder`) —
+    independent of `existing`, since a real entity could be a table/view
+    instead.
     """
 
     def __init__(
         self,
         existing: set[str] | None = None,
+        folders: set[str] | None = None,
         wikis: dict[str, str] | None = None,
         tags: dict[str, list[str]] | None = None,
         raise_on_get_wiki: Exception | None = None,
@@ -83,6 +87,7 @@ class FakeCatalogRest:
         raise_on_set_tags: Exception | None = None,
     ) -> None:
         self.existing = set(existing or set())
+        self.folders = set(folders or set())
         self.created: list[str] = []
         self._wikis = dict(wikis or {})
         self._tags = dict(tags or {})
@@ -93,6 +98,9 @@ class FakeCatalogRest:
 
     def exists(self, path: str) -> bool:
         return path in self.existing
+
+    def is_folder(self, path: str) -> bool:
+        return path in self.folders
 
     def get_wiki(self, path: str) -> str:
         from eea_datalakehouse.catalog.errors import CatalogOperationError
@@ -146,6 +154,7 @@ class FakeCatalogRest:
             current = f"{walked}.{name}"
             if current not in self.existing:
                 self.existing.add(current)
+                self.folders.add(current)
                 self.created.append(current)
                 created.append(current)
             walked = current

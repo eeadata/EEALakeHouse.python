@@ -6,7 +6,7 @@ import pytest
 
 from eea_datalakehouse.catalog import Catalog, retry_state
 from eea_datalakehouse.catalog.rest import CatalogRestClient
-from eea_datalakehouse.catalog.sql import RestSqlExecutor
+from eea_datalakehouse.catalog.sql import FlightSqlExecutor, RestSqlExecutor
 
 from .conftest import FakeCatalogRest, FakeExecutor
 
@@ -27,12 +27,29 @@ def test_injected_executor_is_used_directly() -> None:
     assert fake.statements == ['CREATE TABLE "a"."v1" AS SELECT * FROM "a"."draft"']
 
 
-def test_without_injected_executor_resolves_via_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("EEA_CATALOG_TRANSPORT", raising=False)
+def test_without_injected_executor_builds_a_real_rest_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Fixed, not env-var-driven — even EEA_CATALOG_TRANSPORT=flight must not
+    # change self._executor (only datacopy/datamove go over Flight).
+    monkeypatch.setenv("EEA_CATALOG_TRANSPORT", "flight")
 
     catalog = Catalog(BASE_URL, "pat")
 
     assert isinstance(catalog._executor, RestSqlExecutor)
+
+
+def test_without_injected_flight_executor_builds_a_real_flight_executor() -> None:
+    catalog = Catalog(BASE_URL, "pat")
+
+    assert isinstance(catalog._flight_executor, FlightSqlExecutor)
+    assert catalog._flight_executor._username is None
+
+
+def test_username_is_threaded_through_to_the_flight_executor() -> None:
+    catalog = Catalog(BASE_URL, "pat", username="alice")
+
+    assert catalog._flight_executor._username == "alice"
 
 
 def test_without_injected_catalog_rest_builds_a_real_one() -> None:
@@ -80,14 +97,32 @@ def test_deleteview_delegates_to_operations() -> None:
 
 
 def test_datacopy_replace_mode_delegates_correctly() -> None:
-    fake = FakeExecutor()
-    catalog = Catalog(BASE_URL, "pat", executor=fake)
+    # datacopy always goes over the flight executor, not the REST one.
+    fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+    catalog = Catalog(BASE_URL, "pat", flight_executor=fake, catalog_rest=FakeCatalogRest())
 
     catalog.datacopy("a.src", "a.dst", mode="replace", idempotency_key="k")
 
     assert fake.statements == [
+        'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
+        "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'src'",
         'DROP TABLE IF EXISTS "a"."dst"',
         'CREATE TABLE "a"."dst" AS SELECT * FROM "a"."src"',
+    ]
+
+
+def test_datamove_delegates_correctly() -> None:
+    # datamove always goes over the flight executor, not the REST one.
+    fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+    catalog = Catalog(BASE_URL, "pat", flight_executor=fake, catalog_rest=FakeCatalogRest())
+
+    catalog.datamove("a.src", "a.dst", entry_type="TABLE", idempotency_key="k")
+
+    assert fake.statements == [
+        'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
+        "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'src'",
+        'CREATE TABLE "a"."dst" AS SELECT * FROM "a"."src"',
+        'DROP TABLE "a"."src"',
     ]
 
 
@@ -132,6 +167,47 @@ def test_retry_pending_delegates_to_operations() -> None:
     assert fake.statements == [
         'CREATE OR REPLACE VIEW "a"."consumer" AS SELECT * FROM "a"."v2"',
     ]
+
+
+def test_retry_pending_routes_datamove_back_through_the_flight_executor() -> None:
+    rest_fake = FakeExecutor()  # must stay untouched — datamove never uses REST
+    flight_fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+    catalog = Catalog(
+        BASE_URL,
+        "pat",
+        executor=rest_fake,
+        flight_executor=flight_fake,
+        catalog_rest=FakeCatalogRest(),
+    )
+    retry_state.record(
+        "k",
+        "datamove",
+        "a.dst",
+        "earlier failure",
+        params={
+            "source_path": "a.src",
+            "target_path": "a.dst",
+            "entry_type": "TABLE",
+            "create_target_folder": False,
+        },
+    )
+
+    catalog.retry_pending("k")
+
+    assert flight_fake.statements == [
+        'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
+        "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'src'",
+        'CREATE TABLE "a"."dst" AS SELECT * FROM "a"."src"',
+        'DROP TABLE "a"."src"',
+    ]
+    assert rest_fake.statements == []
+
+
+def test_retry_pending_raises_when_nothing_is_pending() -> None:
+    catalog = Catalog(BASE_URL, "pat")
+
+    with pytest.raises(KeyError):
+        catalog.retry_pending("no-such-key")
 
 
 def test_getwikifrom_delegates_to_operations() -> None:
@@ -185,3 +261,53 @@ def test_repr_does_not_expose_the_token() -> None:
     rendered = repr(catalog)
 
     assert "super-secret-pat" not in rendered
+
+
+class _Closeable:
+    def __init__(self) -> None:
+        self.closed = 0
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def test_close_delegates_to_executor_and_catalog_rest_and_is_idempotent() -> None:
+    executor = _Closeable()
+    catalog_rest = _Closeable()
+    catalog = Catalog(BASE_URL, "pat", executor=executor, catalog_rest=catalog_rest)
+
+    catalog.close()
+    catalog.close()  # second call is a no-op
+
+    assert executor.closed == 1
+    assert catalog_rest.closed == 1
+
+
+def test_close_ignores_objects_without_a_close_method() -> None:
+    catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=FakeCatalogRest())
+
+    catalog.close()  # must not raise, even though the fakes have no close()
+
+
+def test_context_manager_closes_on_exit() -> None:
+    executor = _Closeable()
+
+    with Catalog(BASE_URL, "pat", executor=executor, catalog_rest=_Closeable()) as catalog:
+        assert isinstance(catalog, Catalog)
+
+    assert executor.closed == 1
+
+
+def test_close_all_open_catalogs_closes_every_registered_instance() -> None:
+    from eea_datalakehouse.catalog.client import _close_all_open_catalogs
+
+    a_executor, b_executor = _Closeable(), _Closeable()
+    a = Catalog(BASE_URL, "pat", executor=a_executor, catalog_rest=_Closeable())
+    b = Catalog(BASE_URL, "pat", executor=b_executor, catalog_rest=_Closeable())
+
+    _close_all_open_catalogs()
+
+    assert a_executor.closed == 1
+    assert b_executor.closed == 1
+    assert a._closed is True
+    assert b._closed is True
