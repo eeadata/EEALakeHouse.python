@@ -49,6 +49,54 @@ def test_exists_raises_engine_starting_on_timeout() -> None:
 
 
 @respx.mock
+def test_is_folder_true_for_a_folder_entity() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"entityType": "folder"})
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert client.is_folder("a.b") is True
+
+
+@respx.mock
+def test_is_folder_false_for_a_non_folder_entity() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"entityType": "dataset"})
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert client.is_folder("a.b") is False
+
+
+@respx.mock
+def test_is_folder_false_on_404() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/missing").mock(return_value=httpx.Response(404))
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert client.is_folder("a.missing") is False
+
+
+@respx.mock
+def test_is_folder_false_on_a_broken_by_path_lookup_rather_than_raising() -> None:
+    # The real error this project hit: a Dremio source type whose by-path
+    # lookup rejects nested items with a 400, not a 404.
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/catalog/deep/nested").mock(
+        return_value=httpx.Response(
+            400,
+            json={
+                "errorMessage": (
+                    "Can not get internal item from non-filesystem source [catalog] "
+                    "of type [com.dremio.plugins.dremiocatalog.store.DremioCatalogLocalPlugin]"
+                )
+            },
+        )
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert client.is_folder("catalog.deep.nested") is False
+
+
+@respx.mock
 def test_ensure_folder_path_raises_when_space_missing() -> None:
     respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a").mock(return_value=httpx.Response(404))
     client = CatalogRestClient(BASE_URL, "pat")
@@ -60,17 +108,19 @@ def test_ensure_folder_path_raises_when_space_missing() -> None:
 @respx.mock
 def test_ensure_folder_path_creates_only_missing_levels() -> None:
     respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a").mock(return_value=httpx.Response(200, json={}))
-    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(return_value=httpx.Response(200, json={}))
-    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b/c").mock(return_value=httpx.Response(404))
-    create_route = respx.post(f"{BASE_URL}/api/v3/catalog").mock(
-        return_value=httpx.Response(201, json={})
-    )
+
+    def create_response(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        # "a.b" already there (409); "a.b.c" is genuinely new (201).
+        return httpx.Response(409 if body["path"] == ["a", "b"] else 201, json={})
+
+    create_route = respx.post(f"{BASE_URL}/api/v3/catalog").mock(side_effect=create_response)
 
     client = CatalogRestClient(BASE_URL, "pat")
     created = client.ensure_folder_path("a.b.c")
 
     assert created == ["a.b.c"]
-    assert create_route.call_count == 1
+    assert create_route.call_count == 2
     body = create_route.calls.last.request.content
     assert b'"folder"' in body
     assert b'"c"' in body
@@ -79,7 +129,7 @@ def test_ensure_folder_path_creates_only_missing_levels() -> None:
 @respx.mock
 def test_ensure_folder_path_returns_empty_when_everything_exists() -> None:
     respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a").mock(return_value=httpx.Response(200, json={}))
-    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(return_value=httpx.Response(200, json={}))
+    respx.post(f"{BASE_URL}/api/v3/catalog").mock(return_value=httpx.Response(409))
     client = CatalogRestClient(BASE_URL, "pat")
 
     created = client.ensure_folder_path("a.b")
@@ -90,13 +140,32 @@ def test_ensure_folder_path_returns_empty_when_everything_exists() -> None:
 @respx.mock
 def test_create_folder_tolerates_409_already_exists() -> None:
     respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a").mock(return_value=httpx.Response(200, json={}))
-    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(return_value=httpx.Response(404))
     respx.post(f"{BASE_URL}/api/v3/catalog").mock(return_value=httpx.Response(409))
     client = CatalogRestClient(BASE_URL, "pat")
 
     created = client.ensure_folder_path("a.b")  # must not raise
 
-    assert created == ["a.b"]
+    assert created == []
+
+
+@respx.mock
+def test_ensure_folder_path_does_not_depend_on_by_path_lookups_for_nested_levels() -> None:
+    # Reproduces the real failure: this Dremio source type answers nested
+    # by-path GETs with 400 ("Can not get internal item from non-filesystem
+    # source ... DremioCatalogLocalPlugin"), not 404 — ensure_folder_path
+    # must not need that lookup to succeed for levels under the space/source.
+    # No by-path/a/b or by-path/a/b/c route is mocked at all: if the code
+    # tried to call either, respx would fail this test on its own.
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a").mock(return_value=httpx.Response(200, json={}))
+    create_route = respx.post(f"{BASE_URL}/api/v3/catalog").mock(
+        return_value=httpx.Response(201, json={})
+    )
+
+    client = CatalogRestClient(BASE_URL, "pat")
+    created = client.ensure_folder_path("a.b.c")
+
+    assert created == ["a.b", "a.b.c"]
+    assert create_route.call_count == 2
 
 
 def test_repr_does_not_expose_the_token() -> None:

@@ -70,6 +70,29 @@ class CatalogRestClient:
         """Whether `path` (dot-separated) is any entity in the catalog."""
         return self._lookup_by_path(path) is not None
 
+    def is_folder(self, path: str) -> bool:
+        """Whether `path` names an existing folder — not a table/view/space/source.
+
+        Used by `datacopy`/`datamove` to decide whether a `target_path`
+        that names a folder should have the source's own name appended to
+        it (`cp source dest/` semantics), rather than being taken literally
+        as the new table/view name.
+
+        Best-effort: some Dremio source types (its own internal
+        Arctic/Nessie-backed catalog sources, seen in practice as
+        "Can not get internal item from non-filesystem source ... of type
+        [com.dremio.plugins.dremiocatalog.store.DremioCatalogLocalPlugin]")
+        reject by-path lookups into nested items outright — a 400, not a
+        404 — rather than answering "not found". This convenience can't
+        tell that apart from "doesn't exist", so any lookup failure here
+        is treated the same as "not a folder", never raised.
+        """
+        try:
+            entity = self._lookup_by_path(path)
+        except CatalogOperationError:
+            return False
+        return entity is not None and entity.get("entityType") == "folder"
+
     def get_wiki(self, path: str) -> str:
         """The Dremio wiki text attached to the catalog entity at `path`.
 
@@ -206,7 +229,9 @@ class CatalogRestClient:
                 f"could not set tags for {path!r} ({retry.status_code}): {retry.text[:300]}"
             )
 
-    def _create_folder(self, path: str) -> None:
+    def _create_folder(self, path: str) -> bool:
+        """POST `path` into existence. Returns whether it was newly created
+        (False on 409 — it was already there)."""
         try:
             resp = self._http.post(
                 f"{self._base_url}/api/v3/catalog",
@@ -215,15 +240,29 @@ class CatalogRestClient:
             )
         except httpx.TimeoutException as exc:
             raise EngineStartingError(f"creating folder {path!r} timed out") from exc
-        # 409: someone else created it first between our exists() check and
-        # this call — the post-condition ("it exists now") still holds.
+        # 409: it was already there (either from before this call, or a
+        # concurrent creation) — the post-condition ("it exists now") still
+        # holds either way.
         if resp.status_code not in (200, 201, 409):
             raise CatalogOperationError(
                 f"could not create folder {path!r} ({resp.status_code}): {resp.text[:300]}"
             )
+        return resp.status_code != 409
 
     def ensure_folder_path(self, path: str) -> list[str]:
-        """Create every missing folder level of `path`. Returns the levels created.
+        """Create every missing folder level of `path`. Returns the levels
+        actually created (not the ones that were already there).
+
+        Attempts creation directly for every nested level rather than
+        checking existence first — some Dremio source types (its own
+        internal Arctic/Nessie-backed catalog sources) reject by-path
+        *lookups* into nested items outright (400, not 404) even though
+        folder *creation* still works there (see `is_folder`'s docstring
+        for the exact error). Create-and-tolerate-409-already-there
+        sidesteps needing a working existence check at all for these
+        levels — it costs one extra POST per level that already existed,
+        which is the trade worth making since the alternative is failing
+        outright against a source where the check itself is broken.
 
         The first (leftmost) segment — the Dremio space/source itself — is
         required to already exist and is never created here; only the
@@ -244,8 +283,7 @@ class CatalogRestClient:
         created: list[str] = []
         for name in segments[1:]:
             current = f"{walked}.{name}"
-            if not self.exists(current):
-                self._create_folder(current)
+            if self._create_folder(current):
                 created.append(current)
             walked = current
         return created
