@@ -1,12 +1,15 @@
-"""Dremio's own REST Catalog API (v3) — used for folder existence/creation
-and for reading an entity's wiki/tags, none of which have a SQL or Flight
-equivalent (this is the one place in `catalog` that isn't transport-agnostic
-through SqlExecutor).
+"""Dremio's own REST Catalog API (v3) — used for folder existence/creation/
+deletion and for reading an entity's wiki/tags, none of which have a SQL or
+Flight equivalent (this is the one place in `catalog` that isn't
+transport-agnostic through SqlExecutor).
 
 Unverified against a real Dremio deployment: the v3 catalog API's by-path
-lookup, folder-creation, and wiki/tag-collaboration request/response shapes
-here are inferred from Dremio's documented API, not confirmed against this
-project's own instance — check this against a real call before relying on it.
+lookup, folder-creation, wiki/tag-collaboration, and folder-deletion
+request/response shapes here are inferred from Dremio's documented API, not
+confirmed against this project's own instance — check this against a real
+call before relying on it. `delete_folder`'s cascade path in particular
+assumes a container child's JSON carries ``type="CONTAINER"`` /
+``containerType="FOLDER"`` the way Dremio's docs describe it.
 """
 
 from __future__ import annotations
@@ -229,7 +232,7 @@ class CatalogRestClient:
                 f"could not set tags for {path!r} ({retry.status_code}): {retry.text[:300]}"
             )
 
-    def _create_folder(self, path: str) -> bool:
+    def create_folder(self, path: str) -> bool:
         """POST `path` into existence. Returns whether it was newly created
         (False on 409 — it was already there)."""
         try:
@@ -283,7 +286,69 @@ class CatalogRestClient:
         created: list[str] = []
         for name in segments[1:]:
             current = f"{walked}.{name}"
-            if self._create_folder(current):
+            if self.create_folder(current):
                 created.append(current)
             walked = current
         return created
+
+    @staticmethod
+    def _child_is_folder(child: dict[str, Any]) -> bool:
+        # Unverified against a real deployment (same caveat as the module
+        # docstring): a container child is assumed to carry
+        # containerType="FOLDER" the way Dremio's documented catalog API
+        # describes it.
+        return (
+            str(child.get("type", "")).upper() == "CONTAINER"
+            and str(child.get("containerType", "")).upper() == "FOLDER"
+        )
+
+    def _delete_entity(self, entity_id: str, *, what: str) -> None:
+        try:
+            resp = self._http.delete(
+                f"{self._base_url}/api/v3/catalog/{entity_id}", headers=self._headers
+            )
+        except httpx.TimeoutException as exc:
+            raise EngineStartingError(f"deleting {what} timed out") from exc
+        # 404: already gone (a concurrent delete, or a retry after a prior
+        # attempt whose response we never saw) — the post-condition ("it's
+        # gone") still holds either way.
+        if resp.status_code not in (200, 204, 404):
+            raise CatalogOperationError(
+                f"could not delete {what} ({resp.status_code}): {resp.text[:300]}"
+            )
+
+    def delete_folder(self, path: str, *, cascade: bool = False) -> None:
+        """Delete the folder at `path`. Idempotent — a folder that's
+        already gone is not an error, same as `deleteview`'s
+        ``DROP VIEW IF EXISTS``.
+
+        `cascade=False` (the default) raises `CatalogOperationError` if the
+        folder still has contents — `rmdir` vs `rm -r`. `cascade=True`
+        deletes every table/view and subfolder inside first, depth-first
+        (each straight through this same catalog API — Dremio supports
+        deleting a dataset by id here too, not just via SQL DROP), then the
+        folder itself.
+        """
+        entity = self._lookup_by_path(path)
+        if entity is None:
+            return
+        if entity.get("entityType") != "folder":
+            raise CatalogOperationError(f"{path!r} is not a folder")
+
+        children = entity.get("children") or []
+        if children and not cascade:
+            raise CatalogOperationError(
+                f"folder {path!r} is not empty — pass cascade=True to delete its "
+                "contents and subfolders too"
+            )
+        if cascade:
+            for child in children:
+                child_path = ".".join(child.get("path") or [])
+                if not child_path:
+                    continue
+                if self._child_is_folder(child):
+                    self.delete_folder(child_path, cascade=True)
+                else:
+                    self._delete_entity(child["id"], what=f"{child_path!r}")
+
+        self._delete_entity(entity["id"], what=f"folder {path!r}")

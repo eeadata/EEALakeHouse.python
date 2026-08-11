@@ -793,3 +793,130 @@ def test_deletetags_engine_starting_is_remembered_and_retryable(executor) -> Non
     fake_rest._raise_on_set_tags = None
     operations.retry_pending(executor, "k", catalog_rest=fake_rest)
     assert fake_rest._tags["a.b"] == ["gold"]
+
+
+def test_createfolder_creates_leaf_when_parent_exists() -> None:
+    fake_rest = FakeCatalogRest(existing={"a", "a.b"})
+
+    operations.createfolder(fake_rest, "a.b.c", idempotency_key="k")
+
+    assert fake_rest.created == ["a.b.c"]
+    assert "a.b.c" in fake_rest.folders
+
+
+def test_createfolder_is_idempotent_when_leaf_already_exists() -> None:
+    fake_rest = FakeCatalogRest(existing={"a", "a.b"}, folders={"a.b"})
+
+    operations.createfolder(fake_rest, "a.b", idempotency_key="k")
+
+    assert fake_rest.created == []
+
+
+def test_createfolder_raises_when_parent_missing_and_not_creating_parents() -> None:
+    fake_rest = FakeCatalogRest(existing={"a"})  # "a.b" not there
+
+    with pytest.raises(CatalogOperationError, match="does not exist"):
+        operations.createfolder(fake_rest, "a.b.c", idempotency_key="k")
+
+    assert fake_rest.created == []
+
+
+def test_createfolder_raises_when_path_has_no_parent() -> None:
+    fake_rest = FakeCatalogRest()
+
+    with pytest.raises(CatalogOperationError, match="no parent"):
+        operations.createfolder(fake_rest, "a", idempotency_key="k")
+
+
+def test_createfolder_create_parents_creates_every_missing_level() -> None:
+    fake_rest = FakeCatalogRest(existing={"a"})
+
+    operations.createfolder(fake_rest, "a.b.c", create_parents=True, idempotency_key="k")
+
+    assert fake_rest.created == ["a.b", "a.b.c"]
+
+
+def test_createfolder_engine_starting_is_remembered_and_retryable(executor) -> None:
+    fake_rest = FakeCatalogRest(
+        existing={"a", "a.b"},
+        raise_on_create_folder=EngineStartingError("stalled", idempotency_key="k"),
+    )
+
+    with pytest.raises(EngineStartingError):
+        operations.createfolder(fake_rest, "a.b.c", idempotency_key="k")
+
+    pending = retry_state.get("k")
+    assert pending is not None
+    assert pending.operation == "createfolder"
+    assert pending.params == {"path": "a.b.c", "create_parents": False}
+
+    fake_rest._raise_on_create_folder = None
+    operations.retry_pending(executor, "k", catalog_rest=fake_rest)
+    assert fake_rest.created == ["a.b.c"]
+
+
+def test_deletefolder_deletes_an_empty_folder() -> None:
+    fake_rest = FakeCatalogRest(existing={"a", "a.b"}, folders={"a.b"})
+
+    operations.deletefolder(fake_rest, "a.b", idempotency_key="k")
+
+    assert fake_rest.deleted == ["a.b"]
+    assert "a.b" not in fake_rest.existing
+
+
+def test_deletefolder_is_idempotent_when_already_gone() -> None:
+    fake_rest = FakeCatalogRest(existing={"a"})
+
+    operations.deletefolder(fake_rest, "a.missing", idempotency_key="k")
+
+    assert fake_rest.deleted == []
+
+
+def test_deletefolder_raises_when_not_empty_and_not_cascading() -> None:
+    fake_rest = FakeCatalogRest(
+        existing={"a", "a.b", "a.b.c"}, folders={"a.b", "a.b.c"}
+    )
+
+    with pytest.raises(CatalogOperationError, match="not empty"):
+        operations.deletefolder(fake_rest, "a.b", idempotency_key="k")
+
+    assert fake_rest.deleted == []
+
+
+def test_deletefolder_cascade_deletes_contents_and_subfolders() -> None:
+    fake_rest = FakeCatalogRest(
+        existing={"a", "a.b", "a.b.c", "a.b.view1", "a.b.c.table1"},
+        folders={"a.b", "a.b.c"},
+    )
+
+    operations.deletefolder(fake_rest, "a.b", cascade=True, idempotency_key="k")
+
+    assert set(fake_rest.deleted) == {"a.b", "a.b.c", "a.b.view1", "a.b.c.table1"}
+    assert "a.b" not in fake_rest.existing
+
+
+def test_deletefolder_raises_when_path_is_not_a_folder() -> None:
+    fake_rest = FakeCatalogRest(existing={"a", "a.b"})  # "a.b" not in folders
+
+    with pytest.raises(CatalogOperationError, match="not a folder"):
+        operations.deletefolder(fake_rest, "a.b", idempotency_key="k")
+
+
+def test_deletefolder_engine_starting_is_remembered_and_retryable(executor) -> None:
+    fake_rest = FakeCatalogRest(
+        existing={"a", "a.b"},
+        folders={"a.b"},
+        raise_on_delete_folder=EngineStartingError("stalled", idempotency_key="k"),
+    )
+
+    with pytest.raises(EngineStartingError):
+        operations.deletefolder(fake_rest, "a.b", idempotency_key="k")
+
+    pending = retry_state.get("k")
+    assert pending is not None
+    assert pending.operation == "deletefolder"
+    assert pending.params == {"path": "a.b", "cascade": False}
+
+    fake_rest._raise_on_delete_folder = None
+    operations.retry_pending(executor, "k", catalog_rest=fake_rest)
+    assert fake_rest.deleted == ["a.b"]

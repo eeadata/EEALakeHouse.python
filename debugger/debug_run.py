@@ -275,6 +275,36 @@ def run_deletetags() -> None:
     print(f"deletetags  removed {tags} from {VIEW_PATH}")
 
 
+def run_createfolder() -> None:
+    catalog = Catalog(DREMIO_BASE_URL, DREMIO_TOKEN, username=DREMIO_USERNAME)
+    folder_path = "catalog.water_management_resources.bathing_water.bwd.draft.altia_test.new_folder.level1"
+    if DRY_RUN:
+        print("DRY RUN — not creating a folder. Set DRY_RUN = False to run this for real.")
+        print(f"  folder    {folder_path}")
+        return
+    catalog.createfolder(
+        folder_path,
+        create_parents=True,
+        idempotency_key=f"{TABLE2VIEW_IDEMPOTENCY_KEY}-createfolder",
+    )
+    print(f"createfolder  {folder_path}")
+
+
+def run_deletefolder() -> None:
+    catalog = Catalog(DREMIO_BASE_URL, DREMIO_TOKEN, username=DREMIO_USERNAME)
+    folder_path = "catalog.water_management_resources.bathing_water.bwd.draft.altia_test"
+    if DRY_RUN:
+        print("DRY RUN — not deleting a folder. Set DRY_RUN = False to run this for real.")
+        print(f"  folder    {folder_path}")
+        return
+    catalog.deletefolder(
+        folder_path,
+        cascade=True,
+        idempotency_key=f"{TABLE2VIEW_IDEMPOTENCY_KEY}-deletefolder",
+    )
+    print(f"deletefolder  {folder_path}")
+
+
 def run_catalog_close() -> None:
     """Exercises Catalog.close() directly — set a breakpoint on it
     (client.py) to step into the underlying executor's/catalog_rest's own
@@ -415,7 +445,7 @@ if __name__ == "__main__":
     #run_dds_ingestion()
     #run_table2view()
     #run_datacopy()
-    run_datamove()
+    #run_datamove()
     #run_gettablesfrom()
     #run_gettableitemsfrom()
     
@@ -427,9 +457,9 @@ if __name__ == "__main__":
     #run_gettagsfrom()
     #run_deleteview()
 
-    #run_catalog_close()
-    #run_catalog_context_manager()
-    #run_catalog_bulk_close()
+    #run_createfolder()
+    run_deletefolder()
+
 
 
     

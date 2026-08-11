@@ -86,6 +86,10 @@ catalog.gettablesfrom("bwd", idempotency_key="list-1")   # recurses into every s
 - `deleteview(view_path)` — `DROP VIEW IF EXISTS`.
 - `gettablesfrom(schema_path)` / `gettableitemsfrom(table_path)` — list every table/view under
   a path (recursively), or get one table's schema and row count without fetching any rows.
+- `createfolder(path, create_parents=False)` / `deletefolder(path, cascade=False)` — REST-only
+  (folders have no SQL/Flight equivalent), idempotent. `create_parents=False` (the default)
+  raises if the parent is missing rather than creating a deep new path; `cascade=False` (the
+  default) raises if the folder still has contents rather than deleting them.
 - `retry_pending(idempotency_key)` — re-attempt whatever last stalled on an `EngineStartingError`,
   using the same arguments it was originally called with.
 

@@ -278,6 +278,18 @@ class Catalog:
             self._catalog_rest, path, tags, idempotency_key=idempotency_key
         )
 
+    def createfolder(
+        self, path: str, *, create_parents: bool = False, idempotency_key: str
+    ) -> None:
+        return operations.createfolder(
+            self._catalog_rest, path, create_parents=create_parents, idempotency_key=idempotency_key
+        )
+
+    def deletefolder(self, path: str, *, cascade: bool = False, idempotency_key: str) -> None:
+        return operations.deletefolder(
+            self._catalog_rest, path, cascade=cascade, idempotency_key=idempotency_key
+        )
+
     def retry_pending(self, idempotency_key: str) -> SqlResult | list[Any]:
         pending = retry_state.get(idempotency_key)
         if pending is None:

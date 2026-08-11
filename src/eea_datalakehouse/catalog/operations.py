@@ -1,6 +1,7 @@
 """The catalog operations: table2view, draft2version, publishversion,
 datacopy, datamove, deleteview, gettablesfrom, gettableitemsfrom,
-getwikifrom, gettagsfrom, assignwikito, assigntagsto, deletetags.
+getwikifrom, gettagsfrom, assignwikito, assigntagsto, deletetags,
+createfolder, deletefolder.
 
 Each takes a :class:`~eea_datalakehouse.catalog.sql.SqlExecutor` (REST or
 Flight — the operation doesn't care which) and an `idempotency_key`. On
@@ -60,6 +61,15 @@ relying on this:
   semantics of that version field are unverified against a real deployment
   (see rest.py's docstring). ``assigntagsto`` *replaces* the tag set, it
   doesn't merge with the existing tags.
+* ``createfolder``/``deletefolder`` are REST-only for the same reason —
+  folder creation/deletion has no SQL or Flight equivalent. Both are
+  idempotent (an already-there/already-gone folder is not an error).
+  ``createfolder(create_parents=False)`` (the default) raises if the
+  parent is missing rather than silently creating a deep new path.
+  ``deletefolder(cascade=False)`` (the default) raises if the folder
+  still has contents; ``cascade=True`` deletes everything inside first,
+  depth-first (see `CatalogRestClient.delete_folder`'s docstring for the
+  unverified assumption its cascade path relies on).
 """
 
 from __future__ import annotations
@@ -838,6 +848,81 @@ def deletetags(
     retry_state.clear(idempotency_key)
 
 
+def createfolder(
+    catalog_rest: CatalogRestClient,
+    path: str,
+    *,
+    create_parents: bool = False,
+    idempotency_key: str,
+) -> None:
+    """Create the folder at `path`.
+
+    REST-only (see module docstring) — folder creation has no SQL or
+    Flight equivalent. Idempotent: a folder that's already there is left
+    alone, not an error.
+
+    `create_parents=False` (the default) requires everything above the
+    leaf to already exist — raises `CatalogOperationError` if the parent
+    folder is missing, rather than silently creating a deep new path.
+    `create_parents=True` creates every missing level instead (via
+    `CatalogRestClient.ensure_folder_path`) — same "the space/source
+    itself is never created automatically" rule as elsewhere in this
+    module.
+    """
+
+    def check_parent_exists() -> None:
+        if create_parents:
+            return
+        parent = _parent_path(path)
+        if parent is None:
+            raise CatalogOperationError(f"{path!r} has no parent folder to create it under")
+        if not catalog_rest.exists(parent):
+            raise CatalogOperationError(
+                f"parent {parent!r} does not exist — pass create_parents=True "
+                "to create missing levels automatically"
+            )
+
+    def create() -> None:
+        if create_parents:
+            catalog_rest.ensure_folder_path(path)
+        else:
+            catalog_rest.create_folder(path)
+
+    _run_actions(
+        [check_parent_exists, create],
+        operation="createfolder",
+        target=path,
+        idempotency_key=idempotency_key,
+        params={"path": path, "create_parents": create_parents},
+    )
+
+
+def deletefolder(
+    catalog_rest: CatalogRestClient,
+    path: str,
+    *,
+    cascade: bool = False,
+    idempotency_key: str,
+) -> None:
+    """Delete the folder at `path`.
+
+    REST-only (see module docstring) — folder deletion has no SQL or
+    Flight equivalent. Idempotent: a folder that's already gone is not an
+    error. `cascade=False` (the default) raises `CatalogOperationError` if
+    the folder still has contents — `rmdir` vs `rm -r`. `cascade=True`
+    deletes every table/view and subfolder inside first, depth-first, then
+    the folder itself (see `CatalogRestClient.delete_folder`).
+    """
+    try:
+        catalog_rest.delete_folder(path, cascade=cascade)
+    except EngineStartingError as exc:
+        retry_state.record(
+            idempotency_key, "deletefolder", path, str(exc), params={"path": path, "cascade": cascade}
+        )
+        raise
+    retry_state.clear(idempotency_key)
+
+
 _OPERATIONS = {
     "table2view": table2view,
     "draft2version": draft2version,
@@ -852,6 +937,8 @@ _OPERATIONS = {
     "assignwikito": assignwikito,
     "assigntagsto": assigntagsto,
     "deletetags": deletetags,
+    "createfolder": createfolder,
+    "deletefolder": deletefolder,
 }
 
 

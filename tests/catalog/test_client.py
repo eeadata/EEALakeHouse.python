@@ -277,6 +277,24 @@ def test_deletetags_delegates_to_operations() -> None:
     assert fake_rest._tags["a.b"] == ["gold"]
 
 
+def test_createfolder_delegates_to_operations() -> None:
+    fake_rest = FakeCatalogRest(existing={"a"})
+    catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=fake_rest)
+
+    catalog.createfolder("a.b", idempotency_key="k")
+
+    assert fake_rest.created == ["a.b"]
+
+
+def test_deletefolder_delegates_to_operations() -> None:
+    fake_rest = FakeCatalogRest(existing={"a", "a.b"}, folders={"a.b"})
+    catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=fake_rest)
+
+    catalog.deletefolder("a.b", idempotency_key="k")
+
+    assert fake_rest.deleted == ["a.b"]
+
+
 def test_repr_does_not_expose_the_token() -> None:
     catalog = Catalog(BASE_URL, "super-secret-pat")
 
