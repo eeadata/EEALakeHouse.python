@@ -143,8 +143,11 @@ def run_table2view() -> None:
 def run_datacopy() -> None:
     catalog = Catalog(DREMIO_BASE_URL, DREMIO_TOKEN, username=DREMIO_USERNAME)
     target_path = f"{VIEW_PATH}_copy"
+    source_path = "catalog.water_management_resources.bathing_water.bwd.draft.bw_assessment.test_view"
+    target_path = "catalog.water_management_resources.bathing_water.bwd.draft.altia_test"
 
-    target_path="catalog.water_management_resources.bathing_water.bwd.draft.altia_test.aaa.vvvv"
+
+    #target_path="catalog.water_management_resources.bathing_water.bwd.draft.altia_test.aaa.vvvv"
     if DRY_RUN:
         print("DRY RUN — not copying data. Set DRY_RUN = False to run this for real.")
         print(f"  source    {VIEW_PATH}")
@@ -155,9 +158,9 @@ def run_datacopy() -> None:
     # gRPC channel is only opened once here and reused for both steps.
     print(f"datacopy    via {catalog._flight_executor!r}")
     result = catalog.datacopy(
-        VIEW_PATH,
+        source_path,
         target_path,
-        mode="replace",
+        overwrite=True,
         create_target_folder=False,
         idempotency_key=f"{TABLE2VIEW_IDEMPOTENCY_KEY}-datacopy",
     )
@@ -167,8 +170,8 @@ def run_datacopy() -> None:
 def run_datamove() -> None:
     catalog = Catalog(DREMIO_BASE_URL, DREMIO_TOKEN, username=DREMIO_USERNAME)
     source_path = "catalog.water_management_resources.bathing_water.bwd.draft.altia_test.test_view"
-    target_path="catalog.water_management_resources.bathing_water.bwd.draft.altia_test.aaa.vvvv"
-    target_path = f"{VIEW_PATH}_moved"
+    target_path = "catalog.water_management_resources.bathing_water.bwd.draft.altia_test.aaa.vvvv"
+    #target_path = f"{VIEW_PATH}_moved"
     if DRY_RUN:
         print("DRY RUN — not moving data. Set DRY_RUN = False to run this for real.")
         print(f"  source    {source_path}")
@@ -182,7 +185,7 @@ def run_datamove() -> None:
         target_path,
         # entry_type omitted — auto-detected from INFORMATION_SCHEMA now,
         # regardless of whether source_path is actually a table or a view.
-        create_target_folder=True,
+        create_target_folder=False,
         idempotency_key=f"{TABLE2VIEW_IDEMPOTENCY_KEY}-datamove",
     )
     print(f"datamove    {VIEW_PATH} -> {target_path}  row_count {result.row_count}")
