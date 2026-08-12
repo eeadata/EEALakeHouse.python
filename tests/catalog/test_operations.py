@@ -81,20 +81,18 @@ def test_table2view_raises_when_folder_check_needed_but_no_catalog_rest_given() 
         operations.table2view(fake, "a.view", "a.source", idempotency_key="k")
 
 
-def test_draft2version_is_a_single_ctas(executor) -> None:
-    operations.draft2version(executor, "bwd.draft.bw", "bwd.versions.v1", idempotency_key="k")
+def test_draft2version_is_not_implemented(executor) -> None:
+    with pytest.raises(NotImplementedError):
+        operations.draft2version(executor, "bwd.draft.bw", "bwd.versions.v1", idempotency_key="k")
 
-    assert executor.statements == [
-        'CREATE TABLE "bwd"."versions"."v1" AS SELECT * FROM "bwd"."draft"."bw"',
-    ]
+    assert executor.statements == []
 
 
-def test_publishversion_uses_create_or_replace_view(executor) -> None:
-    operations.publishversion(executor, "bwd.consumer", "bwd.versions.v1", idempotency_key="k")
+def test_publishversion_is_not_implemented(executor) -> None:
+    with pytest.raises(NotImplementedError):
+        operations.publishversion(executor, "bwd.consumer", "bwd.versions.v1", idempotency_key="k")
 
-    assert executor.statements == [
-        'CREATE OR REPLACE VIEW "bwd"."consumer" AS SELECT * FROM "bwd"."versions"."v1"',
-    ]
+    assert executor.statements == []
 
 
 _SOURCE_LOOKUP = (
@@ -486,12 +484,12 @@ def test_deleteview_is_registered_for_retry(executor) -> None:
 
 def test_engine_starting_error_propagates_and_is_remembered(stalling_executor) -> None:
     with pytest.raises(EngineStartingError):
-        operations.draft2version(stalling_executor, "a.draft", "a.v1", idempotency_key="stall-key")
+        operations.deleteview(stalling_executor, "a.view", idempotency_key="stall-key")
 
     pending = retry_state.get("stall-key")
     assert pending is not None
-    assert pending.operation == "draft2version"
-    assert pending.params == {"draft_path": "a.draft", "version_path": "a.v1"}
+    assert pending.operation == "deleteview"
+    assert pending.params == {"view_path": "a.view"}
     assert "step 1/1" in pending.last_error
 
 
@@ -513,28 +511,32 @@ def test_second_step_stalling_is_reported_with_its_step_number() -> None:
 
 
 def test_success_clears_a_previously_remembered_attempt(executor) -> None:
-    retry_state.record("k", "draft2version", "a.v1", "earlier failure")
+    retry_state.record("k", "deleteview", "a.view", "earlier failure")
     assert retry_state.get("k") is not None
 
-    operations.draft2version(executor, "a.draft", "a.v1", idempotency_key="k")
+    operations.deleteview(executor, "a.view", idempotency_key="k")
 
     assert retry_state.get("k") is None
 
 
-def test_retry_pending_dispatches_back_to_the_same_operation(executor) -> None:
+def test_retry_pending_dispatches_back_to_the_same_operation() -> None:
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], []])
     retry_state.record(
         "k",
-        "publishversion",
-        "a.consumer",
+        "datacopy",
+        "a.dst",
         "earlier failure",
-        params={"consumer_view_path": "a.consumer", "version_path": "a.v2"},
+        params={
+            "source_path": "a.src",
+            "target_path": "a.dst",
+            "overwrite": False,
+            "create_target_folder": False,
+        },
     )
 
-    operations.retry_pending(executor, "k")
+    operations.retry_pending(fake, "k")
 
-    assert executor.statements == [
-        'CREATE OR REPLACE VIEW "a"."consumer" AS SELECT * FROM "a"."v2"',
-    ]
+    assert fake.statements[-1] == 'CREATE TABLE "a"."dst" AS SELECT * FROM "a"."src"'
 
 
 def test_retry_pending_raises_keyerror_when_nothing_pending(executor) -> None:
