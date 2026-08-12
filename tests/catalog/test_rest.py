@@ -168,6 +168,160 @@ def test_ensure_folder_path_does_not_depend_on_by_path_lookups_for_nested_levels
     assert create_route.call_count == 2
 
 
+@respx.mock
+def test_create_folder_returns_true_when_newly_created() -> None:
+    create_route = respx.post(f"{BASE_URL}/api/v3/catalog").mock(
+        return_value=httpx.Response(201, json={})
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    created = client.create_folder("a.b")
+
+    assert created is True
+    body = create_route.calls.last.request.content
+    assert b'"folder"' in body
+    assert b'"b"' in body
+
+
+@respx.mock
+def test_create_folder_returns_false_when_already_there() -> None:
+    respx.post(f"{BASE_URL}/api/v3/catalog").mock(return_value=httpx.Response(409))
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert client.create_folder("a.b") is False
+
+
+@respx.mock
+def test_create_folder_raises_engine_starting_on_timeout() -> None:
+    respx.post(f"{BASE_URL}/api/v3/catalog").mock(side_effect=httpx.TimeoutException("t"))
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(EngineStartingError):
+        client.create_folder("a.b")
+
+
+@respx.mock
+def test_create_folder_raises_on_other_errors() -> None:
+    respx.post(f"{BASE_URL}/api/v3/catalog").mock(return_value=httpx.Response(500, text="boom"))
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(CatalogOperationError):
+        client.create_folder("a.b")
+
+
+@respx.mock
+def test_delete_folder_is_a_no_op_when_already_gone() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(return_value=httpx.Response(404))
+    delete_route = respx.delete(url__regex=r".*/api/v3/catalog/.*")
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    client.delete_folder("a.b")  # must not raise
+
+    assert delete_route.call_count == 0
+
+
+@respx.mock
+def test_delete_folder_raises_when_path_is_not_a_folder() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "id-a-b", "entityType": "dataset"})
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(CatalogOperationError, match="not a folder"):
+        client.delete_folder("a.b")
+
+
+@respx.mock
+def test_delete_folder_deletes_an_empty_folder() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "id-a-b", "entityType": "folder", "children": []})
+    )
+    delete_route = respx.delete(f"{BASE_URL}/api/v3/catalog/id-a-b").mock(
+        return_value=httpx.Response(204)
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    client.delete_folder("a.b")
+
+    assert delete_route.call_count == 1
+
+
+@respx.mock
+def test_delete_folder_raises_when_not_empty_and_not_cascading() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "id-a-b",
+                "entityType": "folder",
+                "children": [{"id": "id-view1", "type": "DATASET", "path": ["a", "b", "view1"]}],
+            },
+        )
+    )
+    delete_route = respx.delete(url__regex=r".*/api/v3/catalog/.*")
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(CatalogOperationError, match="not empty"):
+        client.delete_folder("a.b")
+
+    assert delete_route.call_count == 0
+
+
+@respx.mock
+def test_delete_folder_cascade_deletes_contents_and_subfolders() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "id-a-b",
+                "entityType": "folder",
+                "children": [
+                    {"id": "id-view1", "type": "DATASET", "path": ["a", "b", "view1"]},
+                    {
+                        "id": "id-sub",
+                        "type": "CONTAINER",
+                        "containerType": "FOLDER",
+                        "path": ["a", "b", "sub"],
+                    },
+                ],
+            },
+        )
+    )
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b/sub").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "id-sub",
+                "entityType": "folder",
+                "children": [
+                    {"id": "id-table1", "type": "DATASET", "path": ["a", "b", "sub", "table1"]},
+                ],
+            },
+        )
+    )
+    delete_route = respx.delete(url__regex=r".*/api/v3/catalog/.*").mock(
+        return_value=httpx.Response(204)
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    client.delete_folder("a.b", cascade=True)
+
+    deleted_ids = {call.request.url.path.rsplit("/", 1)[-1] for call in delete_route.calls}
+    assert deleted_ids == {"id-view1", "id-table1", "id-sub", "id-a-b"}
+
+
+@respx.mock
+def test_delete_folder_raises_engine_starting_on_delete_timeout() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"id": "id-a-b", "entityType": "folder", "children": []})
+    )
+    respx.delete(f"{BASE_URL}/api/v3/catalog/id-a-b").mock(side_effect=httpx.TimeoutException("t"))
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(EngineStartingError):
+        client.delete_folder("a.b")
+
+
 def test_repr_does_not_expose_the_token() -> None:
     client = CatalogRestClient(BASE_URL, "super-secret-pat")
 

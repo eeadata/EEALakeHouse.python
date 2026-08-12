@@ -207,7 +207,7 @@ class Catalog:
         source_path: str,
         target_path: str,
         *,
-        mode: Literal["create", "replace"] = "create",
+        overwrite: bool = False,
         create_target_folder: bool = False,
         idempotency_key: str,
     ) -> SqlResult:
@@ -216,7 +216,7 @@ class Catalog:
             self._flight_executor,
             source_path,
             target_path,
-            mode=mode,
+            overwrite=overwrite,
             create_target_folder=create_target_folder,
             catalog_rest=self._catalog_rest,
             idempotency_key=idempotency_key,
@@ -228,6 +228,7 @@ class Catalog:
         target_path: str,
         *,
         entry_type: Literal["TABLE", "VIEW"] | None = None,
+        overwrite: bool = False,
         create_target_folder: bool = False,
         idempotency_key: str,
     ) -> SqlResult:
@@ -237,6 +238,7 @@ class Catalog:
             source_path,
             target_path,
             entry_type=entry_type,
+            overwrite=overwrite,
             create_target_folder=create_target_folder,
             catalog_rest=self._catalog_rest,
             idempotency_key=idempotency_key,
@@ -274,6 +276,18 @@ class Catalog:
     def deletetags(self, path: str, tags: list[str], *, idempotency_key: str) -> None:
         return operations.deletetags(
             self._catalog_rest, path, tags, idempotency_key=idempotency_key
+        )
+
+    def createfolder(
+        self, path: str, *, create_parents: bool = False, idempotency_key: str
+    ) -> None:
+        return operations.createfolder(
+            self._catalog_rest, path, create_parents=create_parents, idempotency_key=idempotency_key
+        )
+
+    def deletefolder(self, path: str, *, cascade: bool = False, idempotency_key: str) -> None:
+        return operations.deletefolder(
+            self._catalog_rest, path, cascade=cascade, idempotency_key=idempotency_key
         )
 
     def retry_pending(self, idempotency_key: str) -> SqlResult | list[Any]:

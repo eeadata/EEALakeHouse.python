@@ -85,16 +85,21 @@ class FakeCatalogRest:
         raise_on_get_tags: Exception | None = None,
         raise_on_set_wiki: Exception | None = None,
         raise_on_set_tags: Exception | None = None,
+        raise_on_create_folder: Exception | None = None,
+        raise_on_delete_folder: Exception | None = None,
     ) -> None:
         self.existing = set(existing or set())
         self.folders = set(folders or set())
         self.created: list[str] = []
+        self.deleted: list[str] = []
         self._wikis = dict(wikis or {})
         self._tags = dict(tags or {})
         self._raise_on_get_wiki = raise_on_get_wiki
         self._raise_on_get_tags = raise_on_get_tags
         self._raise_on_set_wiki = raise_on_set_wiki
         self._raise_on_set_tags = raise_on_set_tags
+        self._raise_on_create_folder = raise_on_create_folder
+        self._raise_on_delete_folder = raise_on_delete_folder
 
     def exists(self, path: str) -> bool:
         return path in self.existing
@@ -159,6 +164,47 @@ class FakeCatalogRest:
                 created.append(current)
             walked = current
         return created
+
+    def create_folder(self, path: str) -> bool:
+        if self._raise_on_create_folder is not None:
+            raise self._raise_on_create_folder
+        if path in self.existing:
+            return False
+        self.existing.add(path)
+        self.folders.add(path)
+        self.created.append(path)
+        return True
+
+    def _children_of(self, path: str) -> list[str]:
+        prefix = f"{path}."
+        depth = path.count(".") + 1
+        return [p for p in self.existing if p.startswith(prefix) and p.count(".") == depth]
+
+    def delete_folder(self, path: str, *, cascade: bool = False) -> None:
+        from eea_datalakehouse.catalog.errors import CatalogOperationError
+
+        if self._raise_on_delete_folder is not None:
+            raise self._raise_on_delete_folder
+        if path not in self.existing:
+            return
+        if path not in self.folders:
+            raise CatalogOperationError(f"{path!r} is not a folder")
+        children = self._children_of(path)
+        if children and not cascade:
+            raise CatalogOperationError(
+                f"folder {path!r} is not empty — pass cascade=True to delete its "
+                "contents and subfolders too"
+            )
+        if cascade:
+            for child in children:
+                if child in self.folders:
+                    self.delete_folder(child, cascade=True)
+                else:
+                    self.existing.discard(child)
+                    self.deleted.append(child)
+        self.existing.discard(path)
+        self.folders.discard(path)
+        self.deleted.append(path)
 
 
 @pytest.fixture

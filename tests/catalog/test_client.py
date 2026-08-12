@@ -96,16 +96,26 @@ def test_deleteview_delegates_to_operations() -> None:
     assert fake.statements == ['DROP VIEW IF EXISTS "a"."view"']
 
 
-def test_datacopy_replace_mode_delegates_correctly() -> None:
+def test_datacopy_overwrite_delegates_correctly() -> None:
     # datacopy always goes over the flight executor, not the REST one.
-    fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+    fake = FakeExecutor(
+        rows_sequence=[
+            [{"TABLE_NAME": "src"}],
+            [{"TABLE_NAME": "dst"}],
+            [{"TABLE_TYPE": "TABLE"}],
+        ]
+    )
     catalog = Catalog(BASE_URL, "pat", flight_executor=fake, catalog_rest=FakeCatalogRest())
 
-    catalog.datacopy("a.src", "a.dst", mode="replace", idempotency_key="k")
+    catalog.datacopy("a.src", "a.dst", overwrite=True, idempotency_key="k")
 
     assert fake.statements == [
         'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
         "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'src'",
+        'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
+        "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'dst'",
+        'SELECT "TABLE_TYPE" FROM INFORMATION_SCHEMA."TABLES" '
+        "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'dst'",
         'DROP TABLE IF EXISTS "a"."dst"',
         'CREATE TABLE "a"."dst" AS SELECT * FROM "a"."src"',
     ]
@@ -113,7 +123,10 @@ def test_datacopy_replace_mode_delegates_correctly() -> None:
 
 def test_datamove_delegates_correctly() -> None:
     # datamove always goes over the flight executor, not the REST one.
-    fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+    # Three calls, different query shapes: the initial source-existence
+    # check, the target-doesn't-exist-yet check, and the post-DROP
+    # verification that the target now exists.
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], [], [{"TABLE_NAME": "dst"}]])
     catalog = Catalog(BASE_URL, "pat", flight_executor=fake, catalog_rest=FakeCatalogRest())
 
     catalog.datamove("a.src", "a.dst", entry_type="TABLE", idempotency_key="k")
@@ -121,8 +134,12 @@ def test_datamove_delegates_correctly() -> None:
     assert fake.statements == [
         'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
         "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'src'",
+        'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
+        "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'dst'",
         'CREATE TABLE "a"."dst" AS SELECT * FROM "a"."src"',
         'DROP TABLE "a"."src"',
+        'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
+        "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'dst'",
     ]
 
 
@@ -171,7 +188,7 @@ def test_retry_pending_delegates_to_operations() -> None:
 
 def test_retry_pending_routes_datamove_back_through_the_flight_executor() -> None:
     rest_fake = FakeExecutor()  # must stay untouched — datamove never uses REST
-    flight_fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+    flight_fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], [], [{"TABLE_NAME": "dst"}]])
     catalog = Catalog(
         BASE_URL,
         "pat",
@@ -188,6 +205,7 @@ def test_retry_pending_routes_datamove_back_through_the_flight_executor() -> Non
             "source_path": "a.src",
             "target_path": "a.dst",
             "entry_type": "TABLE",
+            "overwrite": False,
             "create_target_folder": False,
         },
     )
@@ -197,8 +215,12 @@ def test_retry_pending_routes_datamove_back_through_the_flight_executor() -> Non
     assert flight_fake.statements == [
         'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
         "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'src'",
+        'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
+        "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'dst'",
         'CREATE TABLE "a"."dst" AS SELECT * FROM "a"."src"',
         'DROP TABLE "a"."src"',
+        'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
+        "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'dst'",
     ]
     assert rest_fake.statements == []
 
@@ -253,6 +275,24 @@ def test_deletetags_delegates_to_operations() -> None:
     catalog.deletetags("a.b", ["pii"], idempotency_key="k")
 
     assert fake_rest._tags["a.b"] == ["gold"]
+
+
+def test_createfolder_delegates_to_operations() -> None:
+    fake_rest = FakeCatalogRest(existing={"a"})
+    catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=fake_rest)
+
+    catalog.createfolder("a.b", idempotency_key="k")
+
+    assert fake_rest.created == ["a.b"]
+
+
+def test_deletefolder_delegates_to_operations() -> None:
+    fake_rest = FakeCatalogRest(existing={"a", "a.b"}, folders={"a.b"})
+    catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=fake_rest)
+
+    catalog.deletefolder("a.b", idempotency_key="k")
+
+    assert fake_rest.deleted == ["a.b"]
 
 
 def test_repr_does_not_expose_the_token() -> None:

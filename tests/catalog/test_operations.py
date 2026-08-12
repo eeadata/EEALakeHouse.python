@@ -101,29 +101,74 @@ _SOURCE_LOOKUP = (
     'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
     "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'src'"
 )
+_TARGET_LOOKUP = (
+    'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
+    "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'dst'"
+)
+_TARGET_KIND_LOOKUP = (
+    'SELECT "TABLE_TYPE" FROM INFORMATION_SCHEMA."TABLES" '
+    "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'dst'"
+)
 
 
-def test_datacopy_create_mode_has_no_drop() -> None:
-    fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+def test_datacopy_creates_when_target_does_not_exist() -> None:
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], []])
 
     operations.datacopy(fake, "a.src", "a.dst", idempotency_key="k")
 
     assert fake.statements == [
         _SOURCE_LOOKUP,
+        _TARGET_LOOKUP,
         'CREATE TABLE "a"."dst" AS SELECT * FROM "a"."src"',
     ]
 
 
-def test_datacopy_replace_mode_drops_first() -> None:
-    fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+def test_datacopy_raises_when_target_already_exists_and_not_overwriting() -> None:
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], [{"TABLE_NAME": "dst"}]])
 
-    operations.datacopy(fake, "a.src", "a.dst", mode="replace", idempotency_key="k")
+    with pytest.raises(CatalogOperationError, match="already exists"):
+        operations.datacopy(fake, "a.src", "a.dst", idempotency_key="k")
+
+    # Fails fast — never gets to CREATE.
+    assert fake.statements == [_SOURCE_LOOKUP, _TARGET_LOOKUP]
+
+
+def test_datacopy_overwrite_drops_existing_target_first() -> None:
+    # Target's own kind is detected (it might be a view, not a table, from
+    # an earlier different operation) rather than assumed.
+    fake = FakeExecutor(
+        rows_sequence=[
+            [{"TABLE_NAME": "src"}],
+            [{"TABLE_NAME": "dst"}],
+            [{"TABLE_TYPE": "TABLE"}],
+        ]
+    )
+
+    operations.datacopy(fake, "a.src", "a.dst", overwrite=True, idempotency_key="k")
 
     assert fake.statements == [
         _SOURCE_LOOKUP,
+        _TARGET_LOOKUP,
+        _TARGET_KIND_LOOKUP,
         'DROP TABLE IF EXISTS "a"."dst"',
         'CREATE TABLE "a"."dst" AS SELECT * FROM "a"."src"',
     ]
+
+
+def test_datacopy_overwrite_of_a_view_drops_it_as_a_view() -> None:
+    # The real hazard this sidesteps: DROP TABLE on an actual view fails
+    # outright — same class of bug as datamove's entry_type problem.
+    fake = FakeExecutor(
+        rows_sequence=[
+            [{"TABLE_NAME": "src"}],
+            [{"TABLE_NAME": "dst"}],
+            [{"TABLE_TYPE": "VIEW"}],
+        ]
+    )
+
+    operations.datacopy(fake, "a.src", "a.dst", overwrite=True, idempotency_key="k")
+
+    assert fake.statements[3] == 'DROP VIEW IF EXISTS "a"."dst"'
 
 
 def test_datacopy_raises_when_source_does_not_exist() -> None:
@@ -132,12 +177,12 @@ def test_datacopy_raises_when_source_does_not_exist() -> None:
     with pytest.raises(CatalogOperationError, match="does not exist"):
         operations.datacopy(fake, "a.src", "a.dst", idempotency_key="k")
 
-    # Fails fast — never gets to CREATE.
+    # Fails fast — never gets to the target check or CREATE.
     assert fake.statements == [_SOURCE_LOOKUP]
 
 
 def test_datacopy_creates_missing_target_folder() -> None:
-    fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], []])
     catalog_rest = FakeCatalogRest(existing={"bwd"})  # "bwd.consumer" not yet there
 
     operations.datacopy(
@@ -162,27 +207,52 @@ def test_datacopy_raises_when_folder_check_needed_but_no_catalog_rest_given() ->
 
 
 def test_datamove_table_creates_then_drops_source() -> None:
-    fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+    # Three calls, different query shapes: source-existence check,
+    # target-doesn't-exist-yet check, and the post-DROP verification that
+    # the target now exists.
+    fake = FakeExecutor(
+        rows_sequence=[[{"TABLE_NAME": "src"}], [], [{"TABLE_NAME": "dst"}]]
+    )
 
-    operations.datamove(fake, "a.src", "a.dst", entry_type="TABLE", idempotency_key="k")
+    result = operations.datamove(fake, "a.src", "a.dst", entry_type="TABLE", idempotency_key="k")
+
+    # _run_actions returns whichever action ran last (verify_target_exists,
+    # not move_data) — must still be the CREATE's real SqlResult, not None.
+    assert result is not None
+    assert result.job_id == "job-2"
 
     assert fake.statements == [
         _SOURCE_LOOKUP,
+        _TARGET_LOOKUP,
         'CREATE TABLE "a"."dst" AS SELECT * FROM "a"."src"',
         'DROP TABLE "a"."src"',
+        _TARGET_LOOKUP,
     ]
 
 
 def test_datamove_view_uses_view_statements() -> None:
-    fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+    fake = FakeExecutor(
+        rows_sequence=[[{"TABLE_NAME": "src"}], [], [{"TABLE_NAME": "dst"}]]
+    )
 
     operations.datamove(fake, "a.src", "a.dst", entry_type="VIEW", idempotency_key="k")
 
     assert fake.statements == [
         _SOURCE_LOOKUP,
+        _TARGET_LOOKUP,
         'CREATE VIEW "a"."dst" AS SELECT * FROM "a"."src"',
         'DROP VIEW "a"."src"',
+        _TARGET_LOOKUP,
     ]
+
+
+def test_datamove_raises_when_target_was_not_actually_created() -> None:
+    # CREATE raised nothing, but the post-condition check still finds no
+    # target in the catalog — must not report success on that silence alone.
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], [], []])
+
+    with pytest.raises(CatalogOperationError, match="does not exist after CREATE"):
+        operations.datamove(fake, "a.src", "a.dst", entry_type="TABLE", idempotency_key="k")
 
 
 def test_datamove_raises_when_source_does_not_exist() -> None:
@@ -191,29 +261,68 @@ def test_datamove_raises_when_source_does_not_exist() -> None:
     with pytest.raises(CatalogOperationError, match="does not exist"):
         operations.datamove(fake, "a.src", "a.dst", entry_type="TABLE", idempotency_key="k")
 
-    # Fails fast — never gets to CREATE/DROP.
+    # Fails fast — never gets to the target check, CREATE, or DROP.
     assert fake.statements == [_SOURCE_LOOKUP]
 
 
+def test_datamove_raises_when_target_already_exists_and_not_overwriting() -> None:
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], [{"TABLE_NAME": "dst"}]])
+
+    with pytest.raises(CatalogOperationError, match="already exists"):
+        operations.datamove(fake, "a.src", "a.dst", entry_type="TABLE", idempotency_key="k")
+
+    # Fails fast — never gets to CREATE/DROP.
+    assert fake.statements == [_SOURCE_LOOKUP, _TARGET_LOOKUP]
+
+
+def test_datamove_overwrite_drops_existing_target_first() -> None:
+    # Target's own kind is detected (it might be a view, not a table, from
+    # an earlier different operation) rather than assumed.
+    fake = FakeExecutor(
+        rows_sequence=[
+            [{"TABLE_NAME": "src"}],
+            [{"TABLE_NAME": "dst"}],
+            [{"TABLE_TYPE": "VIEW"}],
+            [{"TABLE_NAME": "dst"}],
+        ]
+    )
+
+    operations.datamove(
+        fake, "a.src", "a.dst", entry_type="TABLE", overwrite=True, idempotency_key="k"
+    )
+
+    assert fake.statements == [
+        _SOURCE_LOOKUP,
+        _TARGET_LOOKUP,
+        _TARGET_KIND_LOOKUP,
+        'DROP VIEW IF EXISTS "a"."dst"',
+        'CREATE TABLE "a"."dst" AS SELECT * FROM "a"."src"',
+        'DROP TABLE "a"."src"',
+        _TARGET_LOOKUP,
+    ]
+
+
 def test_datamove_auto_detects_a_view_when_entry_type_not_given() -> None:
-    fake = FakeExecutor(rows=[{"TABLE_TYPE": "VIEW"}])
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_TYPE": "VIEW"}], [], [{"TABLE_NAME": "dst"}]])
 
     operations.datamove(fake, "a.src", "a.dst", idempotency_key="k")
 
     assert fake.statements == [
         'SELECT "TABLE_TYPE" FROM INFORMATION_SCHEMA."TABLES" '
         "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'src'",
+        _TARGET_LOOKUP,
         'CREATE VIEW "a"."dst" AS SELECT * FROM "a"."src"',
         'DROP VIEW "a"."src"',
+        _TARGET_LOOKUP,
     ]
 
 
 def test_datamove_auto_detects_a_table_when_entry_type_not_given() -> None:
-    fake = FakeExecutor(rows=[{"TABLE_TYPE": "TABLE"}])
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_TYPE": "TABLE"}], [], [{"TABLE_NAME": "dst"}]])
 
     operations.datamove(fake, "a.src", "a.dst", idempotency_key="k")
 
-    assert fake.statements[-2:] == [
+    assert fake.statements[2:4] == [
         'CREATE TABLE "a"."dst" AS SELECT * FROM "a"."src"',
         'DROP TABLE "a"."src"',
     ]
@@ -230,11 +339,11 @@ def test_datamove_auto_detect_survives_getting_manual_entry_type_wrong() -> None
     # The exact real-world failure this sidesteps: caller says VIEW, source
     # is actually a TABLE — DROP VIEW on a table fails outright. Passing no
     # entry_type at all detects the real kind instead of trusting a guess.
-    fake = FakeExecutor(rows=[{"TABLE_TYPE": "TABLE"}])
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_TYPE": "TABLE"}], [], [{"TABLE_NAME": "dst"}]])
 
     operations.datamove(fake, "a.src", "a.dst", idempotency_key="k")
 
-    assert fake.statements[-1] == 'DROP TABLE "a"."src"'
+    assert fake.statements[3] == 'DROP TABLE "a"."src"'
 
 
 def test_datamove_retry_re_detects_entry_type() -> None:
@@ -249,23 +358,26 @@ def test_datamove_retry_re_detects_entry_type() -> None:
             "source_path": "a.src",
             "target_path": "a.dst",
             "entry_type": None,
+            "overwrite": False,
             "create_target_folder": False,
         },
     )
-    fake = FakeExecutor(rows=[{"TABLE_TYPE": "VIEW"}])
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_TYPE": "VIEW"}], [], [{"TABLE_NAME": "dst"}]])
 
     operations.retry_pending(fake, "k")
 
     assert fake.statements == [
         'SELECT "TABLE_TYPE" FROM INFORMATION_SCHEMA."TABLES" '
         "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'src'",
+        _TARGET_LOOKUP,
         'CREATE VIEW "a"."dst" AS SELECT * FROM "a"."src"',
         'DROP VIEW "a"."src"',
+        _TARGET_LOOKUP,
     ]
 
 
 def test_datamove_creates_missing_target_folder() -> None:
-    fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], [], [{"TABLE_NAME": "dst"}]])
     catalog_rest = FakeCatalogRest(existing={"bwd"})  # "bwd.consumer" not yet there
 
     operations.datamove(
@@ -282,7 +394,7 @@ def test_datamove_creates_missing_target_folder() -> None:
 
 
 def test_datacopy_appends_source_name_when_target_is_an_existing_folder() -> None:
-    fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], []])
     catalog_rest = FakeCatalogRest(existing={"bwd", "bwd.folder"}, folders={"bwd.folder"})
 
     result = operations.datacopy(
@@ -290,11 +402,11 @@ def test_datacopy_appends_source_name_when_target_is_an_existing_folder() -> Non
     )
 
     assert fake.statements[-1] == 'CREATE TABLE "bwd"."folder"."src" AS SELECT * FROM "bwd"."src"'
-    assert result.job_id == "job-1"
+    assert result.job_id == "job-2"
 
 
 def test_datacopy_uses_target_literally_when_it_is_not_a_folder() -> None:
-    fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], []])
     catalog_rest = FakeCatalogRest(existing={"bwd"})  # "bwd.dst" doesn't exist as anything
 
     operations.datacopy(
@@ -306,7 +418,7 @@ def test_datacopy_uses_target_literally_when_it_is_not_a_folder() -> None:
 
 def test_datacopy_uses_target_literally_without_catalog_rest() -> None:
     # No catalog_rest at all — folder-append is skipped, not an error.
-    fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], []])
 
     operations.datacopy(fake, "bwd.src", "bwd.folder", idempotency_key="k")
 
@@ -332,7 +444,9 @@ def test_datacopy_folder_append_is_remembered_for_retry() -> None:
 
 
 def test_datamove_appends_source_name_when_target_is_an_existing_folder() -> None:
-    fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+    fake = FakeExecutor(
+        rows_sequence=[[{"TABLE_NAME": "src"}], [], [{"TABLE_NAME": "src"}]]
+    )
     catalog_rest = FakeCatalogRest(existing={"bwd", "bwd.folder"}, folders={"bwd.folder"})
 
     operations.datamove(
@@ -347,8 +461,12 @@ def test_datamove_appends_source_name_when_target_is_an_existing_folder() -> Non
     assert fake.statements == [
         'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
         "WHERE \"TABLE_SCHEMA\" = 'bwd' AND \"TABLE_NAME\" = 'src'",
+        'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
+        "WHERE \"TABLE_SCHEMA\" = 'bwd.folder' AND \"TABLE_NAME\" = 'src'",
         'CREATE TABLE "bwd"."folder"."src" AS SELECT * FROM "bwd"."src"',
         'DROP TABLE "bwd"."src"',
+        'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
+        "WHERE \"TABLE_SCHEMA\" = 'bwd.folder' AND \"TABLE_NAME\" = 'src'",
     ]
 
 
@@ -384,12 +502,13 @@ def test_second_step_stalling_is_reported_with_its_step_number() -> None:
     )
 
     with pytest.raises(EngineStartingError):
-        operations.datacopy(executor, "a.src", "a.dst", mode="replace", idempotency_key="k")
+        operations.datacopy(executor, "a.src", "a.dst", overwrite=True, idempotency_key="k")
 
     pending = retry_state.get("k")
     assert pending is not None
     # actions: check_source_exists, resolve_target (no-op, no catalog_rest),
-    # ensure_target_folder (no-op), drop, create
+    # ensure_target_folder (no-op), check_or_drop_target (stalls on its own
+    # target-existence check here), copy_data
     assert "step 4/5" in pending.last_error
 
 
@@ -674,3 +793,130 @@ def test_deletetags_engine_starting_is_remembered_and_retryable(executor) -> Non
     fake_rest._raise_on_set_tags = None
     operations.retry_pending(executor, "k", catalog_rest=fake_rest)
     assert fake_rest._tags["a.b"] == ["gold"]
+
+
+def test_createfolder_creates_leaf_when_parent_exists() -> None:
+    fake_rest = FakeCatalogRest(existing={"a", "a.b"})
+
+    operations.createfolder(fake_rest, "a.b.c", idempotency_key="k")
+
+    assert fake_rest.created == ["a.b.c"]
+    assert "a.b.c" in fake_rest.folders
+
+
+def test_createfolder_is_idempotent_when_leaf_already_exists() -> None:
+    fake_rest = FakeCatalogRest(existing={"a", "a.b"}, folders={"a.b"})
+
+    operations.createfolder(fake_rest, "a.b", idempotency_key="k")
+
+    assert fake_rest.created == []
+
+
+def test_createfolder_raises_when_parent_missing_and_not_creating_parents() -> None:
+    fake_rest = FakeCatalogRest(existing={"a"})  # "a.b" not there
+
+    with pytest.raises(CatalogOperationError, match="does not exist"):
+        operations.createfolder(fake_rest, "a.b.c", idempotency_key="k")
+
+    assert fake_rest.created == []
+
+
+def test_createfolder_raises_when_path_has_no_parent() -> None:
+    fake_rest = FakeCatalogRest()
+
+    with pytest.raises(CatalogOperationError, match="no parent"):
+        operations.createfolder(fake_rest, "a", idempotency_key="k")
+
+
+def test_createfolder_create_parents_creates_every_missing_level() -> None:
+    fake_rest = FakeCatalogRest(existing={"a"})
+
+    operations.createfolder(fake_rest, "a.b.c", create_parents=True, idempotency_key="k")
+
+    assert fake_rest.created == ["a.b", "a.b.c"]
+
+
+def test_createfolder_engine_starting_is_remembered_and_retryable(executor) -> None:
+    fake_rest = FakeCatalogRest(
+        existing={"a", "a.b"},
+        raise_on_create_folder=EngineStartingError("stalled", idempotency_key="k"),
+    )
+
+    with pytest.raises(EngineStartingError):
+        operations.createfolder(fake_rest, "a.b.c", idempotency_key="k")
+
+    pending = retry_state.get("k")
+    assert pending is not None
+    assert pending.operation == "createfolder"
+    assert pending.params == {"path": "a.b.c", "create_parents": False}
+
+    fake_rest._raise_on_create_folder = None
+    operations.retry_pending(executor, "k", catalog_rest=fake_rest)
+    assert fake_rest.created == ["a.b.c"]
+
+
+def test_deletefolder_deletes_an_empty_folder() -> None:
+    fake_rest = FakeCatalogRest(existing={"a", "a.b"}, folders={"a.b"})
+
+    operations.deletefolder(fake_rest, "a.b", idempotency_key="k")
+
+    assert fake_rest.deleted == ["a.b"]
+    assert "a.b" not in fake_rest.existing
+
+
+def test_deletefolder_is_idempotent_when_already_gone() -> None:
+    fake_rest = FakeCatalogRest(existing={"a"})
+
+    operations.deletefolder(fake_rest, "a.missing", idempotency_key="k")
+
+    assert fake_rest.deleted == []
+
+
+def test_deletefolder_raises_when_not_empty_and_not_cascading() -> None:
+    fake_rest = FakeCatalogRest(
+        existing={"a", "a.b", "a.b.c"}, folders={"a.b", "a.b.c"}
+    )
+
+    with pytest.raises(CatalogOperationError, match="not empty"):
+        operations.deletefolder(fake_rest, "a.b", idempotency_key="k")
+
+    assert fake_rest.deleted == []
+
+
+def test_deletefolder_cascade_deletes_contents_and_subfolders() -> None:
+    fake_rest = FakeCatalogRest(
+        existing={"a", "a.b", "a.b.c", "a.b.view1", "a.b.c.table1"},
+        folders={"a.b", "a.b.c"},
+    )
+
+    operations.deletefolder(fake_rest, "a.b", cascade=True, idempotency_key="k")
+
+    assert set(fake_rest.deleted) == {"a.b", "a.b.c", "a.b.view1", "a.b.c.table1"}
+    assert "a.b" not in fake_rest.existing
+
+
+def test_deletefolder_raises_when_path_is_not_a_folder() -> None:
+    fake_rest = FakeCatalogRest(existing={"a", "a.b"})  # "a.b" not in folders
+
+    with pytest.raises(CatalogOperationError, match="not a folder"):
+        operations.deletefolder(fake_rest, "a.b", idempotency_key="k")
+
+
+def test_deletefolder_engine_starting_is_remembered_and_retryable(executor) -> None:
+    fake_rest = FakeCatalogRest(
+        existing={"a", "a.b"},
+        folders={"a.b"},
+        raise_on_delete_folder=EngineStartingError("stalled", idempotency_key="k"),
+    )
+
+    with pytest.raises(EngineStartingError):
+        operations.deletefolder(fake_rest, "a.b", idempotency_key="k")
+
+    pending = retry_state.get("k")
+    assert pending is not None
+    assert pending.operation == "deletefolder"
+    assert pending.params == {"path": "a.b", "cascade": False}
+
+    fake_rest._raise_on_delete_folder = None
+    operations.retry_pending(executor, "k", catalog_rest=fake_rest)
+    assert fake_rest.deleted == ["a.b"]

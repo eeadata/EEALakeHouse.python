@@ -80,11 +80,16 @@ catalog.gettablesfrom("bwd", idempotency_key="list-1")   # recurses into every s
   (CTAS; the draft itself is untouched).
 - `publishversion(consumer_view_path, version_path)` — repoints a consumer-facing view at a
   version (`CREATE OR REPLACE VIEW`, idempotent).
-- `datacopy(source_path, target_path, mode="create"|"replace")` / `datamove(...)` — copy or
-  move a table/view between catalog paths.
+- `datacopy(source_path, target_path, overwrite=False)` / `datamove(...)` — copy or move a
+  table/view between catalog paths, over Arrow Flight. `overwrite=False` (the default) raises if
+  `target_path` already exists; `overwrite=True` replaces it.
 - `deleteview(view_path)` — `DROP VIEW IF EXISTS`.
 - `gettablesfrom(schema_path)` / `gettableitemsfrom(table_path)` — list every table/view under
   a path (recursively), or get one table's schema and row count without fetching any rows.
+- `createfolder(path, create_parents=False)` / `deletefolder(path, cascade=False)` — REST-only
+  (folders have no SQL/Flight equivalent), idempotent. `create_parents=False` (the default)
+  raises if the parent is missing rather than creating a deep new path; `cascade=False` (the
+  default) raises if the folder still has contents rather than deleting them.
 - `retry_pending(idempotency_key)` — re-attempt whatever last stalled on an `EngineStartingError`,
   using the same arguments it was originally called with.
 
