@@ -55,16 +55,13 @@ from eea_datalakehouse.catalog import Catalog, EngineStartingError
 catalog = Catalog(DREMIO_BASE_URL, DREMIO_TOKEN)
 
 try:
-    catalog.draft2version(
-        "bwd.draft.bw_assessment", "bwd.versions.v2025_1", idempotency_key="bwd-v2025_1"
-    )
-    catalog.publishversion(
-        "bwd.consumer", "bwd.versions.v2025_1", idempotency_key="bwd-v2025_1-publish"
+    catalog.table2view(
+        "bwd.consumer", "bwd.draft.bw_assessment", idempotency_key="bwd-v2025_1"
     )
 except EngineStartingError:
     # A cold Dremio engine looks like a stalled call, not a failure — the
     # attempt is remembered under its idempotency_key; call it again later:
-    catalog.retry_pending("bwd-v2025_1-publish")
+    catalog.retry_pending("bwd-v2025_1")
 
 info = catalog.gettableitemsfrom("bwd.versions.v2025_1.assessments", idempotency_key="check-1")
 print(info.schema, info.row_count)             # schema + row count, no rows fetched
@@ -76,10 +73,9 @@ catalog.gettablesfrom("bwd", idempotency_key="list-1")   # recurses into every s
   for a location that started as a physical table (straight off ingest) and is moving to being
   a view; checks `source_path` exists first, and (by default) creates `view_path`'s containing
   folder if it's missing.
-- `draft2version(draft_path, version_path)` — promotes a draft table into a permanent version
-  (CTAS; the draft itself is untouched).
-- `publishversion(consumer_view_path, version_path)` — repoints a consumer-facing view at a
-  version (`CREATE OR REPLACE VIEW`, idempotent).
+- `draft2version(draft_path, version_path)` / `publishversion(consumer_view_path, version_path)`
+  — **not implemented yet** (both raise `NotImplementedError`); promoting a draft table into a
+  permanent version and repointing a consumer-facing view at it.
 - `datacopy(source_path, target_path, overwrite=False)` / `datamove(...)` — copy or move a
   table/view between catalog paths, over Arrow Flight. `overwrite=False` (the default) raises if
   `target_path` already exists; `overwrite=True` replaces it.

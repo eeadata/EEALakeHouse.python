@@ -22,9 +22,9 @@ def test_injected_executor_is_used_directly() -> None:
     fake = FakeExecutor()
     catalog = Catalog(BASE_URL, "pat", executor=fake)
 
-    catalog.draft2version("a.draft", "a.v1", idempotency_key="k")
+    catalog.deleteview("a.view", idempotency_key="k")
 
-    assert fake.statements == ['CREATE TABLE "a"."v1" AS SELECT * FROM "a"."draft"']
+    assert fake.statements == ['DROP VIEW IF EXISTS "a"."view"']
 
 
 def test_without_injected_executor_builds_a_real_rest_executor(
@@ -173,17 +173,15 @@ def test_retry_pending_delegates_to_operations() -> None:
     catalog = Catalog(BASE_URL, "pat", executor=fake)
     retry_state.record(
         "k",
-        "publishversion",
-        "a.consumer",
+        "deleteview",
+        "a.view",
         "earlier failure",
-        params={"consumer_view_path": "a.consumer", "version_path": "a.v2"},
+        params={"view_path": "a.view"},
     )
 
     catalog.retry_pending("k")
 
-    assert fake.statements == [
-        'CREATE OR REPLACE VIEW "a"."consumer" AS SELECT * FROM "a"."v2"',
-    ]
+    assert fake.statements == ['DROP VIEW IF EXISTS "a"."view"']
 
 
 def test_retry_pending_routes_datamove_back_through_the_flight_executor() -> None:
