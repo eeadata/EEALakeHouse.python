@@ -8,12 +8,14 @@ Two main class domains for the EEA data lakehouse:
   S3 credentials) and registers it as a Dremio table, coordinated entirely
   through the DDS REST API.
 - `eea_datalakehouse.catalog` — Dremio catalog operations once data has
-  landed: promoting a draft table to a version, publishing a version to a
-  consumer view, moving/copying/deleting catalog entries, and listing what's
-  there. Runs over Dremio's REST SQL Jobs API by default, or Arrow Flight SQL
-  opt-in — and treats a stalled call as a Dremio engine cold-starting rather
-  than a failure, so it can be remembered and retried later instead of
-  blocking.
+  landed: converting a table to a view, copying/moving/deleting catalog
+  entries, managing folders, wiki text and tags, and listing what's there.
+  `datacopy`/`datamove` always run over Arrow Flight SQL; everything else
+  runs over Dremio's REST SQL Jobs API (folders/wiki/tags have no SQL
+  equivalent at all, so those go through Dremio's own catalog REST API
+  directly) — and every operation treats a stalled call as a Dremio engine
+  cold-starting rather than a failure, so it can be remembered and retried
+  later instead of blocking.
 
 ## Install
 
@@ -50,44 +52,86 @@ session resumes by skipping files the server reports as already uploaded.
 ```python
 from eea_datalakehouse.catalog import Catalog, EngineStartingError
 
-# base_url/token are Dremio's own (not DDS) — REST by default; set
-# EEA_CATALOG_TRANSPORT=flight in the environment to use Arrow Flight SQL instead.
-catalog = Catalog(DREMIO_BASE_URL, DREMIO_TOKEN)
+# base_url/token are Dremio's own (not DDS). `username` is only needed for
+# datacopy/datamove (Arrow Flight's basic-auth handshake) — everything else
+# runs over Dremio's REST SQL Jobs API regardless of EEA_CATALOG_TRANSPORT.
+with Catalog(DREMIO_BASE_URL, DREMIO_TOKEN, username=DREMIO_USERNAME) as catalog:
+    try:
+        catalog.table2view(
+            "bwd.consumer", "bwd.draft.bw_assessment", idempotency_key="bwd-v2025_1"
+        )
+    except EngineStartingError:
+        # A cold Dremio engine looks like a stalled call, not a failure — the
+        # attempt is remembered under its idempotency_key; call it again later:
+        catalog.retry_pending("bwd-v2025_1")
 
-try:
-    catalog.table2view(
-        "bwd.consumer", "bwd.draft.bw_assessment", idempotency_key="bwd-v2025_1"
-    )
-except EngineStartingError:
-    # A cold Dremio engine looks like a stalled call, not a failure — the
-    # attempt is remembered under its idempotency_key; call it again later:
-    catalog.retry_pending("bwd-v2025_1")
+    info = catalog.gettableitemsfrom("bwd.versions.v2025_1.assessments", idempotency_key="check-1")
+    print(info.schema, info.row_count)             # schema + row count, no rows fetched
 
-info = catalog.gettableitemsfrom("bwd.versions.v2025_1.assessments", idempotency_key="check-1")
-print(info.schema, info.row_count)             # schema + row count, no rows fetched
-
-catalog.gettablesfrom("bwd", idempotency_key="list-1")   # recurses into every subfolder
+    catalog.gettablesfrom("bwd", idempotency_key="list-1")   # recurses into every subfolder
+# `with` calls catalog.close() on exit, disposing the REST/Flight session(s).
+# If you don't use `with`, call catalog.close() yourself when done — a
+# process-exit/SIGTERM fallback covers a caller that forgets either way.
 ```
 
-- `table2view(view_path, source_path)` — the one-time `DROP TABLE` + `CREATE VIEW` transition
-  for a location that started as a physical table (straight off ingest) and is moving to being
-  a view; checks `source_path` exists first, and (by default) creates `view_path`'s containing
-  folder if it's missing.
+Every operation takes `idempotency_key=` (keyword-only). On `EngineStartingError` — a stalled
+call, most likely a cold-starting Dremio engine, not a real failure — the attempt is remembered
+under that key; call `catalog.retry_pending(idempotency_key)` later to pick it back up with the
+exact same arguments.
+
+### Catalog operations
+
+**Table/view lifecycle**
+- `table2view(view_path, source_path, create_target_folder=True)` — the one-time `DROP TABLE` +
+  `CREATE VIEW` transition for a location that started as a physical table (straight off ingest)
+  and is moving to being a view. Checks `source_path` exists first; by default also creates
+  `view_path`'s containing folder if missing.
 - `draft2version(draft_path, version_path)` / `publishversion(consumer_view_path, version_path)`
   — **not implemented yet** (both raise `NotImplementedError`); promoting a draft table into a
   permanent version and repointing a consumer-facing view at it.
-- `datacopy(source_path, target_path, overwrite=False)` / `datamove(...)` — copy or move a
-  table/view between catalog paths, over Arrow Flight. `overwrite=False` (the default) raises if
-  `target_path` already exists; `overwrite=True` replaces it.
 - `deleteview(view_path)` — `DROP VIEW IF EXISTS`.
-- `gettablesfrom(schema_path)` / `gettableitemsfrom(table_path)` — list every table/view under
-  a path (recursively), or get one table's schema and row count without fetching any rows.
-- `createfolder(path, create_parents=False)` / `deletefolder(path, cascade=False)` — REST-only
-  (folders have no SQL/Flight equivalent), idempotent. `create_parents=False` (the default)
-  raises if the parent is missing rather than creating a deep new path; `cascade=False` (the
-  default) raises if the folder still has contents rather than deleting them.
+
+**Copying/moving data** — always over Arrow Flight SQL, never REST, regardless of
+`EEA_CATALOG_TRANSPORT` (needs `username=` on `Catalog(...)` for the Flight auth handshake):
+- `datacopy(source_path, target_path, overwrite=False, create_target_folder=False)` — `CREATE
+  TABLE ... AS SELECT`. If `target_path` is an existing *folder* rather than a specific
+  table/view path, the source's own name is appended to it (`cp source dest/` semantics).
+  `overwrite=False` (the default) raises if the (possibly folder-adjusted) target already
+  exists; `overwrite=True` detects whatever is actually there — it might be a view, not a table
+  — and drops it with the matching verb first.
+- `datamove(source_path, target_path, entry_type=None, overwrite=False,
+  create_target_folder=False)` — copies then drops the source. `entry_type` (`"TABLE"`/`"VIEW"`)
+  is auto-detected via `INFORMATION_SCHEMA` when not given, rather than trusting a caller to get
+  it right. Same folder-append and `overwrite` behavior as `datacopy`. After the move, verifies
+  `target_path` actually exists in the catalog before declaring success, rather than trusting a
+  silent CREATE/DROP.
+
+**Discovery**
+- `gettablesfrom(schema_path)` — every table/view under `schema_path`, recursing into
+  subfolders; returns full dot-separated paths.
+- `gettableitemsfrom(table_path)` — one table/view's schema (`{column: DATA_TYPE}`) and row
+  count, without fetching any actual rows.
+
+**Wiki & tags** (Dremio's catalog collaboration API — REST-only, no SQL/Flight equivalent):
+- `getwikifrom(path)` / `assignwikito(path, text)` — read, or create/overwrite, the wiki text on
+  a catalog entity.
+- `gettagsfrom(path)` / `assigntagsto(path, tags)` / `deletetags(path, tags)` — read the full tag
+  list; replace it wholesale; or remove just the given tags, leaving the rest untouched.
+
+**Folders** (REST-only, idempotent — an already-there/already-gone folder is not an error):
+- `createfolder(path, create_parents=False)` — `create_parents=False` (the default) raises if
+  the parent is missing rather than creating a deep new path; `create_parents=True` creates
+  every missing level.
+- `deletefolder(path, cascade=False)` — `cascade=False` (the default) raises if the folder still
+  has contents; `cascade=True` deletes every table/view and subfolder inside first, depth-first.
+
+**Retrying**
 - `retry_pending(idempotency_key)` — re-attempt whatever last stalled on an `EngineStartingError`,
   using the same arguments it was originally called with.
+
+**Lifecycle**
+- `catalog.close()` (or `with Catalog(...) as catalog:`) — disposes the REST/Flight session(s).
+  Idempotent, and covered by a process-exit/SIGTERM fallback if you forget.
 
 ## Layout
 
@@ -98,10 +142,10 @@ catalog.gettablesfrom("bwd", idempotency_key="list-1")   # recurses into every s
 | `dds_ingestion/client.py` | thin, unit-testable HTTP client (`IngestClient`) |
 | `dds_ingestion/progress.py` | tqdm progress bar with graceful fallback |
 | `dds_ingestion/folder.py` | `FolderIngest` orchestration (scan/parallel/resume) |
-| `catalog/client.py` | `Catalog` — one connection, every operation as a method |
-| `catalog/operations.py` | the operations themselves (table2view, draft2version, ...), as functions taking an executor |
+| `catalog/client.py` | `Catalog` — two connections (REST + Flight), every operation as a method |
+| `catalog/operations.py` | the operations themselves (table2view, datacopy, createfolder, ...), as functions taking an executor and/or a `CatalogRestClient` |
 | `catalog/sql.py` | `SqlExecutor` protocol + REST/Flight implementations, `resolve_executor()` (transport env var) |
-| `catalog/rest.py` | `CatalogRestClient` — Dremio's native `/api/v3/catalog` for folder existence/creation (no SQL equivalent) |
+| `catalog/rest.py` | `CatalogRestClient` — Dremio's native `/api/v3/catalog` for folders, wiki, and tags (none of which have a SQL/Flight equivalent) |
 | `catalog/retry_state.py` | persisted memory of stalled attempts, for `retry_pending()` |
 | `catalog/errors.py` | `CatalogOperationError`, `EngineStartingError` |
 
