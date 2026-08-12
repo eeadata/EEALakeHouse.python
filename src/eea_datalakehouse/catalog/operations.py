@@ -1,6 +1,7 @@
 """The catalog operations: table2view, draft2version, publishversion,
 datacopy, datamove, deleteview, gettablesfrom, gettableitemsfrom,
-getwikifrom, gettagsfrom, assignwikito, assigntagsto, deletetags.
+getwikifrom, gettagsfrom, assignwikito, assigntagsto, deletetags,
+createfolder, deletefolder.
 
 Each takes a :class:`~eea_datalakehouse.catalog.sql.SqlExecutor` (REST or
 Flight — the operation doesn't care which) and an `idempotency_key`. On
@@ -34,11 +35,21 @@ relying on this:
   message says which step it got to, but resolving that specific case is
   left to the caller (check the catalog, then call retry_pending or finish
   the DROP by hand).
-* ``table2view``'s ``create_target_folder=True`` (the default) needs a
-  ``catalog_rest=`` (a :class:`~eea_datalakehouse.catalog.rest.CatalogRestClient`)
-  to check/create the view's containing folder — folder creation has no SQL
-  or Flight equivalent. Pass ``create_target_folder=False`` if you don't
-  have one and know the folder already exists.
+* ``table2view``, ``datacopy``, and ``datamove`` all check `source_path`
+  actually exists (as a table or view) before doing anything else, so a
+  typo fails with a clear message instead of a confusing CTAS/CREATE VIEW
+  error. Each also takes ``create_target_folder=`` — ``True`` by default
+  for ``table2view``, ``False`` by default for ``datacopy``/``datamove`` —
+  which, when true, needs a ``catalog_rest=`` (a
+  :class:`~eea_datalakehouse.catalog.rest.CatalogRestClient`) to check/create
+  the target's containing folder, since folder creation has no SQL or
+  Flight equivalent.
+* When Flight is the selected transport, ``FlightSqlExecutor`` holds one
+  ``FlightClient`` (a persistent gRPC channel) for its whole lifetime
+  instead of reconnecting per statement — data operations like
+  ``datacopy``/``datamove`` run several statements (existence check,
+  folder creation, the CTAS/DROP itself) through the same executor, so this
+  session reuse is what keeps them from paying a fresh handshake per step.
 * ``getwikifrom`` / ``gettagsfrom`` / ``assignwikito`` / ``assigntagsto`` are
   REST-only for the same reason: Dremio wikis/tags have no SQL or Flight
   equivalent, so they take a ``catalog_rest`` directly rather than a
@@ -50,6 +61,15 @@ relying on this:
   semantics of that version field are unverified against a real deployment
   (see rest.py's docstring). ``assigntagsto`` *replaces* the tag set, it
   doesn't merge with the existing tags.
+* ``createfolder``/``deletefolder`` are REST-only for the same reason —
+  folder creation/deletion has no SQL or Flight equivalent. Both are
+  idempotent (an already-there/already-gone folder is not an error).
+  ``createfolder(create_parents=False)`` (the default) raises if the
+  parent is missing rather than silently creating a deep new path.
+  ``deletefolder(cascade=False)`` (the default) raises if the folder
+  still has contents; ``cascade=True`` deletes everything inside first,
+  depth-first (see `CatalogRestClient.delete_folder`'s docstring for the
+  unverified assumption its cascade path relies on).
 """
 
 from __future__ import annotations
@@ -185,6 +205,48 @@ def _entry_exists(executor: SqlExecutor, path: str, *, idempotency_key: str) -> 
     return len(rows) > 0
 
 
+def _entry_kind(executor: SqlExecutor, path: str, *, idempotency_key: str) -> Literal["TABLE", "VIEW"]:
+    """Whether `path` is a Dremio TABLE or VIEW, via INFORMATION_SCHEMA's
+    own ``TABLE_TYPE`` column — doubles as an existence check.
+
+    Raises `CatalogOperationError` if `path` doesn't exist at all. Used by
+    `datamove` to auto-detect `entry_type` rather than trusting a caller
+    to have gotten it right — a ``DROP VIEW`` on an actual table (or vice
+    versa) fails outright with "is not a VIEW"/"is not a TABLE", which is
+    exactly the failure this sidesteps.
+    """
+    schema_path = _parent_path(path)
+    if schema_path is None:
+        raise ValueError(f"{path!r} has no containing schema")
+    leaf = path.rsplit(".", 1)[-1]
+    sql = (
+        'SELECT "TABLE_TYPE" FROM INFORMATION_SCHEMA."TABLES" '
+        f"WHERE \"TABLE_SCHEMA\" = {_quote_literal(schema_path)} "
+        f"AND \"TABLE_NAME\" = {_quote_literal(leaf)}"
+    )
+    rows = executor.fetch_all(sql, idempotency_key=idempotency_key)
+    if not rows:
+        raise CatalogOperationError(f"{path!r} does not exist")
+    return "VIEW" if "VIEW" in str(rows[0].get("TABLE_TYPE", "")).upper() else "TABLE"
+
+
+def _resolve_target_path(
+    catalog_rest: CatalogRestClient | None, target_path: str, source_path: str
+) -> str:
+    """`cp source dest/` semantics: if `target_path` is an existing folder
+    rather than a specific table/view path, land the copy/move *inside* it
+    under the source's own name, instead of literally trying to name the
+    folder itself the target.
+
+    Best-effort — with no `catalog_rest` to ask, `target_path` is used
+    exactly as given (the pre-existing behavior).
+    """
+    if catalog_rest is not None and catalog_rest.is_folder(target_path):
+        leaf = source_path.rsplit(".", 1)[-1]
+        return f"{target_path}.{leaf}"
+    return target_path
+
+
 def table2view(
     executor: SqlExecutor,
     view_path: str,
@@ -308,29 +370,89 @@ def datacopy(
     source_path: str,
     target_path: str,
     *,
-    mode: Literal["create", "replace"] = "create",
+    overwrite: bool = False,
+    create_target_folder: bool = False,
+    catalog_rest: CatalogRestClient | None = None,
     idempotency_key: str,
 ) -> SqlResult:
     """Copy data from `source_path` into `target_path`.
 
-    ``mode="create"`` (default) is a plain CTAS — fails loudly if
-    `target_path` already exists, so you don't silently overwrite something.
-    ``mode="replace"`` drops `target_path` first (``IF EXISTS``, idempotent),
-    for a caller that has already decided overwriting is correct.
+    Checks `source_path` actually exists (as a table or view) before doing
+    anything else, so a typo fails with a clear message instead of a
+    confusing CTAS error. If `target_path` is an existing folder rather
+    than a specific table/view path, the source's own name is appended to
+    it — `cp source dest/` semantics, landing the copy inside that folder
+    under the same name (needs `catalog_rest`; skipped, using `target_path`
+    exactly as given, without one).
+
+    `overwrite=False` (the default) checks the (possibly folder-adjusted)
+    target explicitly and raises `CatalogOperationError` if it already
+    exists, rather than letting a bare CTAS fail with Dremio's own less
+    specific error — so you don't silently overwrite something.
+    `overwrite=True` drops it first (``IF EXISTS``, idempotent), for a
+    caller that has already decided overwriting is correct. When
+    `create_target_folder` is true, also ensures its containing folder
+    exists first, creating any missing levels — this requires
+    `catalog_rest`.
     """
-    statements = []
-    if mode == "replace":
-        statements.append(f"DROP TABLE IF EXISTS {_quote_path(target_path)}")
-    statements.append(
-        f"CREATE TABLE {_quote_path(target_path)} AS SELECT * FROM {_quote_path(source_path)}"
-    )
-    return _run_steps(
-        executor,
-        statements,
+    params: dict[str, Any] = {
+        "source_path": source_path,
+        "target_path": target_path,
+        "overwrite": overwrite,
+        "create_target_folder": create_target_folder,
+    }
+
+    def check_source_exists() -> None:
+        if not _entry_exists(executor, source_path, idempotency_key=idempotency_key):
+            raise CatalogOperationError(f"source {source_path!r} does not exist")
+
+    def resolve_target() -> None:
+        nonlocal target_path
+        target_path = _resolve_target_path(catalog_rest, target_path, source_path)
+        params["target_path"] = target_path
+
+    def ensure_target_folder() -> None:
+        if not create_target_folder:
+            return
+        parent = _parent_path(target_path)
+        if parent is None:
+            return
+        if catalog_rest is None:
+            raise CatalogOperationError(
+                "datacopy(create_target_folder=True) needs catalog_rest= "
+                "to check/create the target folder"
+            )
+        catalog_rest.ensure_folder_path(parent)
+
+    def check_or_drop_target() -> None:
+        if not _entry_exists(executor, target_path, idempotency_key=idempotency_key):
+            return  # nothing there — nothing to check or drop
+        if not overwrite:
+            raise CatalogOperationError(
+                f"target {target_path!r} already exists — pass overwrite=True to replace it"
+            )
+        # Drop whatever it actually is (it might be a view, not a table,
+        # from an earlier different operation) — DROP TABLE on a view (or
+        # vice versa) fails outright, the same class of bug datamove's
+        # entry_type auto-detection exists to avoid.
+        existing_kind = _entry_kind(executor, target_path, idempotency_key=idempotency_key)
+        executor.execute(
+            f"DROP {existing_kind} IF EXISTS {_quote_path(target_path)}",
+            idempotency_key=idempotency_key,
+        )
+
+    def copy_data() -> SqlResult:
+        return executor.execute(
+            f"CREATE TABLE {_quote_path(target_path)} AS SELECT * FROM {_quote_path(source_path)}",
+            idempotency_key=idempotency_key,
+        )
+
+    return _run_actions(
+        [check_source_exists, resolve_target, ensure_target_folder, check_or_drop_target, copy_data],
         operation="datacopy",
         target=target_path,
         idempotency_key=idempotency_key,
-        params={"source_path": source_path, "target_path": target_path, "mode": mode},
+        params=params,
     )
 
 
@@ -339,33 +461,146 @@ def datamove(
     source_path: str,
     target_path: str,
     *,
-    entry_type: Literal["TABLE", "VIEW"],
+    entry_type: Literal["TABLE", "VIEW"] | None = None,
+    overwrite: bool = False,
+    create_target_folder: bool = False,
+    catalog_rest: CatalogRestClient | None = None,
     idempotency_key: str,
 ) -> SqlResult:
     """Move a table or view from `source_path` to `target_path` (copy, then drop).
 
-    `entry_type` must be given explicitly — this does not query
-    ``INFORMATION_SCHEMA`` to detect it, so a retry never risks a second
-    (possibly stale) round trip guessing what `source_path` is before doing
-    the real work. See the module docstring for the one partial-failure case
-    this doesn't fully cover (CREATE succeeds, DROP then stalls).
+    `entry_type` is auto-detected via INFORMATION_SCHEMA (``TABLE_TYPE``,
+    see `_entry_kind`) when not given — that same query doubles as the
+    source-exists check. Getting `entry_type` wrong yourself (e.g.
+    `source_path` was a table, not a view) fails the DROP outright with
+    "is not a VIEW"/"is not a TABLE"; auto-detection sidesteps that
+    entirely. Re-querying on a retry is safe here — `source_path` itself
+    is untouched until the final DROP, so what it *is* can't have changed
+    out from under a stalled attempt. Pass `entry_type` explicitly only to
+    skip that lookup (you already know it) or override a detection you
+    don't trust.
+
+    If `target_path` is an existing folder rather than a specific
+    table/view path, the source's own name is appended to it — `cp source
+    dest/` semantics, landing the move inside that folder under the same
+    name (needs `catalog_rest`; skipped, using `target_path` exactly as
+    given, without one).
+
+    `overwrite=False` (the default) checks the (possibly folder-adjusted)
+    target explicitly and raises `CatalogOperationError` if it already
+    exists, rather than letting a bare CTAS fail with Dremio's own less
+    specific error. `overwrite=True` drops whatever is actually there
+    first (detecting its real kind — it might be a view, not a table, or
+    vice versa, from an earlier different operation; blindly dropping the
+    wrong kind fails outright, same as the `entry_type` problem above).
+    When `create_target_folder` is true, also ensures the (possibly
+    folder-adjusted) target's containing folder exists first — this
+    requires `catalog_rest`.
+
+    After DROP, checks that `target_path` actually exists in the catalog
+    before declaring success — neither CREATE nor DROP raising is proof
+    either one actually happened server-side (Flight SQL's completion
+    semantics for a no-result-rows DDL statement aren't something this
+    module has verified against a real deployment); raises
+    `CatalogOperationError` if the target isn't there. See the module
+    docstring for the one partial-failure case this doesn't fully cover
+    (CREATE succeeds, DROP then stalls).
     """
-    create_kind = "VIEW" if entry_type == "VIEW" else "TABLE"
-    statements = [
-        f"CREATE {create_kind} {_quote_path(target_path)} AS SELECT * FROM {_quote_path(source_path)}",
-        f"DROP {create_kind} {_quote_path(source_path)}",
-    ]
-    return _run_steps(
-        executor,
-        statements,
+    create_kind: str = entry_type if entry_type is not None else "TABLE"
+    params: dict[str, Any] = {
+        "source_path": source_path,
+        "target_path": target_path,
+        "entry_type": entry_type,
+        "overwrite": overwrite,
+        "create_target_folder": create_target_folder,
+    }
+
+    def check_or_detect_source() -> None:
+        nonlocal create_kind
+        if entry_type is not None:
+            if not _entry_exists(executor, source_path, idempotency_key=idempotency_key):
+                raise CatalogOperationError(f"source {source_path!r} does not exist")
+            return
+        create_kind = _entry_kind(executor, source_path, idempotency_key=idempotency_key)
+
+    def resolve_target() -> None:
+        nonlocal target_path
+        target_path = _resolve_target_path(catalog_rest, target_path, source_path)
+        params["target_path"] = target_path
+
+    def ensure_target_folder() -> None:
+        if not create_target_folder:
+            return
+        parent = _parent_path(target_path)
+        if parent is None:
+            return
+        if catalog_rest is None:
+            raise CatalogOperationError(
+                "datamove(create_target_folder=True) needs catalog_rest= "
+                "to check/create the target folder"
+            )
+        catalog_rest.ensure_folder_path(parent)
+
+    def check_or_drop_target() -> None:
+        if not _entry_exists(executor, target_path, idempotency_key=idempotency_key):
+            return  # nothing there — nothing to check or drop
+        if not overwrite:
+            raise CatalogOperationError(
+                f"target {target_path!r} already exists — pass overwrite=True to replace it"
+            )
+        existing_kind = _entry_kind(executor, target_path, idempotency_key=idempotency_key)
+        executor.execute(
+            f"DROP {existing_kind} IF EXISTS {_quote_path(target_path)}",
+            idempotency_key=idempotency_key,
+        )
+
+    move_result: SqlResult | None = None
+
+    def move_data() -> SqlResult:
+        nonlocal move_result
+        move_result = executor.execute(
+            f"CREATE {create_kind} {_quote_path(target_path)} AS "
+            f"SELECT * FROM {_quote_path(source_path)}",
+            idempotency_key=idempotency_key,
+        )
+        return move_result
+
+    def drop_source() -> SqlResult:
+        return executor.execute(
+            f"DROP {create_kind} {_quote_path(source_path)}", idempotency_key=idempotency_key
+        )
+
+    def verify_target_exists() -> SqlResult:
+        # Neither CREATE nor DROP raising is proof either one actually
+        # happened — Arrow Flight SQL's completion semantics for a DDL
+        # statement with no result rows are exactly the kind of thing this
+        # module's own docstring flags as unverified against a real
+        # deployment. Check the catalog itself rather than trust the
+        # executor's silence.
+        if not _entry_exists(executor, target_path, idempotency_key=idempotency_key):
+            raise CatalogOperationError(
+                f"target {target_path!r} does not exist after CREATE {create_kind} — "
+                "the move did not actually complete"
+            )
+        # _run_actions returns whichever action ran last — this one, not
+        # move_data — so it has to be the one to hand back the real result.
+        assert move_result is not None
+        return move_result
+
+    return _run_actions(
+        [
+            check_or_detect_source,
+            resolve_target,
+            ensure_target_folder,
+            check_or_drop_target,
+            move_data,
+            drop_source,
+            verify_target_exists,
+        ],
         operation="datamove",
         target=target_path,
         idempotency_key=idempotency_key,
-        params={
-            "source_path": source_path,
-            "target_path": target_path,
-            "entry_type": entry_type,
-        },
+        params=params,
     )
 
 
@@ -613,6 +848,81 @@ def deletetags(
     retry_state.clear(idempotency_key)
 
 
+def createfolder(
+    catalog_rest: CatalogRestClient,
+    path: str,
+    *,
+    create_parents: bool = False,
+    idempotency_key: str,
+) -> None:
+    """Create the folder at `path`.
+
+    REST-only (see module docstring) — folder creation has no SQL or
+    Flight equivalent. Idempotent: a folder that's already there is left
+    alone, not an error.
+
+    `create_parents=False` (the default) requires everything above the
+    leaf to already exist — raises `CatalogOperationError` if the parent
+    folder is missing, rather than silently creating a deep new path.
+    `create_parents=True` creates every missing level instead (via
+    `CatalogRestClient.ensure_folder_path`) — same "the space/source
+    itself is never created automatically" rule as elsewhere in this
+    module.
+    """
+
+    def check_parent_exists() -> None:
+        if create_parents:
+            return
+        parent = _parent_path(path)
+        if parent is None:
+            raise CatalogOperationError(f"{path!r} has no parent folder to create it under")
+        if not catalog_rest.exists(parent):
+            raise CatalogOperationError(
+                f"parent {parent!r} does not exist — pass create_parents=True "
+                "to create missing levels automatically"
+            )
+
+    def create() -> None:
+        if create_parents:
+            catalog_rest.ensure_folder_path(path)
+        else:
+            catalog_rest.create_folder(path)
+
+    _run_actions(
+        [check_parent_exists, create],
+        operation="createfolder",
+        target=path,
+        idempotency_key=idempotency_key,
+        params={"path": path, "create_parents": create_parents},
+    )
+
+
+def deletefolder(
+    catalog_rest: CatalogRestClient,
+    path: str,
+    *,
+    cascade: bool = False,
+    idempotency_key: str,
+) -> None:
+    """Delete the folder at `path`.
+
+    REST-only (see module docstring) — folder deletion has no SQL or
+    Flight equivalent. Idempotent: a folder that's already gone is not an
+    error. `cascade=False` (the default) raises `CatalogOperationError` if
+    the folder still has contents — `rmdir` vs `rm -r`. `cascade=True`
+    deletes every table/view and subfolder inside first, depth-first, then
+    the folder itself (see `CatalogRestClient.delete_folder`).
+    """
+    try:
+        catalog_rest.delete_folder(path, cascade=cascade)
+    except EngineStartingError as exc:
+        retry_state.record(
+            idempotency_key, "deletefolder", path, str(exc), params={"path": path, "cascade": cascade}
+        )
+        raise
+    retry_state.clear(idempotency_key)
+
+
 _OPERATIONS = {
     "table2view": table2view,
     "draft2version": draft2version,
@@ -627,6 +937,8 @@ _OPERATIONS = {
     "assignwikito": assignwikito,
     "assigntagsto": assigntagsto,
     "deletetags": deletetags,
+    "createfolder": createfolder,
+    "deletefolder": deletefolder,
 }
 
 

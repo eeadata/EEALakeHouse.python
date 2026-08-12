@@ -120,6 +120,19 @@ def test_resolve_executor_picks_flight_when_configured(monkeypatch: pytest.Monke
     executor = resolve_executor(BASE_URL, "pat")
 
     assert isinstance(executor, FlightSqlExecutor)
+    # BASE_URL is https:// — the default location must follow suit with
+    # grpc+tls, not plain grpc.
+    assert executor._location == "grpc+tls://dremio.example.test:32010"
+
+
+def test_default_flight_location_uses_plain_grpc_for_an_http_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(TRANSPORT_ENV_VAR, "flight")
+    monkeypatch.delenv(FLIGHT_LOCATION_ENV_VAR, raising=False)
+
+    executor = resolve_executor("http://dremio.example.test", "pat")
+
     assert executor._location == "grpc://dremio.example.test:32010"
 
 
@@ -143,3 +156,73 @@ def test_resolve_executor_explicit_flight_location_wins_over_env_var(
     executor = resolve_executor(BASE_URL, "pat", flight_location="grpc://explicit:5678")
 
     assert executor._location == "grpc://explicit:5678"
+
+
+def test_flight_executor_reuses_one_client_across_calls() -> None:
+    executor = FlightSqlExecutor("grpc://localhost:1234", "user", "pat")
+
+    first = executor._get_client()
+    second = executor._get_client()
+
+    assert first is second
+
+
+def test_flight_executor_close_drops_its_own_client() -> None:
+    executor = FlightSqlExecutor("grpc://localhost:1234", "user", "pat")
+    executor._get_client()
+
+    executor.close()
+
+    assert executor._client is None
+
+
+def test_flight_executor_does_not_close_an_injected_client() -> None:
+    class FakeFlightClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    fake_client = FakeFlightClient()
+    executor = FlightSqlExecutor("grpc://localhost:1234", "user", "pat", flight_client=fake_client)
+
+    executor.close()
+
+    assert fake_client.closed is False
+    assert executor._client is fake_client
+
+
+class _FakeAuthenticatingFlightClient:
+    def __init__(self) -> None:
+        self.authenticate_calls = 0
+
+    def authenticate_basic_token(self, username: str, password: str, options=None):
+        self.authenticate_calls += 1
+        return (b"authorization", f"Bearer session-for-{username}".encode())
+
+    def close(self) -> None:
+        pass
+
+
+def test_flight_executor_authenticates_once_and_caches_the_header() -> None:
+    fake_client = _FakeAuthenticatingFlightClient()
+    executor = FlightSqlExecutor(
+        "grpc://localhost:1234", "alice", "pat", flight_client=fake_client
+    )
+
+    first = executor._call_options()
+    second = executor._call_options()
+
+    assert fake_client.authenticate_calls == 1
+    assert first.headers == [(b"authorization", b"Bearer session-for-alice")]
+    assert second.headers == first.headers
+
+
+def test_flight_executor_raises_clear_error_when_username_missing() -> None:
+    executor = FlightSqlExecutor(
+        "grpc://localhost:1234", None, "pat", flight_client=_FakeAuthenticatingFlightClient()
+    )
+
+    with pytest.raises(CatalogOperationError, match="needs a username"):
+        executor._call_options()
