@@ -10,6 +10,7 @@ venv/
 .mypy_cache/
 .ruff_cache/
 .claude/
-debugger/
+debugger/bathing_water/
 .env
 .env.*
+!debugger/.env.example

@@ -6,9 +6,9 @@ dds_ingestion's IngestClient/FolderIngest):
 
 table2view, draft2version, publishversion, datacopy, datamove, deleteview,
 gettablesfrom, gettableitemsfrom, getwikifrom, gettagsfrom, assignwikito,
-assigntagsto, deletetags — over REST (the default) or Arrow Flight (opt in
-via EEA_CATALOG_TRANSPORT=flight in .env), with retry-later error handling
-for a Dremio engine that's still starting up.
+assigntagsto, deletetags, createfolder, deletefolder — over REST (the
+default) or Arrow Flight (opt in via EEA_CATALOG_TRANSPORT=flight in .env),
+with retry-later error handling for a Dremio engine that's still starting up.
 
 The module-level functions in `operations` (table2view(executor, ...) etc.)
 are what `Catalog`'s methods delegate to — call them directly if you'd
@@ -23,8 +23,10 @@ from .operations import (
     TableInfo,
     assigntagsto,
     assignwikito,
+    createfolder,
     datacopy,
     datamove,
+    deletefolder,
     deletetags,
     deleteview,
     draft2version,
@@ -61,8 +63,10 @@ __all__ = [
     "TableInfo",
     "assigntagsto",
     "assignwikito",
+    "createfolder",
     "datacopy",
     "datamove",
+    "deletefolder",
     "deletetags",
     "deleteview",
     "draft2version",

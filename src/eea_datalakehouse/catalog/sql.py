@@ -67,42 +67,57 @@ class SqlExecutor(Protocol):
 
 
 def _default_flight_location(base_url: str) -> str:
-    """Best-effort Flight location derived from a REST base_url's host.
+    """Best-effort Flight location derived from a REST base_url's host and
+    scheme.
 
     Dremio's REST API and Flight endpoint are different ports on the same
-    host, not the same URL — this only supplies the host; the port is
-    DEFAULT_FLIGHT_PORT, which is Dremio's documented default and has not
-    been verified against this project's actual deployment. Prefer passing
-    `flight_location` explicitly, or set DREMIO_FLIGHT_LOCATION, if that
-    default is wrong for you.
+    host, not the same URL — this borrows the host from base_url, and its
+    TLS-ness too (an https base_url gets grpc+tls, not plain grpc — a
+    Dremio deployment terminating REST in TLS almost always requires Flight
+    over TLS as well; connecting with plain grpc to a TLS-only endpoint
+    fails with a misleading "Socket closed" rather than a clear protocol
+    error). The port is DEFAULT_FLIGHT_PORT, which is Dremio's documented
+    default and has not been verified against this project's actual
+    deployment. Prefer passing `flight_location` explicitly, or set
+    DREMIO_FLIGHT_LOCATION, if either guess is wrong for you.
     """
-    host = urlsplit(base_url).hostname or base_url
-    return f"grpc://{host}:{DEFAULT_FLIGHT_PORT}"
+    parsed = urlsplit(base_url)
+    host = parsed.hostname or base_url
+    scheme = "grpc+tls" if parsed.scheme == "https" else "grpc"
+    return f"{scheme}://{host}:{DEFAULT_FLIGHT_PORT}"
+
+
+def resolve_flight_location(base_url: str, flight_location: str | None = None) -> str:
+    """The Flight location to actually connect to: explicit `flight_location`,
+    else DREMIO_FLIGHT_LOCATION, else a best-effort default derived from
+    `base_url`'s host (see `_default_flight_location`)."""
+    return (
+        flight_location or os.environ.get(FLIGHT_LOCATION_ENV_VAR) or _default_flight_location(base_url)
+    )
 
 
 def resolve_executor(
     base_url: str,
     token: str,
     *,
+    username: str | None = None,
     flight_location: str | None = None,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> SqlExecutor:
     """REST by default; Arrow Flight when EEA_CATALOG_TRANSPORT=flight.
 
-    `flight_location` (or DREMIO_FLIGHT_LOCATION if that's not given) is only
-    consulted when Flight is actually selected — REST callers never need to
-    know or care about it.
+    `flight_location` (or DREMIO_FLIGHT_LOCATION if that's not given) and
+    `username` are only consulted when Flight is actually selected — REST
+    callers never need to know or care about either (REST authenticates
+    with `token` alone).
     """
     transport = os.environ.get(TRANSPORT_ENV_VAR, "").strip().lower()
     if transport != "flight":
         return RestSqlExecutor(base_url, token, timeout=timeout)
 
-    location = (
-        flight_location
-        or os.environ.get(FLIGHT_LOCATION_ENV_VAR)
-        or _default_flight_location(base_url)
+    return FlightSqlExecutor(
+        resolve_flight_location(base_url, flight_location), username, token, timeout=timeout
     )
-    return FlightSqlExecutor(location, token, timeout=timeout)
 
 
 class RestSqlExecutor:
@@ -237,33 +252,94 @@ class RestSqlExecutor:
 class FlightSqlExecutor:
     """Runs SQL through Dremio's Arrow Flight SQL endpoint.
 
-    Authenticates with the Dremio PAT as a bearer token on each call
-    (matching how dds_ingestion authenticates to DDS) rather than the
-    username/password handshake — one less round trip, and no session token
-    to manage.
+    Authenticates with `username`/`token` (the Dremio PAT used as the
+    password) via Flight's own HTTP-basic handshake
+    (`FlightClient.authenticate_basic_token`), the same username/password
+    auth `DREMIO_USER`/`DREMIO_TOKEN` already provide elsewhere in this
+    project — rather than sending the raw PAT as a bearer header directly
+    (some Dremio deployments reject that on the Flight endpoint even though
+    REST accepts it). The handshake runs once and its resulting session
+    token is cached for the life of this executor, not repeated per call.
+
+    Holds one `FlightClient` (a persistent gRPC channel) for the executor's
+    whole lifetime instead of opening a new one per statement — data
+    operations like `datacopy`/`datamove` issue several statements through
+    the same executor (existence check, folder creation, the CTAS/DROP
+    itself), and reconnecting for each would be pure overhead. Call
+    `close()` when done, same as `RestSqlExecutor`.
     """
 
-    def __init__(self, location: str, token: str, *, timeout: float = DEFAULT_TIMEOUT) -> None:
+    def __init__(
+        self,
+        location: str,
+        username: str | None,
+        token: str,
+        *,
+        timeout: float = DEFAULT_TIMEOUT,
+        flight_client: Any | None = None,
+    ) -> None:
         self._location = location
+        self._username = username
         self._token = token
         self._timeout = timeout
+        self._owns_client = flight_client is None
+        self._client = flight_client
+        self._auth_header: tuple[bytes, bytes] | None = None
 
     def __repr__(self) -> str:
-        return f"FlightSqlExecutor(location={self._location!r})"
+        return f"FlightSqlExecutor(location={self._location!r}, username={self._username!r})"
 
-    def _call_options(self):
+    def close(self) -> None:
+        if self._owns_client and self._client is not None:
+            self._client.close()
+            self._client = None
+        self._auth_header = None
+
+    def _get_client(self):
+        import pyarrow.flight as flight
+
+        if self._client is None:
+            self._client = flight.FlightClient(self._location)
+        return self._client
+
+    def _authenticate(self, idempotency_key: str | None):
+        """The basic-auth handshake's bearer-token header, done once and
+        cached — reused by every call for this executor's whole lifetime,
+        same reasoning as `_get_client()` reusing one `FlightClient`."""
+        import pyarrow.flight as flight
+
+        if self._auth_header is None:
+            if not self._username:
+                raise CatalogOperationError(
+                    "FlightSqlExecutor needs a username to authenticate — "
+                    "pass Catalog(..., username=...) (e.g. DREMIO_USER)"
+                )
+            client = self._get_client()
+            try:
+                self._auth_header = client.authenticate_basic_token(
+                    self._username, self._token, flight.FlightCallOptions(timeout=self._timeout)
+                )
+            except flight.FlightTimedOutError as exc:
+                raise EngineStartingError(
+                    "Flight authentication timed out (likely a starting engine)",
+                    idempotency_key=idempotency_key,
+                ) from exc
+            except flight.FlightServerError as exc:
+                raise CatalogOperationError(f"Flight authentication failed: {exc}") from exc
+        return self._auth_header
+
+    def _call_options(self, idempotency_key: str | None = None):
         import pyarrow.flight as flight
 
         return flight.FlightCallOptions(
-            timeout=self._timeout,
-            headers=[(b"authorization", f"Bearer {self._token}".encode())],
+            timeout=self._timeout, headers=[self._authenticate(idempotency_key)]
         )
 
     def _get_flight_info(self, sql: str, idempotency_key: str | None):
         import pyarrow.flight as flight
 
-        client = flight.FlightClient(self._location)
-        options = self._call_options()
+        client = self._get_client()
+        options = self._call_options(idempotency_key)
         descriptor = flight.FlightDescriptor.for_command(sql.encode())
         try:
             info = client.get_flight_info(descriptor, options)
