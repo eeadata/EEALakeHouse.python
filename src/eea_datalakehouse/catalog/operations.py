@@ -320,22 +320,9 @@ def draft2version(
 ) -> SqlResult:
     """Promote the draft table at `draft_path` into a permanent `version_path`.
 
-    CTAS, not a move — the draft stays exactly where ingest left it. Not
-    idempotent by itself (a retry after a real partial failure would hit
-    "table already exists"); pass a fresh `version_path` per release, as the
-    ``versions.v2025_1``-style convention already does.
+    Not implemented yet.
     """
-    statements = [
-        f"CREATE TABLE {_quote_path(version_path)} AS SELECT * FROM {_quote_path(draft_path)}",
-    ]
-    return _run_steps(
-        executor,
-        statements,
-        operation="draft2version",
-        target=version_path,
-        idempotency_key=idempotency_key,
-        params={"draft_path": draft_path, "version_path": version_path},
-    )
+    raise NotImplementedError("draft2version is not implemented yet")
 
 
 def publishversion(
@@ -347,22 +334,9 @@ def publishversion(
 ) -> SqlResult:
     """Repoint the consumer-facing view at `version_path`.
 
-    ``CREATE OR REPLACE VIEW`` — idempotent, safe to retry or re-run.
-    `consumer_view_path` must already be a view (see ``table2view`` for the
-    one-time conversion from a table).
+    Not implemented yet.
     """
-    statements = [
-        f"CREATE OR REPLACE VIEW {_quote_path(consumer_view_path)} AS "
-        f"SELECT * FROM {_quote_path(version_path)}",
-    ]
-    return _run_steps(
-        executor,
-        statements,
-        operation="publishversion",
-        target=consumer_view_path,
-        idempotency_key=idempotency_key,
-        params={"consumer_view_path": consumer_view_path, "version_path": version_path},
-    )
+    raise NotImplementedError("publishversion is not implemented yet")
 
 
 def datacopy(
