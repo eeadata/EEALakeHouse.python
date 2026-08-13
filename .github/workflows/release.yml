@@ -64,6 +64,32 @@ jobs:
       - name: Build sdist and wheel
         run: python -m build
 
+      # Only one release/tag is ever kept per branch — delete whatever this
+      # branch's previous release+tag was (main: a plain "v*" tag; staging:
+      # a "v*-staging" tag) before creating the new one below. Best-effort:
+      # a delete failure (e.g. nothing to delete yet) must not fail the
+      # release itself.
+      - name: Delete this branch's previous release and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          if [ "${{ github.ref_name }}" = "staging" ]; then
+            SUFFIX="-staging"
+          else
+            SUFFIX=""
+          fi
+          for TAG in $(gh release list --limit 100 --json tagName -q '.[].tagName'); do
+            case "$TAG" in
+              *-staging) TAG_SUFFIX="-staging" ;;
+              *) TAG_SUFFIX="" ;;
+            esac
+            if [ "$TAG_SUFFIX" = "$SUFFIX" ]; then
+              echo "Deleting previous release/tag for ${{ github.ref_name }}: $TAG"
+              gh release delete "$TAG" --cleanup-tag -y
+            fi
+          done
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:

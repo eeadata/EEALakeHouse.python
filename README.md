@@ -19,10 +19,17 @@ Two main class domains for the EEA data lakehouse:
 
 ## Install
 
-Install directly from GitHub, pinned to a released tag:
+[![Latest release](https://img.shields.io/github/v/release/eeadata/EEALakeHouse.python?label=latest%20release)](https://github.com/eeadata/EEALakeHouse.python/releases/latest)
+
+The badge above always shows the current latest release tag — substitute it for `v0.1.5` below
+if it's moved on since this was written (or check the [Releases page](https://github.com/eeadata/EEALakeHouse.python/releases/latest) directly).
 
 ```bash
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.0"
+# latest release (currently v0.1.5) — recommended: stable, pinned to a tag
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.5"
+
+# latest main — bleeding edge, whatever's currently merged, not pinned to a release
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@main"
 ```
 
 ## Usage
@@ -169,12 +176,23 @@ pytest
    Pushing to `main` without bumping the version re-publishes the release for
    the current version with the latest build artifacts.
 
+**Only one release/tag exists per branch at a time** — `main` always has exactly one `vX.Y.Z`
+release, `staging` exactly one `vX.Y.Z-staging` prerelease. Each new release deletes its branch's
+previous release *and* tag first, so **tags aren't permanent** — pin to whatever the
+[Install](#install) badge shows *now*, not to an old tag number, since it won't exist once a
+newer release replaces it.
+
 ## Install in JupyterLab
 
-Run this in a notebook cell, pinned to the release tag you want:
+Run this in a notebook cell — see the badge under [Install](#install) for the current latest
+release tag (`v0.1.5` as of this writing):
 
 ```python
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.0"
+# latest release (currently v0.1.5) — recommended
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.5"
+
+# latest main — bleeding edge, not pinned to a release
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@main"
 ```
 
 Use the `%pip` magic rather than `!pip` — it installs into the kernel the
@@ -186,9 +204,9 @@ Kernel...**) so the import below picks up the newly installed package:
 from eea_datalakehouse.dds_ingestion import FolderIngest
 ```
 
-Alternatively, download the wheel attached to the GitHub Release page for
-that tag and install the local file instead of pulling from git:
+Alternatively, download the wheel attached to the [GitHub Release page](https://github.com/eeadata/EEALakeHouse.python/releases/latest)
+for that tag and install the local file instead of pulling from git:
 
 ```python
-%pip install /path/to/EEADataLakehouse-0.1.0-py3-none-any.whl
+%pip install /path/to/EEADataLakehouse-0.1.5-py3-none-any.whl
 ```
