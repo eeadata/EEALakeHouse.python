@@ -19,17 +19,20 @@ Two main class domains for the EEA data lakehouse:
 
 ## Install
 
-[![Latest release](https://img.shields.io/github/v/release/eeadata/EEALakeHouse.python?label=latest%20release)](https://github.com/eeadata/EEALakeHouse.python/releases/latest)
+[![main](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Feeadata%2FEEALakeHouse.python%2Freleases&query=%24%5B%3F%28%40.prerelease%3D%3Dfalse%29%5D.tag_name&label=main&color=blue)](https://github.com/eeadata/EEALakeHouse.python/releases/latest)
+[![staging](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Feeadata%2FEEALakeHouse.python%2Freleases&query=%24%5B%3F%28%40.prerelease%3D%3Dtrue%29%5D.tag_name&label=staging&color=orange)](https://github.com/eeadata/EEALakeHouse.python/releases)
 
-The badge above always shows the current latest release tag — substitute it for `v0.1.5` below
-if it's moved on since this was written (or check the [Releases page](https://github.com/eeadata/EEALakeHouse.python/releases/latest) directly).
+These badges are live — each one queries the GitHub API directly and always shows whatever tag
+is *currently* released for that branch, updating on its own every time `main`/`staging` cuts a
+new release (see [Releasing a new version](#releasing-a-new-version) — only one tag exists per
+branch at a time, so pin to whatever the badge shows *now*, not a number copied from here).
 
 ```bash
-# latest release (currently v0.1.5) — recommended: stable, pinned to a tag
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.5"
+# main's latest release (stable) — pin to the tag the "main" badge above shows
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.6"
 
-# latest main — bleeding edge, whatever's currently merged, not pinned to a release
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@main"
+# staging's latest release (early access) — pin to the tag the "staging" badge above shows
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.6-staging"
 ```
 
 ## Usage
@@ -182,17 +185,23 @@ previous release *and* tag first, so **tags aren't permanent** — pin to whatev
 [Install](#install) badge shows *now*, not to an old tag number, since it won't exist once a
 newer release replaces it.
 
+The workflow also rewrites this README's `pip`/`%pip install ...@vX.Y.Z[-staging]` example lines
+to the version it just released, committing that change back to the branch (`[skip ci]`, so it
+doesn't re-trigger itself) — so the examples above never go stale, without anyone having to
+remember to update them by hand.
+
 ## Install in JupyterLab
 
-Run this in a notebook cell — see the badge under [Install](#install) for the current latest
-release tag (`v0.1.5` as of this writing):
+Run this in a notebook cell (see the live badges under [Install](#install) for the current
+`main`/`staging` release tags — the lines below are kept in sync with them automatically, see
+[Releasing a new version](#releasing-a-new-version)):
 
 ```python
-# latest release (currently v0.1.5) — recommended
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.5"
+# main's latest release (stable) — recommended
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.6"
 
-# latest main — bleeding edge, not pinned to a release
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@main"
+# staging's latest release (early access)
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.6-staging"
 ```
 
 Use the `%pip` magic rather than `!pip` — it installs into the kernel the
@@ -208,5 +217,5 @@ Alternatively, download the wheel attached to the [GitHub Release page](https://
 for that tag and install the local file instead of pulling from git:
 
 ```python
-%pip install /path/to/EEADataLakehouse-0.1.5-py3-none-any.whl
+%pip install /path/to/EEADataLakehouse-<version>-py3-none-any.whl
 ```
