@@ -27,6 +27,16 @@ import tempfile
 import os
 import json
 import httpx
+
+
+
+import argparse
+import atexit
+import subprocess
+import sys
+
+import requests
+
 from pathlib import Path
 from xmlrpc.client import Boolean
 from eea_datalakehouse.catalog import Catalog
@@ -38,7 +48,12 @@ from eea_datalakehouse.dds_ingestion.common.dremio_identity import (endpoint, dd
 BASE_URL = "https://dds.debug.local"
 # This script always lives directly in debugger/, so its own directory *is*
 # the folder to look in — independent of whatever cwd the debugger/terminal
-# happened to launch with.
+# happened to launch with.   
+CACHE_PATH = os.path.expanduser("~/.dremio_msal_cache.json")
+TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
+JWT_TYPE = "urn:ietf:params:oauth:token-type:jwt"
+PAT_TYPE = "urn:ietf:params:oauth:token-type:dremio:personal-access-token"
+
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 
 
@@ -346,6 +361,126 @@ def run_catalog_bulk_close() -> None:
     print(f"catalog_bulk_close  after   a.closed={a._closed}  b.closed={b._closed}")
 
 
+
+# --------------------------------------------------------------------------
+# Step 1 — get an Entra ID JWT
+# --------------------------------------------------------------------------
+def entra_token_azcli(scope: str) -> str:
+    """Reuse the Azure CLI's cached login. Silent, no prompts."""
+    out = subprocess.run(
+        ["az", "account", "get-access-token", "--scope", scope, "-o", "json"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(out.stdout)["accessToken"]
+
+
+def _msal_app(cls, **kwargs):
+    import msal
+
+    cache = msal.SerializableTokenCache()
+    if os.path.exists(CACHE_PATH):
+        cache.deserialize(open(CACHE_PATH).read())
+
+    def _flush():
+        if cache.has_state_changed:
+            fd = os.open(CACHE_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(cache.serialize())
+
+    atexit.register(_flush)
+    return cls(token_cache=cache, **kwargs)
+
+
+def entra_token_device(tenant: str, client_id: str, scope: str) -> str:
+    """Device-code flow with a persistent cache: interactive once, silent after."""
+    import msal
+
+    app = _msal_app(
+        msal.PublicClientApplication,
+        client_id=client_id,
+        authority=f"https://login.microsoftonline.com/{tenant}",
+    )
+
+    accounts = app.get_accounts()
+    result = app.acquire_token_silent([scope], account=accounts[0]) if accounts else None
+
+    if not result:
+        flow = app.initiate_device_flow(scopes=[scope])
+        if "user_code" not in flow:
+            raise RuntimeError(f"device flow failed: {flow}")
+        print(flow["message"], file=sys.stderr)
+        result = app.acquire_token_by_device_flow(flow)
+
+    if "access_token" not in result:
+        raise RuntimeError(f"Entra ID error: {result.get('error_description', result)}")
+    return result["access_token"]
+
+
+def entra_token_sp(tenant: str, client_id: str, client_secret: str, scope: str) -> str:
+    """Client credentials — fully unattended, app identity."""
+    import msal
+
+    app = msal.ConfidentialClientApplication(
+        client_id=client_id,
+        client_credential=client_secret,
+        authority=f"https://login.microsoftonline.com/{tenant}",
+    )
+    result = app.acquire_token_for_client(scopes=[scope])
+    if "access_token" not in result:
+        raise RuntimeError(f"Entra ID error: {result.get('error_description', result)}")
+    return result["access_token"]
+
+
+# --------------------------------------------------------------------------
+# Step 2 — exchange the Entra JWT for a Dremio access token
+# --------------------------------------------------------------------------
+def dremio_exchange(host: str, subject_token: str, token_type: str = JWT_TYPE,
+                    verify: bool | str = True) -> dict:
+    r = requests.post(
+        f"https://{host}/oauth/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "grant_type": TOKEN_EXCHANGE,
+            "subject_token": subject_token,
+            "subject_token_type": token_type,
+            "scope": "dremio.all",
+        },
+        timeout=30,
+        verify=verify,
+    )
+    if not r.ok:
+        raise RuntimeError(f"Dremio token exchange failed [{r.status_code}]: {r.text}")
+    return r.json()
+
+
+# --------------------------------------------------------------------------
+# Step 3 — optional: mint a long-lived PAT with that access token
+# --------------------------------------------------------------------------
+def create_pat(host: str, access_token: str, username: str, label: str,
+               days: int = 90, verify: bool | str = True) -> dict:
+    h = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+
+    u = requests.get(f"https://{host}/api/v3/user/by-name/{username}",
+                     headers=h, timeout=30, verify=verify)
+    if not u.ok:
+        raise RuntimeError(f"user lookup failed [{u.status_code}]: {u.text}")
+    user_id = u.json()["id"]
+
+    p = requests.post(
+        f"https://{host}/api/v3/user/{user_id}/token",
+        headers=h,
+        json={"label": label, "millisecondsToExpire": days * 86_400_000},
+        timeout=30,
+        verify=verify,
+    )
+    if not p.ok:
+        raise RuntimeError(f"PAT creation failed [{p.status_code}]: {p.text}")
+    return p.json()
+
+
+
 if __name__ == "__main__":
     if not ENV_PATH.exists():
         raise RuntimeError(f"could not find {ENV_PATH}")
@@ -458,8 +593,59 @@ if __name__ == "__main__":
     #run_deleteview()
 
     #run_createfolder()
-    run_deletefolder()
+    #run_deletefolder()
 
 
 
+
+
+
+
+
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--mode", choices=["azcli", "device", "sp"], default="device")
+    ap.add_argument("--host", default=os.getenv("DREMIO_HOST"))
+    ap.add_argument("--tenant", default=os.getenv("ENTRA_TENANT_ID"))
+    ap.add_argument("--client-id", default=os.getenv("ENTRA_CLIENT_ID"))
+    ap.add_argument("--client-secret", default=os.getenv("ENTRA_CLIENT_SECRET"))
+    ap.add_argument("--scope", default=os.getenv("ENTRA_SCOPE"))
+    ap.add_argument("--create-pat", metavar="USERNAME",
+                    help="also mint a PAT for this Dremio username")
+    ap.add_argument("--pat-label", default="automated")
+    ap.add_argument("--pat-days", type=int, default=90, help="1-180, default 90")
+    ap.add_argument("--ca-bundle", help="path to CA bundle for self-signed Dremio certs")
+    ap.add_argument("--insecure", action="store_true", help="skip TLS verification")
+    args = ap.parse_args()
+
+    missing = [n for n, v in [("--host", args.host), ("--scope", args.scope)] if not v]
+    if args.mode != "azcli":
+        missing += [n for n, v in [("--tenant", args.tenant),
+                                   ("--client-id", args.client_id)] if not v]
+    if args.mode == "sp" and not args.client_secret:
+        missing.append("--client-secret")
+    if missing:
+        ap.error("missing required: " + ", ".join(missing))
+
+    verify: bool | str = args.ca_bundle or (not args.insecure)
+
+    if args.mode == "azcli":
+        jwt = entra_token_azcli(args.scope)
+    elif args.mode == "device":
+        jwt = entra_token_device(args.tenant, args.client_id, args.scope)
+    else:
+        jwt = entra_token_sp(args.tenant, args.client_id, args.client_secret, args.scope)
+
+    tok = dremio_exchange(args.host, jwt, verify=verify)
+    access_token = tok["access_token"]
+    print(f"# Dremio access token (expires in {tok.get('expires_in')}s)", file=sys.stderr)
+    print(access_token)
+
+    if args.create_pat:
+        pat = create_pat(args.host, access_token, args.create_pat,
+                         args.pat_label, args.pat_days, verify=verify)
+        print("# PAT (store it now, it is not retrievable again)", file=sys.stderr)
+        print(pat.get("token") or json.dumps(pat))
+
+    print ("OK")
     
