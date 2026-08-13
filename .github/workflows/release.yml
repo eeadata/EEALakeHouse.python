@@ -49,6 +49,29 @@ jobs:
           fi
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
+      # Keeps the README's `pip`/`%pip install ...@vX.Y.Z[-staging]` example
+      # lines from ever going stale — only touches this branch's own lines
+      # (matched by the trailing `"` for main, `-staging"` for staging, so
+      # a staging run can never clobber main's line and vice versa).
+      # [skip ci]: this push must not re-trigger this same workflow.
+      - name: Update README's install examples for this branch
+        run: |
+          NEW_VERSION="${{ steps.version.outputs.version }}"
+          if [ "${{ github.ref_name }}" = "staging" ]; then
+            sed -i -E "s#(EEALakeHouse\.python\.git@v)[0-9]+\.[0-9]+\.[0-9]+(-staging\")#\1${NEW_VERSION}\2#g" README.md
+          else
+            sed -i -E "s#(EEALakeHouse\.python\.git@v)[0-9]+\.[0-9]+\.[0-9]+\"#\1${NEW_VERSION}\"#g" README.md
+          fi
+          if git diff --quiet -- README.md; then
+            echo "README already up to date for this branch's version."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add README.md
+            git commit -m "Update README install examples to v${NEW_VERSION}${{ github.ref_name == 'staging' && '-staging' || '' }} [skip ci]"
+            git push
+          fi
+
       # Tags the *build* (not the committed pyproject.toml) with its branch,
       # via a PEP 440 local version segment ("+main"/"+staging") — this is
       # what shows up in the wheel filename, e.g.
