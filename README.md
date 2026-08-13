@@ -32,7 +32,7 @@ branch at a time, so pin to whatever the badge shows *now*, not a number copied 
 pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.6"
 
 # staging's latest release (early access) — pin to the tag the "staging" badge above shows
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.6-staging"
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.7-staging"
 ```
 
 ## Usage
@@ -201,7 +201,7 @@ Run this in a notebook cell (see the live badges under [Install](#install) for t
 %pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.6"
 
 # staging's latest release (early access)
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.6-staging"
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.7-staging"
 ```
 
 Use the `%pip` magic rather than `!pip` — it installs into the kernel the
