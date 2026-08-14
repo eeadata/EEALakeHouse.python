@@ -113,11 +113,18 @@ jobs:
             fi
           done
 
+      # target_commitish is required here: without it, the GitHub API creates
+      # a brand-new tag from the *repository's default branch* tip, not from
+      # github.sha (the commit that triggered this run) and not from the
+      # version-bump/README commits the earlier steps just pushed to this
+      # branch. Pointing it at github.ref_name makes the release tag land on
+      # this branch's actual current tip.
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.version.outputs.version }}${{ github.ref_name == 'staging' && '-staging' || '' }}
           name: v${{ steps.version.outputs.version }} (${{ github.ref_name }})
+          target_commitish: ${{ github.ref_name }}
           files: dist/*
           generate_release_notes: true
           prerelease: ${{ github.ref_name == 'staging' }}
