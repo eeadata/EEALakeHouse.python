@@ -295,11 +295,13 @@ def run_setmeta2wiki() -> None:
         print("DRY RUN — not updating wiki metadata. Set DRY_RUN = False to run this for real.")
         print(f"  folder    {folder_path}")
         return
-    new_tags = [{"tag_name": "reviewed_by", "tag_value": "debug-run", "tag_title": "Reviewed by"}]
+    new_tags = [
+                {"tag_name": "test111", "tag_value": "oskar_value11", "tag_title": "oskar_title11"}
+                ]
     catalog.setmeta2wiki(
         folder_path,
         tags=new_tags,
-        overwrite=False,  # merge with whatever tags are already there
+        overwrite=True,  # merge with whatever tags are already there
         idempotency_key=f"{TABLE2VIEW_IDEMPOTENCY_KEY}-write-meta",
     )
     print(f"setmeta2wiki  meta updated on {folder_path}")
@@ -643,7 +645,7 @@ if __name__ == "__main__":
     
     #run_setwikito()
     #run_deletewiki()
-    #run_setmeta2wiki()
+    run_setmeta2wiki()
     #run_getmetafromwiki()
     #run_settagsto()
     #run_deletetags()
@@ -652,7 +654,7 @@ if __name__ == "__main__":
     #run_gettagsfrom()
     #run_deleteview()
 
-    run_createfolder()
+    #run_createfolder()
     #run_deletefolder()
 
 
