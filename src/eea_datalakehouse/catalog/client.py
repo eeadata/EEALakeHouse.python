@@ -263,13 +263,47 @@ class Catalog:
     def gettagsfrom(self, path: str, *, idempotency_key: str) -> list[str]:
         return operations.gettagsfrom(self._catalog_rest, path, idempotency_key=idempotency_key)
 
-    def assignwikito(self, path: str, text: str, *, idempotency_key: str) -> None:
-        return operations.assignwikito(
-            self._catalog_rest, path, text, idempotency_key=idempotency_key
+    def setwikito(
+        self,
+        path: str,
+        text: str,
+        *,
+        tags: list[dict[str, str]] | None = None,
+        idempotency_key: str,
+    ) -> None:
+        return operations.setwikito(
+            self._catalog_rest, path, text, tags=tags, idempotency_key=idempotency_key
         )
 
-    def assigntagsto(self, path: str, tags: list[str], *, idempotency_key: str) -> None:
-        return operations.assigntagsto(
+    def deletewiki(self, path: str, *, idempotency_key: str) -> None:
+        return operations.deletewiki(self._catalog_rest, path, idempotency_key=idempotency_key)
+
+    def setmeta2wiki(
+        self,
+        path: str,
+        *,
+        tags: list[dict[str, str]] | None = None,
+        overwrite: bool = True,
+        idempotency_key: str,
+    ) -> None:
+        return operations.setmeta2wiki(
+            self._catalog_rest, path, tags=tags, overwrite=overwrite, idempotency_key=idempotency_key
+        )
+
+    def getmetafromwiki(
+        self,
+        path: str,
+        tag_name: str | None = None,
+        field: Literal["tag_value", "tag_title"] | None = None,
+        *,
+        idempotency_key: str,
+    ) -> list[dict[str, str]] | dict[str, str]:
+        return operations.getmetafromwiki(
+            self._catalog_rest, path, tag_name, field, idempotency_key=idempotency_key
+        )
+
+    def settagsto(self, path: str, tags: list[str], *, idempotency_key: str) -> None:
+        return operations.settagsto(
             self._catalog_rest, path, tags, idempotency_key=idempotency_key
         )
 

@@ -96,6 +96,26 @@ class CatalogRestClient:
             return False
         return entity is not None and entity.get("entityType") == "folder"
 
+    def is_table_or_view(self, path: str) -> bool:
+        """Whether `path` names an existing table or view — a Dremio
+        "dataset" entity, not a folder/space/source.
+
+        Used to gate `gettagsfrom`/`settagsto` to the entities that
+        actually have Dremio's own tags/labels concept — folders don't
+        (see `setmeta2wiki`/`getmetafromwiki` for the folder-level
+        stand-in).
+
+        Best-effort, same reasoning as `is_folder`: some Dremio source
+        types reject by-path lookups into nested items outright (400, not
+        404), so any lookup failure here is treated the same as "not a
+        match", never raised.
+        """
+        try:
+            entity = self._lookup_by_path(path)
+        except CatalogOperationError:
+            return False
+        return entity is not None and entity.get("entityType") == "dataset"
+
     def get_wiki(self, path: str) -> str:
         """The Dremio wiki text attached to the catalog entity at `path`.
 

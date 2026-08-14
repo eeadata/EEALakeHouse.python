@@ -248,20 +248,73 @@ def test_gettagsfrom_delegates_to_operations() -> None:
     assert tags == ["pii"]
 
 
-def test_assignwikito_delegates_to_operations() -> None:
+def test_setwikito_delegates_to_operations() -> None:
     fake_rest = FakeCatalogRest(existing={"a.b"})
     catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=fake_rest)
 
-    catalog.assignwikito("a.b", "# New docs", idempotency_key="k")
+    catalog.setwikito("a.b", "# New docs", idempotency_key="k")
 
     assert fake_rest._wikis["a.b"] == "# New docs"
 
 
-def test_assigntagsto_delegates_to_operations() -> None:
+def test_deletewiki_delegates_to_operations() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, wikis={"a.b": "# Docs"})
+    catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=fake_rest)
+
+    catalog.deletewiki("a.b", idempotency_key="k")
+
+    assert fake_rest._wikis["a.b"] == ""
+
+
+def test_setwikito_with_tags_delegates_to_operations() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"})
+    catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=fake_rest)
+    tags = [{"tag_name": "owner", "tag_value": "bwd-team", "tag_title": "Owner"}]
+
+    catalog.setwikito("a.b", "# New docs", tags=tags, idempotency_key="k")
+
+    assert fake_rest._wikis["a.b"] == (
+        '# New docs\n\n# Meta Data\n\tOwner : bwd-team\n<meta>\n'
+        '<tag name="owner" value="bwd-team" title="Owner"/>\n</meta>'
+    )
+
+
+def test_setmeta2wiki_delegates_to_operations() -> None:
+    existing_wiki = (
+        '# Docs\n\n# Meta Data\n\tOwner : bwd-team\n<meta>\n'
+        '<tag name="owner" value="bwd-team" title="Owner"/>\n</meta>'
+    )
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"}, wikis={"a.b": existing_wiki})
+    catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=fake_rest)
+    new_tags = [{"tag_name": "status", "tag_value": "published", "tag_title": "Status"}]
+
+    catalog.setmeta2wiki("a.b", tags=new_tags, overwrite=False, idempotency_key="k")
+
+    assert fake_rest._wikis["a.b"] == (
+        '# Docs\n\n# Meta Data\n\tOwner : bwd-team\n\tStatus : published\n<meta>\n'
+        '<tag name="owner" value="bwd-team" title="Owner"/>\n'
+        '<tag name="status" value="published" title="Status"/>\n</meta>'
+    )
+
+
+def test_getmetafromwiki_delegates_to_operations() -> None:
+    existing_wiki = (
+        '# Docs\n\n# Meta Data\n\tOwner : bwd-team\n<meta>\n'
+        '<tag name="owner" value="bwd-team" title="Owner"/>\n</meta>'
+    )
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"}, wikis={"a.b": existing_wiki})
+    catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=fake_rest)
+
+    result = catalog.getmetafromwiki("a.b", "owner", "tag_value", idempotency_key="k")
+
+    assert result == {"tag_name": "owner", "tag_value": "bwd-team"}
+
+
+def test_settagsto_delegates_to_operations() -> None:
     fake_rest = FakeCatalogRest(existing={"a.b"})
     catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=fake_rest)
 
-    catalog.assigntagsto("a.b", ["pii"], idempotency_key="k")
+    catalog.settagsto("a.b", ["pii"], idempotency_key="k")
 
     assert fake_rest._tags["a.b"] == ["pii"]
 

@@ -97,6 +97,52 @@ def test_is_folder_false_on_a_broken_by_path_lookup_rather_than_raising() -> Non
 
 
 @respx.mock
+def test_is_table_or_view_true_for_a_dataset_entity() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"entityType": "dataset"})
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert client.is_table_or_view("a.b") is True
+
+
+@respx.mock
+def test_is_table_or_view_false_for_a_folder_entity() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"entityType": "folder"})
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert client.is_table_or_view("a.b") is False
+
+
+@respx.mock
+def test_is_table_or_view_false_on_404() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/missing").mock(return_value=httpx.Response(404))
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert client.is_table_or_view("a.missing") is False
+
+
+@respx.mock
+def test_is_table_or_view_false_on_a_broken_by_path_lookup_rather_than_raising() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/catalog/deep/nested").mock(
+        return_value=httpx.Response(
+            400,
+            json={
+                "errorMessage": (
+                    "Can not get internal item from non-filesystem source [catalog] "
+                    "of type [com.dremio.plugins.dremiocatalog.store.DremioCatalogLocalPlugin]"
+                )
+            },
+        )
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert client.is_table_or_view("catalog.deep.nested") is False
+
+
+@respx.mock
 def test_ensure_folder_path_raises_when_space_missing() -> None:
     respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a").mock(return_value=httpx.Response(404))
     client = CatalogRestClient(BASE_URL, "pat")

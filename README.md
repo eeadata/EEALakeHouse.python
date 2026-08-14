@@ -123,10 +123,32 @@ exact same arguments.
   count, without fetching any actual rows.
 
 **Wiki & tags** (Dremio's catalog collaboration API — REST-only, no SQL/Flight equivalent):
-- `getwikifrom(path)` / `assignwikito(path, text)` — read, or create/overwrite, the wiki text on
-  a catalog entity.
-- `gettagsfrom(path)` / `assigntagsto(path, tags)` / `deletetags(path, tags)` — read the full tag
-  list; replace it wholesale; or remove just the given tags, leaving the rest untouched.
+- `getwikifrom(path)` / `setwikito(path, text, tags=None)` / `deletewiki(path)` — read,
+  create/overwrite, or clear the wiki text on a catalog entity. `deletewiki` is idempotent — a
+  missing `path`, or one with no wiki at all, is a no-op, not an error (Dremio's collaboration
+  API has no separate delete-wiki endpoint, so this clears the text to empty). `tags`, if given
+  to `setwikito`, is a list of `{"tag_name", "tag_value", "tag_title"}` dicts rendered into a
+  `# Meta Data` section appended to `text` (both a human-readable `title : value` line per tag
+  and the same data as `<meta><tag name=... value=... title=.../>...</meta>`) — Dremio's wiki is
+  plain markdown with no structured-metadata concept of its own, so this is embedded directly in
+  the text.
+- `setmeta2wiki(path, tags=None, overwrite=True)` / `getmetafromwiki(path, tag_name=None,
+  field=None)` — **folders only** (raises `CatalogOperationError` on a table/view — those have
+  Dremio's own tags/labels for this instead). `setmeta2wiki` updates just the `# Meta Data`
+  section of the wiki already at `path`, keeping whatever text comes before it untouched:
+  `overwrite=True` (the default) replaces the whole section with one built fresh from `tags`;
+  `overwrite=False` merges `tags` into whatever tags are already there (parsed back out of the
+  existing `<meta>` block), appended after them, with no deduplication. If `path` has no wiki
+  yet, starts from empty base text rather than raising. `getmetafromwiki` reads it back:
+  without `tag_name` (or if it doesn't match one there), returns every tag as a list; with a
+  matching `tag_name`, returns a single `{"tag_name", ...}` dict instead — both `tag_value` and
+  `tag_title` if `field` isn't given, or just the one `field` (`"tag_value"`/`"tag_title"`) asks
+  for.
+- `gettagsfrom(path)` / `settagsto(path, tags)` / `deletetags(path, tags)` — **tables/views
+  only** (the mirror image of `setmeta2wiki`/`getmetafromwiki` — raises
+  `CatalogOperationError` on a folder, which has no Dremio tags/labels concept of its own). Read
+  the full tag list; replace it wholesale; or remove just the given tags, leaving the rest
+  untouched.
 
 **Folders** (REST-only, idempotent — an already-there/already-gone folder is not an error):
 - `createfolder(path, create_parents=False)` — `create_parents=False` (the default) raises if
