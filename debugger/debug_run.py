@@ -349,7 +349,7 @@ def run_deletetags() -> None:
 
 def run_createfolder() -> None:
     catalog = Catalog(DREMIO_BASE_URL, DREMIO_TOKEN, username=DREMIO_USERNAME)
-    folder_path = "catalog.water_management_resources.bathing_water.bwd.draft.altia_test.new_folder.level1"
+    folder_path = "catalog.water_management_resources.bathing_water.bwd.draft.altia_test"
     if DRY_RUN:
         print("DRY RUN — not creating a folder. Set DRY_RUN = False to run this for real.")
         print(f"  folder    {folder_path}")
@@ -652,16 +652,14 @@ if __name__ == "__main__":
     #run_gettagsfrom()
     #run_deleteview()
 
-    #run_createfolder()
+    run_createfolder()
     #run_deletefolder()
 
 
 
 
 
-
-
-
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=["azcli", "device", "sp"], default="device")
@@ -708,4 +706,4 @@ if __name__ == "__main__":
         print(pat.get("token") or json.dumps(pat))
 
     print ("OK")
-    
+    """    
