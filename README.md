@@ -24,15 +24,23 @@ Two main class domains for the EEA data lakehouse:
 
 These badges are live — each one queries the GitHub API directly and always shows whatever tag
 is *currently* released for that branch, updating on its own every time `main`/`staging` cuts a
-new release (see [Releasing a new version](#releasing-a-new-version) — only one tag exists per
-branch at a time, so pin to whatever the badge shows *now*, not a number copied from here).
+new release (see [Releasing a new version](#releasing-a-new-version)).
+
+`@main`/`@staging` always installs whatever was most recently released for that branch — a
+floating tag sharing the branch's own name, moved forward to the latest release automatically
+each time one is cut, so there's nothing to look up or keep in sync yourself:
 
 ```bash
-# main's latest release (stable) — pin to the tag the "main" badge above shows
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.6"
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@main"       # latest stable
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@staging"    # latest early access
+```
 
-# staging's latest release (early access) — pin to the tag the "staging" badge above shows
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.6-staging"
+To pin to one *specific* release instead (e.g. for a reproducible lockfile), use the exact tag
+the badge above shows — but only one tag is ever kept per branch (see below), so an old pin will
+eventually stop resolving once a newer release replaces it:
+
+```bash
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.6"
 ```
 
 ## Usage
@@ -207,6 +215,13 @@ previous release *and* tag first, so **tags aren't permanent** — pin to whatev
 [Install](#install) badge shows *now*, not to an old tag number, since it won't exist once a
 newer release replaces it.
 
+**A separate floating tag literally named `main`/`staging`** always points at that branch's
+latest release — the workflow force-moves it (`git tag -f`, force-push) once the real release
+above succeeds. It deliberately shares its name with the branch: git resolves the ambiguity
+deterministically (a tag always wins over a same-named branch), so `@main`/`@staging` in an
+install command means "latest release," not "current branch tip" — expect (and ignore) a
+"refname is ambiguous" warning from git/pip when that happens.
+
 The workflow also rewrites this README's `pip`/`%pip install ...@vX.Y.Z[-staging]` example lines
 to the version it just released, committing that change back to the branch (`[skip ci]`, so it
 doesn't re-trigger itself) — so the examples above never go stale, without anyone having to
@@ -214,16 +229,20 @@ remember to update them by hand.
 
 ## Install in JupyterLab
 
-Run this in a notebook cell (see the live badges under [Install](#install) for the current
-`main`/`staging` release tags — the lines below are kept in sync with them automatically, see
+Run this in a notebook cell — `@main`/`@staging` always resolves to whatever was most recently
+released for that branch (see [Install](#install) above):
+
+```python
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@main"       # latest stable
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@staging"    # latest early access
+```
+
+To pin to one specific release instead, use the exact tag the live badges under
+[Install](#install) show (kept in sync automatically, see
 [Releasing a new version](#releasing-a-new-version)):
 
 ```python
-# main's latest release (stable) — recommended
 %pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.6"
-
-# staging's latest release (early access)
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.6-staging"
 ```
 
 Use the `%pip` magic rather than `!pip` — it installs into the kernel the

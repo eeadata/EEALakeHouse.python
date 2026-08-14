@@ -121,3 +121,23 @@ jobs:
           files: dist/*
           generate_release_notes: true
           prerelease: ${{ github.ref_name == 'staging' }}
+
+      # A floating alias tag literally named after the branch (main/staging)
+      # that always points at whatever was just released — unlike the
+      # v{version}[-staging] tag above (deleted/recreated, so it names one
+      # specific release), this one just moves forward every time. Runs only
+      # once the real release above has succeeded.
+      #
+      # Sharing its name with the branch is deliberate: `git` resolves the
+      # ambiguity deterministically (a tag always wins over a same-named
+      # branch — see gitrevisions(7) on ref disambiguation order), so
+      # `pip install ...@main` / `...@staging` always resolves to this tag,
+      # i.e. the latest release — not necessarily the exact branch tip.
+      # Expect (and ignore) a "refname 'main' is ambiguous" warning from
+      # git/pip when that happens. The push uses fully-qualified refs on
+      # both sides specifically to sidestep that same ambiguity for the
+      # push command itself.
+      - name: Move the branch-name alias tag to this release
+        run: |
+          git tag -f "${{ github.ref_name }}"
+          git push origin "refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}" --force
