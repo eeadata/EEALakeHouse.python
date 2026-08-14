@@ -5,10 +5,11 @@ dds_ingestion's IngestClient/FolderIngest):
     catalog.draft2version("bwd.draft.bw", "bwd.versions.v1", idempotency_key="bwd-v2025_1")
 
 table2view, draft2version, publishversion, datacopy, datamove, deleteview,
-gettablesfrom, gettableitemsfrom, getwikifrom, gettagsfrom, assignwikito,
-assigntagsto, deletetags, createfolder, deletefolder — over REST (the
-default) or Arrow Flight (opt in via EEA_CATALOG_TRANSPORT=flight in .env),
-with retry-later error handling for a Dremio engine that's still starting up.
+gettablesfrom, gettableitemsfrom, getwikifrom, gettagsfrom, setwikito,
+deletewiki, setmeta2wiki, getmetafromwiki, settagsto, deletetags,
+createfolder, deletefolder — over REST (the default) or Arrow Flight (opt
+in via EEA_CATALOG_TRANSPORT=flight in .env), with retry-later error
+handling for a Dremio engine that's still starting up.
 
 The module-level functions in `operations` (table2view(executor, ...) etc.)
 are what `Catalog`'s methods delegate to — call them directly if you'd
@@ -21,21 +22,24 @@ from .client import Catalog
 from .errors import CatalogOperationError, EngineStartingError
 from .operations import (
     TableInfo,
-    assigntagsto,
-    assignwikito,
     createfolder,
     datacopy,
     datamove,
     deletefolder,
     deletetags,
     deleteview,
+    deletewiki,
     draft2version,
     gettableitemsfrom,
     gettablesfrom,
     gettagsfrom,
     getwikifrom,
     publishversion,
+    getmetafromwiki,
     retry_pending,
+    setmeta2wiki,
+    settagsto,
+    setwikito,
     table2view,
 )
 from .rest import CatalogRestClient
@@ -61,21 +65,24 @@ __all__ = [
     "SqlExecutor",
     "SqlResult",
     "TableInfo",
-    "assigntagsto",
-    "assignwikito",
     "createfolder",
     "datacopy",
     "datamove",
     "deletefolder",
     "deletetags",
     "deleteview",
+    "deletewiki",
     "draft2version",
     "gettableitemsfrom",
     "gettablesfrom",
     "gettagsfrom",
     "getwikifrom",
     "publishversion",
+    "getmetafromwiki",
     "resolve_executor",
     "retry_pending",
+    "setmeta2wiki",
+    "settagsto",
+    "setwikito",
     "table2view",
 ]

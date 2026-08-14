@@ -24,15 +24,19 @@ Two main class domains for the EEA data lakehouse:
 
 These badges are live — each one queries the GitHub API directly and always shows whatever tag
 is *currently* released for that branch, updating on its own every time `main`/`staging` cuts a
-new release (see [Releasing a new version](#releasing-a-new-version) — only one tag exists per
-branch at a time, so pin to whatever the badge shows *now*, not a number copied from here).
+new release (see [Releasing a new version](#releasing-a-new-version)).
+
+`@main`/`@staging` always installs whatever was most recently released for that branch — a
+floating tag sharing the branch's own name, moved forward to the latest release automatically
+each time one is cut, so there's nothing to look up or keep in sync yourself:
 
 ```bash
-# main's latest release (stable) — pin to the tag the "main" badge above shows
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.7"
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@main"       # latest stable
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@staging"    # latest early access
+```
 
 # staging's latest release (early access) — pin to the tag the "staging" badge above shows
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.7-staging"
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.9-staging"
 ```
 
 ## Usage
@@ -123,10 +127,32 @@ exact same arguments.
   count, without fetching any actual rows.
 
 **Wiki & tags** (Dremio's catalog collaboration API — REST-only, no SQL/Flight equivalent):
-- `getwikifrom(path)` / `assignwikito(path, text)` — read, or create/overwrite, the wiki text on
-  a catalog entity.
-- `gettagsfrom(path)` / `assigntagsto(path, tags)` / `deletetags(path, tags)` — read the full tag
-  list; replace it wholesale; or remove just the given tags, leaving the rest untouched.
+- `getwikifrom(path)` / `setwikito(path, text, tags=None)` / `deletewiki(path)` — read,
+  create/overwrite, or clear the wiki text on a catalog entity. `deletewiki` is idempotent — a
+  missing `path`, or one with no wiki at all, is a no-op, not an error (Dremio's collaboration
+  API has no separate delete-wiki endpoint, so this clears the text to empty). `tags`, if given
+  to `setwikito`, is a list of `{"tag_name", "tag_value", "tag_title"}` dicts rendered into a
+  `# Meta Data` section appended to `text` (both a human-readable `title : value` line per tag
+  and the same data as `<meta><tag name=... value=... title=.../>...</meta>`) — Dremio's wiki is
+  plain markdown with no structured-metadata concept of its own, so this is embedded directly in
+  the text.
+- `setmeta2wiki(path, tags=None, overwrite=True)` / `getmetafromwiki(path, tag_name=None,
+  field=None)` — **folders only** (raises `CatalogOperationError` on a table/view — those have
+  Dremio's own tags/labels for this instead). `setmeta2wiki` updates just the `# Meta Data`
+  section of the wiki already at `path`, keeping whatever text comes before it untouched:
+  `overwrite=True` (the default) replaces the whole section with one built fresh from `tags`;
+  `overwrite=False` merges `tags` into whatever tags are already there (parsed back out of the
+  existing `<meta>` block), appended after them, with no deduplication. If `path` has no wiki
+  yet, starts from empty base text rather than raising. `getmetafromwiki` reads it back:
+  without `tag_name` (or if it doesn't match one there), returns every tag as a list; with a
+  matching `tag_name`, returns a single `{"tag_name", ...}` dict instead — both `tag_value` and
+  `tag_title` if `field` isn't given, or just the one `field` (`"tag_value"`/`"tag_title"`) asks
+  for.
+- `gettagsfrom(path)` / `settagsto(path, tags)` / `deletetags(path, tags)` — **tables/views
+  only** (the mirror image of `setmeta2wiki`/`getmetafromwiki` — raises
+  `CatalogOperationError` on a folder, which has no Dremio tags/labels concept of its own). Read
+  the full tag list; replace it wholesale; or remove just the given tags, leaving the rest
+  untouched.
 
 **Folders** (REST-only, idempotent — an already-there/already-gone folder is not an error):
 - `createfolder(path, create_parents=False)` — `create_parents=False` (the default) raises if
@@ -185,6 +211,13 @@ previous release *and* tag first, so **tags aren't permanent** — pin to whatev
 [Install](#install) badge shows *now*, not to an old tag number, since it won't exist once a
 newer release replaces it.
 
+**A separate floating tag literally named `main`/`staging`** always points at that branch's
+latest release — the workflow force-moves it (`git tag -f`, force-push) once the real release
+above succeeds. It deliberately shares its name with the branch: git resolves the ambiguity
+deterministically (a tag always wins over a same-named branch), so `@main`/`@staging` in an
+install command means "latest release," not "current branch tip" — expect (and ignore) a
+"refname is ambiguous" warning from git/pip when that happens.
+
 The workflow also rewrites this README's `pip`/`%pip install ...@vX.Y.Z[-staging]` example lines
 to the version it just released, committing that change back to the branch (`[skip ci]`, so it
 doesn't re-trigger itself) — so the examples above never go stale, without anyone having to
@@ -192,16 +225,23 @@ remember to update them by hand.
 
 ## Install in JupyterLab
 
-Run this in a notebook cell (see the live badges under [Install](#install) for the current
-`main`/`staging` release tags — the lines below are kept in sync with them automatically, see
+Run this in a notebook cell — `@main`/`@staging` always resolves to whatever was most recently
+released for that branch (see [Install](#install) above):
+
+```python
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@main"       # latest stable
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@staging"    # latest early access
+```
+
+To pin to one specific release instead, use the exact tag the live badges under
+[Install](#install) show (kept in sync automatically, see
 [Releasing a new version](#releasing-a-new-version)):
 
 ```python
-# main's latest release (stable) — recommended
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.7"
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.6"
 
 # staging's latest release (early access)
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.7-staging"
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.9-staging"
 ```
 
 Use the `%pip` magic rather than `!pip` — it installs into the kernel the
