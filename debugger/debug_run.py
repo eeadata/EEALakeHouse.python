@@ -255,27 +255,86 @@ def run_gettagsfrom() -> None:
     print(f"  tags       {tags}")
 
 
-def run_assignwikito() -> None:
+def run_setwikito() -> None:
     catalog = Catalog(DREMIO_BASE_URL, DREMIO_TOKEN, username=DREMIO_USERNAME)
     if DRY_RUN:
         print("DRY RUN — not setting the wiki. Set DRY_RUN = False to run this for real.")
         print(f"  view      {VIEW_PATH}")
         return
-    wiki_text = "# Bathing water assessments\n\nDebug-set wiki text for testing assignwikito."
+    wiki_text = "# Bathing water assessments\n\nDebug-set wiki text for testing setwikito."
     #wiki_text ="blabla"
-    catalog.assignwikito(VIEW_PATH, wiki_text, idempotency_key=f"{TABLE2VIEW_IDEMPOTENCY_KEY}-set-wiki")
-    print(f"assignwikito  wiki set on {VIEW_PATH}")
+    meta_tags = [
+        {"tag_name": "owner", "tag_value": "bwd-team", "tag_title": "Owner"},
+        {"tag_name": "status", "tag_value": "debug", "tag_title": "Status"},
+    ]
+    catalog.setwikito(
+        VIEW_PATH,
+        wiki_text,
+        tags=meta_tags,
+        idempotency_key=f"{TABLE2VIEW_IDEMPOTENCY_KEY}-set-wiki",
+    )
+    print(f"setwikito  wiki set on {VIEW_PATH} (with {len(meta_tags)} meta tags)")
 
 
-def run_assigntagsto() -> None:
+def run_deletewiki() -> None:
+    catalog = Catalog(DREMIO_BASE_URL, DREMIO_TOKEN, username=DREMIO_USERNAME)
+    if DRY_RUN:
+        print("DRY RUN — not deleting the wiki. Set DRY_RUN = False to run this for real.")
+        print(f"  view      {VIEW_PATH}")
+        return
+    catalog.deletewiki(VIEW_PATH, idempotency_key=f"{TABLE2VIEW_IDEMPOTENCY_KEY}-delete-wiki")
+    print(f"deletewiki  wiki cleared on {VIEW_PATH} (if it had one)")
+
+
+def run_setmeta2wiki() -> None:
+    catalog = Catalog(DREMIO_BASE_URL, DREMIO_TOKEN, username=DREMIO_USERNAME)
+    # Folders only — tables/views (like VIEW_PATH used elsewhere) have
+    # Dremio's own tags/labels for this instead and would raise here.
+    folder_path = "catalog.water_management_resources.bathing_water.bwd.draft.altia_test"
+    if DRY_RUN:
+        print("DRY RUN — not updating wiki metadata. Set DRY_RUN = False to run this for real.")
+        print(f"  folder    {folder_path}")
+        return
+    new_tags = [
+                {"tag_name": "test111", "tag_value": "oskar_value11", "tag_title": "oskar_title11"}
+                ]
+    catalog.setmeta2wiki(
+        folder_path,
+        tags=new_tags,
+        overwrite=True,  # merge with whatever tags are already there
+        idempotency_key=f"{TABLE2VIEW_IDEMPOTENCY_KEY}-write-meta",
+    )
+    print(f"setmeta2wiki  meta updated on {folder_path}")
+
+
+def run_getmetafromwiki() -> None:
+    catalog = Catalog(DREMIO_BASE_URL, DREMIO_TOKEN, username=DREMIO_USERNAME)
+    folder_path = "catalog.water_management_resources.bathing_water.bwd.draft.altia_test"
+    # run_setmeta2wiki() must have run at least once first, so there's a
+    # "# Meta Data" section here to read back.
+    all_tags = catalog.getmetafromwiki(
+        folder_path, idempotency_key=f"{TABLE2VIEW_IDEMPOTENCY_KEY}-read-meta-all"
+    )
+    print(f"getmetafromwiki  all tags on {folder_path}: {all_tags}")
+
+    one_tag = catalog.getmetafromwiki(
+        folder_path,
+        "reviewed_by",
+        "tag_value",
+        idempotency_key=f"{TABLE2VIEW_IDEMPOTENCY_KEY}-read-meta-one",
+    )
+    print(f"getmetafromwiki  reviewed_by's tag_value: {one_tag}")
+
+
+def run_settagsto() -> None:
     catalog = Catalog(DREMIO_BASE_URL, DREMIO_TOKEN, username=DREMIO_USERNAME)
     if DRY_RUN:
         print("DRY RUN — not setting tags. Set DRY_RUN = False to run this for real.")
         print(f"  view      {VIEW_PATH}")
         return
     tags = ["bathing-water", "debug"]
-    catalog.assigntagsto(VIEW_PATH, tags, idempotency_key=f"{TABLE2VIEW_IDEMPOTENCY_KEY}-set-tags")
-    print(f"assigntagsto  tags set on {VIEW_PATH}: {tags}")
+    catalog.settagsto(VIEW_PATH, tags, idempotency_key=f"{TABLE2VIEW_IDEMPOTENCY_KEY}-set-tags")
+    print(f"settagsto  tags set on {VIEW_PATH}: {tags}")
 
 
 def run_deletetags() -> None:
@@ -292,7 +351,7 @@ def run_deletetags() -> None:
 
 def run_createfolder() -> None:
     catalog = Catalog(DREMIO_BASE_URL, DREMIO_TOKEN, username=DREMIO_USERNAME)
-    folder_path = "catalog.water_management_resources.bathing_water.bwd.draft.altia_test.new_folder.level1"
+    folder_path = "catalog.water_management_resources.bathing_water.bwd.draft.altia_test"
     if DRY_RUN:
         print("DRY RUN — not creating a folder. Set DRY_RUN = False to run this for real.")
         print(f"  folder    {folder_path}")
@@ -584,8 +643,11 @@ if __name__ == "__main__":
     #run_gettablesfrom()
     #run_gettableitemsfrom()
     
-    #run_assignwikito()
-    #run_assigntagsto()
+    #run_setwikito()
+    #run_deletewiki()
+    run_setmeta2wiki()
+    #run_getmetafromwiki()
+    #run_settagsto()
     #run_deletetags()
 
     #run_getwikifrom()
@@ -599,9 +661,7 @@ if __name__ == "__main__":
 
 
 
-
-
-
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=["azcli", "device", "sp"], default="device")
@@ -648,4 +708,4 @@ if __name__ == "__main__":
         print(pat.get("token") or json.dumps(pat))
 
     print ("OK")
-    
+    """    

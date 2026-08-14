@@ -677,9 +677,17 @@ def test_gettagsfrom_raises_when_path_does_not_exist() -> None:
         operations.gettagsfrom(fake_rest, "a.missing", idempotency_key="k")
 
 
+def test_gettagsfrom_raises_when_path_is_a_folder() -> None:
+    # Folders have setmeta2wiki/getmetafromwiki for this instead.
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"})
+
+    with pytest.raises(CatalogOperationError, match="only works on tables/views"):
+        operations.gettagsfrom(fake_rest, "a.b", idempotency_key="k")
+
+
 def test_gettagsfrom_engine_starting_is_remembered_and_retryable(executor) -> None:
     fake_rest = FakeCatalogRest(
-        raise_on_get_tags=EngineStartingError("stalled", idempotency_key="k")
+        existing={"a.b"}, raise_on_get_tags=EngineStartingError("stalled", idempotency_key="k")
     )
 
     with pytest.raises(EngineStartingError):
@@ -691,37 +699,36 @@ def test_gettagsfrom_engine_starting_is_remembered_and_retryable(executor) -> No
     assert pending.params == {"path": "a.b"}
 
     fake_rest._raise_on_get_tags = None
-    fake_rest.existing.add("a.b")
     fake_rest._tags["a.b"] = ["pii"]
     assert operations.retry_pending(executor, "k", catalog_rest=fake_rest) == ["pii"]
 
 
-def test_assignwikito_sets_the_wiki() -> None:
+def test_setwikito_sets_the_wiki() -> None:
     fake_rest = FakeCatalogRest(existing={"a.b"})
 
-    operations.assignwikito(fake_rest, "a.b", "# New docs", idempotency_key="k")
+    operations.setwikito(fake_rest, "a.b", "# New docs", idempotency_key="k")
 
     assert fake_rest._wikis["a.b"] == "# New docs"
 
 
-def test_assignwikito_raises_when_path_does_not_exist() -> None:
+def test_setwikito_raises_when_path_does_not_exist() -> None:
     fake_rest = FakeCatalogRest()
 
     with pytest.raises(CatalogOperationError, match="does not exist"):
-        operations.assignwikito(fake_rest, "a.missing", "text", idempotency_key="k")
+        operations.setwikito(fake_rest, "a.missing", "text", idempotency_key="k")
 
 
-def test_assignwikito_engine_starting_is_remembered_and_retryable(executor) -> None:
+def test_setwikito_engine_starting_is_remembered_and_retryable(executor) -> None:
     fake_rest = FakeCatalogRest(
         existing={"a.b"}, raise_on_set_wiki=EngineStartingError("stalled", idempotency_key="k")
     )
 
     with pytest.raises(EngineStartingError):
-        operations.assignwikito(fake_rest, "a.b", "# New docs", idempotency_key="k")
+        operations.setwikito(fake_rest, "a.b", "# New docs", idempotency_key="k")
 
     pending = retry_state.get("k")
     assert pending is not None
-    assert pending.operation == "assignwikito"
+    assert pending.operation == "setwikito"
     assert pending.params == {"path": "a.b", "text": "# New docs"}
 
     fake_rest._raise_on_set_wiki = None
@@ -729,32 +736,382 @@ def test_assignwikito_engine_starting_is_remembered_and_retryable(executor) -> N
     assert fake_rest._wikis["a.b"] == "# New docs"
 
 
-def test_assigntagsto_sets_the_tags() -> None:
+def test_setwikito_appends_metadata_section_when_tags_given() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"})
+    tags = [
+        {"tag_name": "owner", "tag_value": "bwd-team", "tag_title": "Owner"},
+        {"tag_name": "status", "tag_value": "published", "tag_title": "Status"},
+    ]
+
+    operations.setwikito(fake_rest, "a.b", "# Docs", tags=tags, idempotency_key="k")
+
+    assert fake_rest._wikis["a.b"] == (
+        "# Docs\n\n"
+        "# Meta Data\n"
+        "\tOwner : bwd-team\n"
+        "\tStatus : published\n"
+        "<meta>\n"
+        '<tag name="owner" value="bwd-team" title="Owner"/>\n'
+        '<tag name="status" value="published" title="Status"/>\n'
+        "</meta>"
+    )
+
+
+def test_setwikito_without_tags_leaves_text_untouched() -> None:
     fake_rest = FakeCatalogRest(existing={"a.b"})
 
-    operations.assigntagsto(fake_rest, "a.b", ["pii", "reviewed"], idempotency_key="k")
+    operations.setwikito(fake_rest, "a.b", "# Docs", idempotency_key="k")
+
+    assert fake_rest._wikis["a.b"] == "# Docs"
+
+
+def test_setwikito_raises_when_a_tag_is_missing_a_key() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"})
+    tags = [{"tag_name": "owner", "tag_value": "bwd-team"}]  # no tag_title
+
+    with pytest.raises(CatalogOperationError, match="tag_title"):
+        operations.setwikito(fake_rest, "a.b", "# Docs", tags=tags, idempotency_key="k")
+
+    # Fails before ever calling set_wiki.
+    assert "a.b" not in fake_rest._wikis
+
+
+def test_setwikito_retry_resends_the_already_rendered_metadata(executor) -> None:
+    fake_rest = FakeCatalogRest(
+        existing={"a.b"}, raise_on_set_wiki=EngineStartingError("stalled", idempotency_key="k")
+    )
+    tags = [{"tag_name": "owner", "tag_value": "bwd-team", "tag_title": "Owner"}]
+
+    with pytest.raises(EngineStartingError):
+        operations.setwikito(fake_rest, "a.b", "# Docs", tags=tags, idempotency_key="k")
+
+    pending = retry_state.get("k")
+    assert pending is not None
+    # tags itself is never persisted — only the fully-rendered text.
+    assert "tags" not in pending.params
+    assert pending.params["text"] == (
+        '# Docs\n\n# Meta Data\n\tOwner : bwd-team\n<meta>\n'
+        '<tag name="owner" value="bwd-team" title="Owner"/>\n</meta>'
+    )
+
+    fake_rest._raise_on_set_wiki = None
+    operations.retry_pending(executor, "k", catalog_rest=fake_rest)
+    assert fake_rest._wikis["a.b"] == pending.params["text"]
+
+
+def test_deletewiki_clears_an_existing_wiki() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, wikis={"a.b": "# Docs"})
+
+    operations.deletewiki(fake_rest, "a.b", idempotency_key="k")
+
+    assert fake_rest._wikis["a.b"] == ""
+
+
+def test_deletewiki_is_a_no_op_when_entity_has_no_wiki() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"})  # exists, but no wiki set
+
+    operations.deletewiki(fake_rest, "a.b", idempotency_key="k")
+
+    assert "a.b" not in fake_rest._wikis
+
+
+def test_deletewiki_is_a_no_op_when_path_does_not_exist() -> None:
+    fake_rest = FakeCatalogRest()
+
+    operations.deletewiki(fake_rest, "a.missing", idempotency_key="k")  # must not raise
+
+    assert "a.missing" not in fake_rest._wikis
+
+
+def test_deletewiki_engine_starting_is_remembered_and_retryable(executor) -> None:
+    fake_rest = FakeCatalogRest(
+        existing={"a.b"},
+        wikis={"a.b": "# Docs"},
+        raise_on_get_wiki=EngineStartingError("stalled", idempotency_key="k"),
+    )
+
+    with pytest.raises(EngineStartingError):
+        operations.deletewiki(fake_rest, "a.b", idempotency_key="k")
+
+    pending = retry_state.get("k")
+    assert pending is not None
+    assert pending.operation == "deletewiki"
+    assert pending.params == {"path": "a.b"}
+
+    fake_rest._raise_on_get_wiki = None
+    operations.retry_pending(executor, "k", catalog_rest=fake_rest)
+    assert fake_rest._wikis["a.b"] == ""
+
+
+_EXISTING_WIKI_WITH_META = (
+    "# Docs\n\nOriginal wiki text.\n\n"
+    "# Meta Data\n"
+    "\tOwner : bwd-team\n"
+    "<meta>\n"
+    '<tag name="owner" value="bwd-team" title="Owner"/>\n'
+    "</meta>"
+)
+
+
+def test_setmeta2wiki_overwrite_replaces_the_existing_meta_section() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"}, wikis={"a.b": _EXISTING_WIKI_WITH_META})
+    new_tags = [{"tag_name": "status", "tag_value": "published", "tag_title": "Status"}]
+
+    operations.setmeta2wiki(fake_rest, "a.b", tags=new_tags, idempotency_key="k")
+
+    assert fake_rest._wikis["a.b"] == (
+        "# Docs\n\nOriginal wiki text.\n\n"
+        "# Meta Data\n"
+        "\tStatus : published\n"
+        "<meta>\n"
+        '<tag name="status" value="published" title="Status"/>\n'
+        "</meta>"
+    )
+
+
+def test_setmeta2wiki_no_overwrite_merges_with_existing_tags() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"}, wikis={"a.b": _EXISTING_WIKI_WITH_META})
+    new_tags = [{"tag_name": "status", "tag_value": "published", "tag_title": "Status"}]
+
+    operations.setmeta2wiki(fake_rest, "a.b", tags=new_tags, overwrite=False, idempotency_key="k")
+
+    assert fake_rest._wikis["a.b"] == (
+        "# Docs\n\nOriginal wiki text.\n\n"
+        "# Meta Data\n"
+        "\tOwner : bwd-team\n"
+        "\tStatus : published\n"
+        "<meta>\n"
+        '<tag name="owner" value="bwd-team" title="Owner"/>\n'
+        '<tag name="status" value="published" title="Status"/>\n'
+        "</meta>"
+    )
+
+
+def test_setmeta2wiki_creates_meta_section_when_none_exists_yet() -> None:
+    fake_rest = FakeCatalogRest(
+        existing={"a.b"}, folders={"a.b"}, wikis={"a.b": "# Docs\n\nPlain wiki, no meta yet."}
+    )
+    new_tags = [{"tag_name": "owner", "tag_value": "bwd-team", "tag_title": "Owner"}]
+
+    operations.setmeta2wiki(fake_rest, "a.b", tags=new_tags, idempotency_key="k")
+
+    assert fake_rest._wikis["a.b"] == (
+        "# Docs\n\nPlain wiki, no meta yet.\n\n"
+        "# Meta Data\n"
+        "\tOwner : bwd-team\n"
+        "<meta>\n"
+        '<tag name="owner" value="bwd-team" title="Owner"/>\n'
+        "</meta>"
+    )
+
+
+def test_setmeta2wiki_starts_from_empty_base_text_when_no_wiki_yet() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"})  # exists, but no wiki set at all
+    new_tags = [{"tag_name": "owner", "tag_value": "bwd-team", "tag_title": "Owner"}]
+
+    operations.setmeta2wiki(fake_rest, "a.b", tags=new_tags, idempotency_key="k")
+
+    assert fake_rest._wikis["a.b"] == (
+        "\n\n# Meta Data\n"
+        "\tOwner : bwd-team\n"
+        "<meta>\n"
+        '<tag name="owner" value="bwd-team" title="Owner"/>\n'
+        "</meta>"
+    )
+
+
+def test_setmeta2wiki_raises_when_path_does_not_exist() -> None:
+    fake_rest = FakeCatalogRest()
+
+    with pytest.raises(CatalogOperationError, match="does not exist"):
+        operations.setmeta2wiki(fake_rest, "a.missing", idempotency_key="k")
+
+
+def test_setmeta2wiki_raises_when_path_is_not_a_folder() -> None:
+    # Exists, but as a table/view, not a folder — those have Dremio's own
+    # tags/labels for this instead.
+    fake_rest = FakeCatalogRest(existing={"a.b"})
+
+    with pytest.raises(CatalogOperationError, match="only works on folders"):
+        operations.setmeta2wiki(fake_rest, "a.b", idempotency_key="k")
+
+
+def test_setmeta2wiki_raises_when_a_tag_is_missing_a_key() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"}, wikis={"a.b": "# Docs"})
+    bad_tags = [{"tag_name": "owner", "tag_value": "bwd-team"}]  # no tag_title
+
+    with pytest.raises(CatalogOperationError, match="tag_title"):
+        operations.setmeta2wiki(fake_rest, "a.b", tags=bad_tags, idempotency_key="k")
+
+    assert fake_rest._wikis["a.b"] == "# Docs"
+
+
+def test_setmeta2wiki_engine_starting_is_remembered_and_retryable(executor) -> None:
+    fake_rest = FakeCatalogRest(
+        existing={"a.b"},
+        folders={"a.b"},
+        wikis={"a.b": "# Docs"},
+        raise_on_set_wiki=EngineStartingError("stalled", idempotency_key="k"),
+    )
+    new_tags = [{"tag_name": "owner", "tag_value": "bwd-team", "tag_title": "Owner"}]
+
+    with pytest.raises(EngineStartingError):
+        operations.setmeta2wiki(fake_rest, "a.b", tags=new_tags, idempotency_key="k")
+
+    pending = retry_state.get("k")
+    assert pending is not None
+    assert pending.operation == "setmeta2wiki"
+    assert pending.params == {"path": "a.b", "tags": new_tags, "overwrite": True}
+
+    fake_rest._raise_on_set_wiki = None
+    operations.retry_pending(executor, "k", catalog_rest=fake_rest)
+    assert fake_rest._wikis["a.b"] == (
+        "# Docs\n\n"
+        "# Meta Data\n"
+        "\tOwner : bwd-team\n"
+        "<meta>\n"
+        '<tag name="owner" value="bwd-team" title="Owner"/>\n'
+        "</meta>"
+    )
+
+
+_WIKI_WITH_TWO_TAGS = (
+    "# Docs\n\n"
+    "# Meta Data\n"
+    "\tOwner : bwd-team\n"
+    "\tStatus : published\n"
+    "<meta>\n"
+    '<tag name="owner" value="bwd-team" title="Owner"/>\n'
+    '<tag name="status" value="published" title="Status"/>\n'
+    "</meta>"
+)
+_ALL_TAGS = [
+    {"tag_name": "owner", "tag_value": "bwd-team", "tag_title": "Owner"},
+    {"tag_name": "status", "tag_value": "published", "tag_title": "Status"},
+]
+
+
+def test_getmetafromwiki_without_tag_name_returns_every_tag() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"}, wikis={"a.b": _WIKI_WITH_TWO_TAGS})
+
+    result = operations.getmetafromwiki(fake_rest, "a.b", idempotency_key="k")
+
+    assert result == _ALL_TAGS
+
+
+def test_getmetafromwiki_with_unknown_tag_name_returns_every_tag() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"}, wikis={"a.b": _WIKI_WITH_TWO_TAGS})
+
+    result = operations.getmetafromwiki(fake_rest, "a.b", "no-such-tag", idempotency_key="k")
+
+    assert result == _ALL_TAGS
+
+
+def test_getmetafromwiki_with_tag_name_and_no_field_returns_both() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"}, wikis={"a.b": _WIKI_WITH_TWO_TAGS})
+
+    result = operations.getmetafromwiki(fake_rest, "a.b", "owner", idempotency_key="k")
+
+    assert result == {"tag_name": "owner", "tag_value": "bwd-team", "tag_title": "Owner"}
+
+
+def test_getmetafromwiki_with_tag_name_and_tag_value_field() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"}, wikis={"a.b": _WIKI_WITH_TWO_TAGS})
+
+    result = operations.getmetafromwiki(fake_rest, "a.b", "owner", "tag_value", idempotency_key="k")
+
+    assert result == {"tag_name": "owner", "tag_value": "bwd-team"}
+
+
+def test_getmetafromwiki_with_tag_name_and_tag_title_field() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"}, wikis={"a.b": _WIKI_WITH_TWO_TAGS})
+
+    result = operations.getmetafromwiki(fake_rest, "a.b", "owner", "tag_title", idempotency_key="k")
+
+    assert result == {"tag_name": "owner", "tag_title": "Owner"}
+
+
+def test_getmetafromwiki_raises_on_invalid_field() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"}, wikis={"a.b": _WIKI_WITH_TWO_TAGS})
+
+    with pytest.raises(CatalogOperationError, match="field must be"):
+        operations.getmetafromwiki(fake_rest, "a.b", "owner", "bogus", idempotency_key="k")
+
+
+def test_getmetafromwiki_returns_empty_list_when_no_wiki_yet() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"})
+
+    assert operations.getmetafromwiki(fake_rest, "a.b", idempotency_key="k") == []
+
+
+def test_getmetafromwiki_raises_when_path_does_not_exist() -> None:
+    fake_rest = FakeCatalogRest()
+
+    with pytest.raises(CatalogOperationError, match="does not exist"):
+        operations.getmetafromwiki(fake_rest, "a.missing", idempotency_key="k")
+
+
+def test_getmetafromwiki_raises_when_path_is_not_a_folder() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"})  # not in folders
+
+    with pytest.raises(CatalogOperationError, match="only works on folders"):
+        operations.getmetafromwiki(fake_rest, "a.b", idempotency_key="k")
+
+
+def test_getmetafromwiki_engine_starting_is_remembered_and_retryable(executor) -> None:
+    fake_rest = FakeCatalogRest(
+        existing={"a.b"},
+        folders={"a.b"},
+        wikis={"a.b": _WIKI_WITH_TWO_TAGS},
+        raise_on_get_wiki=EngineStartingError("stalled", idempotency_key="k"),
+    )
+
+    with pytest.raises(EngineStartingError):
+        operations.getmetafromwiki(fake_rest, "a.b", "owner", idempotency_key="k")
+
+    pending = retry_state.get("k")
+    assert pending is not None
+    assert pending.operation == "getmetafromwiki"
+    assert pending.params == {"path": "a.b", "tag_name": "owner", "field": None}
+
+    fake_rest._raise_on_get_wiki = None
+    result = operations.retry_pending(executor, "k", catalog_rest=fake_rest)
+    assert result == {"tag_name": "owner", "tag_value": "bwd-team", "tag_title": "Owner"}
+
+
+def test_settagsto_sets_the_tags() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"})
+
+    operations.settagsto(fake_rest, "a.b", ["pii", "reviewed"], idempotency_key="k")
 
     assert fake_rest._tags["a.b"] == ["pii", "reviewed"]
 
 
-def test_assigntagsto_raises_when_path_does_not_exist() -> None:
+def test_settagsto_raises_when_path_does_not_exist() -> None:
     fake_rest = FakeCatalogRest()
 
     with pytest.raises(CatalogOperationError, match="does not exist"):
-        operations.assigntagsto(fake_rest, "a.missing", ["pii"], idempotency_key="k")
+        operations.settagsto(fake_rest, "a.missing", ["pii"], idempotency_key="k")
 
 
-def test_assigntagsto_engine_starting_is_remembered_and_retryable(executor) -> None:
+def test_settagsto_raises_when_path_is_a_folder() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"})
+
+    with pytest.raises(CatalogOperationError, match="only works on tables/views"):
+        operations.settagsto(fake_rest, "a.b", ["pii"], idempotency_key="k")
+
+
+def test_settagsto_engine_starting_is_remembered_and_retryable(executor) -> None:
     fake_rest = FakeCatalogRest(
         existing={"a.b"}, raise_on_set_tags=EngineStartingError("stalled", idempotency_key="k")
     )
 
     with pytest.raises(EngineStartingError):
-        operations.assigntagsto(fake_rest, "a.b", ["pii"], idempotency_key="k")
+        operations.settagsto(fake_rest, "a.b", ["pii"], idempotency_key="k")
 
     pending = retry_state.get("k")
     assert pending is not None
-    assert pending.operation == "assigntagsto"
+    assert pending.operation == "settagsto"
     assert pending.params == {"path": "a.b", "tags": ["pii"]}
 
     fake_rest._raise_on_set_tags = None

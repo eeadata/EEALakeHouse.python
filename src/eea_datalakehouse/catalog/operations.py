@@ -1,7 +1,7 @@
 """The catalog operations: table2view, draft2version, publishversion,
 datacopy, datamove, deleteview, gettablesfrom, gettableitemsfrom,
-getwikifrom, gettagsfrom, assignwikito, assigntagsto, deletetags,
-createfolder, deletefolder.
+getwikifrom, gettagsfrom, setwikito, deletewiki, setmeta2wiki,
+getmetafromwiki, settagsto, deletetags, createfolder, deletefolder.
 
 Each takes a :class:`~eea_datalakehouse.catalog.sql.SqlExecutor` (REST or
 Flight — the operation doesn't care which) and an `idempotency_key`. On
@@ -50,16 +50,16 @@ relying on this:
   ``datacopy``/``datamove`` run several statements (existence check,
   folder creation, the CTAS/DROP itself) through the same executor, so this
   session reuse is what keeps them from paying a fresh handshake per step.
-* ``getwikifrom`` / ``gettagsfrom`` / ``assignwikito`` / ``assigntagsto`` are
+* ``getwikifrom`` / ``gettagsfrom`` / ``setwikito`` / ``settagsto`` are
   REST-only for the same reason: Dremio wikis/tags have no SQL or Flight
   equivalent, so they take a ``catalog_rest`` directly rather than a
   ``SqlExecutor``. ``getwikifrom`` raises if the entity has no wiki at all;
   ``gettagsfrom`` doesn't — zero tags is normal, only a missing path raises.
-* ``assignwikito``/``assigntagsto`` create the wiki/tags if the entity has
+* ``setwikito``/``settagsto`` create the wiki/tags if the entity has
   none yet, or overwrite them if it already has some — Dremio's
   collaboration API is versioned for optimistic concurrency, and the exact
   semantics of that version field are unverified against a real deployment
-  (see rest.py's docstring). ``assigntagsto`` *replaces* the tag set, it
+  (see rest.py's docstring). ``settagsto`` *replaces* the tag set, it
   doesn't merge with the existing tags.
 * ``createfolder``/``deletefolder`` are REST-only for the same reason —
   folder creation/deletion has no SQL or Flight equivalent. Both are
@@ -75,6 +75,7 @@ relying on this:
 from __future__ import annotations
 
 import inspect
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -736,12 +737,14 @@ def gettagsfrom(
 ) -> list[str]:
     """The Dremio tags attached to the catalog entity at `path`.
 
-    REST-only (see module docstring) — takes `catalog_rest` directly rather
-    than a `SqlExecutor`. Raises `CatalogOperationError` only if `path`
-    itself doesn't exist; an entity with zero tags is a normal state and
-    returns an empty list, not an error (unlike `getwikifrom`).
+    Tables/views only (see `_require_table_or_view`) — raises
+    `CatalogOperationError` if `path` doesn't exist or isn't one. REST-only
+    (see module docstring) — takes `catalog_rest` directly rather than a
+    `SqlExecutor`. An entity with zero tags is a normal state and returns
+    an empty list, not an error (unlike `getwikifrom`).
     """
     try:
+        _require_table_or_view(catalog_rest, path, "gettagsfrom")
         tags = catalog_rest.get_tags(path)
     except EngineStartingError as exc:
         retry_state.record(idempotency_key, "gettagsfrom", path, str(exc), params={"path": path})
@@ -750,11 +753,65 @@ def gettagsfrom(
     return tags
 
 
-def assignwikito(
+_REQUIRED_TAG_KEYS = frozenset({"tag_name", "tag_value", "tag_title"})
+
+# What separates the caller's own wiki text from the "# Meta Data" section
+# setwikito/setmeta2wiki append — the exact prefix _render_wiki_metadata's
+# output gets joined onto, so splitting on it is exact, not a guess.
+_META_MARKER = "\n\n# Meta Data\n"
+
+_TAG_ELEMENT_RE = re.compile(r'<tag\s+name="([^"]*)"\s+value="([^"]*)"\s+title="([^"]*)"\s*/>')
+
+
+def _validate_tags(tags: list[dict[str, str]]) -> None:
+    missing = [t for t in tags if not _REQUIRED_TAG_KEYS <= t.keys()]
+    if missing:
+        raise CatalogOperationError(
+            f"each tag needs {sorted(_REQUIRED_TAG_KEYS)} — missing from: {missing!r}"
+        )
+
+
+def _render_wiki_metadata(tags: list[dict[str, str]]) -> str:
+    """The "# Meta Data" section `setwikito`/`setmeta2wiki` append when
+    `tags` is given.
+
+    Dremio's wiki has no structured-metadata concept of its own — it's
+    plain markdown text — so this is the only way to carry name/value/title
+    tags through it: one human-readable "title : value" line per tag,
+    followed by the same data machine-readable as
+    ``<meta><tag name=... value=... title=.../>...</meta>``.
+    """
+    display_lines = [f"\t{tag['tag_title']} : {tag['tag_value']}" for tag in tags]
+    meta_lines = [
+        f'<tag name="{tag["tag_name"]}" value="{tag["tag_value"]}" title="{tag["tag_title"]}"/>'
+        for tag in tags
+    ]
+    return "\n".join(["# Meta Data", *display_lines, "<meta>", *meta_lines, "</meta>"])
+
+
+def _split_wiki_metadata(text: str) -> tuple[str, list[dict[str, str]]]:
+    """`(base_text, existing_tags)`: `base_text` is whatever came before the
+    "# Meta Data" section (or all of `text`, if there isn't one yet);
+    `existing_tags` is parsed back out of that section's `<meta>` block,
+    best-effort — a wiki hand-edited outside this format (or with no
+    section at all) just yields no tags, not an error.
+    """
+    idx = text.find(_META_MARKER)
+    if idx == -1:
+        return text, []
+    existing_tags = [
+        {"tag_name": name, "tag_value": value, "tag_title": title}
+        for name, value, title in _TAG_ELEMENT_RE.findall(text[idx:])
+    ]
+    return text[:idx], existing_tags
+
+
+def setwikito(
     catalog_rest: CatalogRestClient,
     path: str,
     text: str,
     *,
+    tags: list[dict[str, str]] | None = None,
     idempotency_key: str,
 ) -> None:
     """Create or overwrite the Dremio wiki text on the catalog entity at `path`.
@@ -762,18 +819,203 @@ def assignwikito(
     REST-only (see module docstring) — takes `catalog_rest` directly rather
     than a `SqlExecutor`. Raises `CatalogOperationError` if `path` doesn't
     exist.
+
+    `tags`, if given, is a list of ``{"tag_name": ..., "tag_value": ...,
+    "tag_title": ...}`` dicts (raises `CatalogOperationError` immediately if
+    any is missing a key) — each rendered into a "# Meta Data" section
+    appended to `text` before it's sent (see `_render_wiki_metadata`). The
+    rendered text, metadata included, is what a retry remembers and
+    re-sends — `tags` itself is never persisted to retry_state.
     """
+    if tags:
+        _validate_tags(tags)
+        text = f"{text}\n\n{_render_wiki_metadata(tags)}"
+
     try:
         catalog_rest.set_wiki(path, text)
     except EngineStartingError as exc:
         retry_state.record(
-            idempotency_key, "assignwikito", path, str(exc), params={"path": path, "text": text}
+            idempotency_key, "setwikito", path, str(exc), params={"path": path, "text": text}
         )
         raise
     retry_state.clear(idempotency_key)
 
 
-def assigntagsto(
+def deletewiki(
+    catalog_rest: CatalogRestClient,
+    path: str,
+    *,
+    idempotency_key: str,
+) -> None:
+    """Delete the wiki text on the catalog entity at `path`, if it has one.
+
+    REST-only (see module docstring) — takes `catalog_rest` directly rather
+    than a `SqlExecutor`. Idempotent: a missing `path`, or one with no wiki
+    at all, is a no-op, not an error — same as `deleteview`'s
+    ``DROP VIEW IF EXISTS``. Dremio's collaboration API has no separate
+    delete-wiki endpoint to speak of, so this clears it by setting the text
+    to empty (the same workaround `deletetags` uses for tags).
+    """
+    try:
+        has_wiki = True
+        try:
+            catalog_rest.get_wiki(path)
+        except CatalogOperationError:
+            has_wiki = False  # path missing entirely, or just has no wiki — nothing to delete
+        if has_wiki:
+            catalog_rest.set_wiki(path, "")
+    except EngineStartingError as exc:
+        retry_state.record(idempotency_key, "deletewiki", path, str(exc), params={"path": path})
+        raise
+    retry_state.clear(idempotency_key)
+
+
+def _require_folder(catalog_rest: CatalogRestClient, path: str, operation_name: str) -> None:
+    """Gate for `setmeta2wiki`/`getmetafromwiki`: both are a folder-only
+    stand-in for tags, since Dremio's own tags/labels only exist on
+    tables/views, not folders — so this scheme and Dremio's real tags are
+    meant to cover different levels, not overlap.
+    """
+    if not catalog_rest.exists(path):
+        raise CatalogOperationError(f"{path!r} does not exist")
+    if not catalog_rest.is_folder(path):
+        raise CatalogOperationError(
+            f"{operation_name} only works on folders — {path!r} is not one "
+            "(tables/views have Dremio's own tags/labels for this instead)"
+        )
+
+
+def _require_table_or_view(catalog_rest: CatalogRestClient, path: str, operation_name: str) -> None:
+    """Gate for `gettagsfrom`/`settagsto`: the mirror image of
+    `_require_folder` — Dremio's own tags/labels only exist on
+    tables/views, not folders (see `setmeta2wiki`/`getmetafromwiki` for
+    the folder-level stand-in) — so this and that scheme are meant to
+    cover different levels, not overlap.
+    """
+    if not catalog_rest.exists(path):
+        raise CatalogOperationError(f"{path!r} does not exist")
+    if not catalog_rest.is_table_or_view(path):
+        raise CatalogOperationError(
+            f"{operation_name} only works on tables/views — {path!r} is not one "
+            "(folders have setmeta2wiki/getmetafromwiki for this instead)"
+        )
+
+
+def setmeta2wiki(
+    catalog_rest: CatalogRestClient,
+    path: str,
+    *,
+    tags: list[dict[str, str]] | None = None,
+    overwrite: bool = True,
+    idempotency_key: str,
+) -> None:
+    """Append or update the "# Meta Data" section (see `setwikito`) on
+    the wiki already at `path`, keeping whatever text comes before it.
+
+    Folders only (see `_require_folder`) — raises `CatalogOperationError`
+    if `path` doesn't exist or isn't one.
+
+    `overwrite=True` (the default) replaces the whole section with one
+    rendered fresh from `tags`. `overwrite=False` instead merges: the tags
+    already embedded in the current section (parsed back out of its
+    ``<meta>`` block) plus `tags`, appended after them — nothing is
+    deduplicated, so a repeated `tag_name` shows up twice.
+
+    Raises `CatalogOperationError` if any tag is missing a required key.
+    If `path` has no wiki yet, starts from empty base text rather than
+    raising — same as `setwikito` creating one from scratch.
+    """
+    try:
+        _require_folder(catalog_rest, path, "setmeta2wiki")
+
+        try:
+            current_text = catalog_rest.get_wiki(path)
+        except CatalogOperationError:
+            current_text = ""  # exists, but no wiki yet
+
+        base_text, existing_tags = _split_wiki_metadata(current_text)
+
+        new_tags = list(tags or []) if overwrite else existing_tags + list(tags or [])
+        if new_tags:
+            _validate_tags(new_tags)
+            full_text = f"{base_text}\n\n{_render_wiki_metadata(new_tags)}"
+        else:
+            full_text = base_text
+
+        catalog_rest.set_wiki(path, full_text)
+    except EngineStartingError as exc:
+        # Params mirror this function's own arguments (not the computed
+        # full_text) — a retry re-runs the whole thing from scratch,
+        # re-fetching and re-merging against whatever the wiki looks like
+        # by then, rather than blindly resending a stale precomputed string.
+        retry_state.record(
+            idempotency_key,
+            "setmeta2wiki",
+            path,
+            str(exc),
+            params={"path": path, "tags": tags, "overwrite": overwrite},
+        )
+        raise
+    retry_state.clear(idempotency_key)
+
+
+def getmetafromwiki(
+    catalog_rest: CatalogRestClient,
+    path: str,
+    tag_name: str | None = None,
+    field: Literal["tag_value", "tag_title"] | None = None,
+    *,
+    idempotency_key: str,
+) -> list[dict[str, str]] | dict[str, str]:
+    """The metadata tags `setmeta2wiki` embedded in the wiki at `path`.
+
+    Folders only (see `_require_folder`) — raises `CatalogOperationError`
+    if `path` doesn't exist or isn't one.
+
+    Without `tag_name` — or if it doesn't actually match any tag there —
+    returns every tag as a list of ``{"tag_name", "tag_value",
+    "tag_title"}`` dicts. With a matching `tag_name`, returns a single dict
+    for just that tag instead: both ``tag_value`` and ``tag_title`` if
+    `field` isn't given, or ``tag_name`` plus whichever one `field` asks
+    for (``"tag_value"`` or ``"tag_title"``).
+    """
+    if field is not None and field not in ("tag_value", "tag_title"):
+        raise CatalogOperationError(
+            f'field must be "tag_value", "tag_title", or None — got {field!r}'
+        )
+
+    try:
+        _require_folder(catalog_rest, path, "getmetafromwiki")
+        try:
+            text = catalog_rest.get_wiki(path)
+        except CatalogOperationError:
+            text = ""  # exists (as a folder), but no wiki yet
+    except EngineStartingError as exc:
+        retry_state.record(
+            idempotency_key,
+            "getmetafromwiki",
+            path,
+            str(exc),
+            params={"path": path, "tag_name": tag_name, "field": field},
+        )
+        raise
+    retry_state.clear(idempotency_key)
+
+    _, tags = _split_wiki_metadata(text)
+
+    if tag_name is None:
+        return tags
+
+    match = next((t for t in tags if t["tag_name"] == tag_name), None)
+    if match is None:
+        return tags
+
+    if field is None:
+        return dict(match)
+    return {"tag_name": match["tag_name"], field: match[field]}
+
+
+def settagsto(
     catalog_rest: CatalogRestClient,
     path: str,
     tags: list[str],
@@ -782,16 +1024,19 @@ def assigntagsto(
 ) -> None:
     """Replace the Dremio tags on the catalog entity at `path` with `tags`.
 
-    REST-only (see module docstring) — takes `catalog_rest` directly rather
-    than a `SqlExecutor`. Raises `CatalogOperationError` if `path` doesn't
-    exist. This *replaces* the tag set — pass the union of old and new tags
-    if you want to keep the existing ones (e.g. via `gettagsfrom` first).
+    Tables/views only (see `_require_table_or_view`) — raises
+    `CatalogOperationError` if `path` doesn't exist or isn't one. REST-only
+    (see module docstring) — takes `catalog_rest` directly rather than a
+    `SqlExecutor`. This *replaces* the tag set — pass the union of old and
+    new tags if you want to keep the existing ones (e.g. via `gettagsfrom`
+    first).
     """
     try:
+        _require_table_or_view(catalog_rest, path, "settagsto")
         catalog_rest.set_tags(path, tags)
     except EngineStartingError as exc:
         retry_state.record(
-            idempotency_key, "assigntagsto", path, str(exc), params={"path": path, "tags": tags}
+            idempotency_key, "settagsto", path, str(exc), params={"path": path, "tags": tags}
         )
         raise
     retry_state.clear(idempotency_key)
@@ -908,8 +1153,11 @@ _OPERATIONS = {
     "gettableitemsfrom": gettableitemsfrom,
     "getwikifrom": getwikifrom,
     "gettagsfrom": gettagsfrom,
-    "assignwikito": assignwikito,
-    "assigntagsto": assigntagsto,
+    "setwikito": setwikito,
+    "deletewiki": deletewiki,
+    "setmeta2wiki": setmeta2wiki,
+    "getmetafromwiki": getmetafromwiki,
+    "settagsto": settagsto,
     "deletetags": deletetags,
     "createfolder": createfolder,
     "deletefolder": deletefolder,
