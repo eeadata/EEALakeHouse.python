@@ -107,6 +107,12 @@ class FakeCatalogRest:
     def is_folder(self, path: str) -> bool:
         return path in self.folders
 
+    def is_table_or_view(self, path: str) -> bool:
+        # Every seeded path is either a folder (if also in self.folders) or,
+        # by default, a table/view — mirrors a real entity always being
+        # exactly one specific type.
+        return path in self.existing and path not in self.folders
+
     def get_wiki(self, path: str) -> str:
         from eea_datalakehouse.catalog.errors import CatalogOperationError
 
