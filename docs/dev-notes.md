@@ -793,6 +793,120 @@ with Catalog(DREMIO_URL, DREMIO_TOKEN, username=DREMIO_USERNAME) as catalog:
     )
 ```
 
+### Half the public surface has no docstring — and a notebook is where that shows
+
+- **Status:** open
+- **Where:** the whole package; worst in `dds_ingestion/models.py`,
+  `dds_ingestion/progress.py`, `dds_ingestion/client.py` (this branch) and
+  `catalog/client.py` (on `development`)
+- **Observation:** counting public classes/functions/methods (`__init__`
+  included, `_private` names excluded):
+
+  | tree | public defs | no docstring |
+  | --- | --- | --- |
+  | this branch (`data_preparation` + `dds_ingestion`) | 82 | 29 (35%) |
+  | `development` (adds `catalog/`) | 152 | 75 (49%) |
+
+  Note what is *not* missing: type information. `mypy` runs `strict = true`
+  (`pyproject.toml:56`) and a scan of both trees finds no unannotated parameter
+  and one unannotated return in total. Only the prose is absent, and unevenly:
+
+  - `catalog/client.py` — 20 of 22 public members, including every verb
+    (`table2view`, `draft2version`, `publishversion`, `datacopy`, `datamove`,
+    …). Its own class docstring is thorough; the methods under it have none.
+    See the next entry — those docstrings do exist, one layer down.
+  - `dds_ingestion/client.py` — `IngestClient.begin:107`, `.commit:136`,
+    `.close:90`, and both `__init__`s.
+  - `dds_ingestion/models.py` — 15 of 27, i.e. every `from_json`/`as_payload`
+    and the `Progress:134` class itself.
+  - `dds_ingestion/progress.py` — the `ProgressBar:13` protocol's `update`/
+    `close`, though the module docstring does spell the contract out.
+  - `data_preparation/` — classes and methods are documented well; but none of
+    the four modules, nor the package `__init__.py`, has a module docstring.
+- **Why it matters:** this library is driven from a notebook by design —
+  `dds_ingestion/__init__.py` opens with "A generated Jupyter notebook imports
+  :class:`FolderIngest`…". In JupyterLab, `Shift+Tab` inside a call and `obj?`
+  in a cell both render the same two things and nothing else: the signature and
+  the docstring. Where the docstring is empty a custodian gets a bare signature
+  and has to leave the notebook and open the source to learn what `commit()`
+  returns or what `Progress` carries. We have documentation — in READMEs — but
+  it is not reachable from where people are typing, which is the one place the
+  question actually gets asked.
+- **Suggestion:** a one-line summary on everything named in an `__all__`, in the
+  NumPy style `data_preparation/transformation.py:19` already uses, plus module
+  docstrings for the four `data_preparation` modules. To stop it drifting back,
+  turn on ruff's pydocstyle rules for `src/`: `pyproject.toml:50` currently
+  selects `E,F,I,UP,B,C4,SIM`, so nothing has ever checked for a docstring —
+  adding `"D"` with `[tool.ruff.lint.pydocstyle] convention = "numpy"` would.
+- **Open question:** do we want this on the `from_json`/`as_payload` wire
+  helpers too, or only on the surface a notebook touches? A `D` rule set covers
+  both unless we add a per-file-ignore for `models.py`.
+
+### `Catalog`'s methods drop the docstrings that `operations` already wrote
+
+- **Status:** open
+- **Where:** `src/eea_datalakehouse/catalog/client.py:174-249` vs
+  `catalog/operations.py` (on `development`)
+- **Observation:** all 19 public verbs in `operations.py` carry a real
+  docstring — `datacopy:343` "Copy data from `source_path` into `target_path`.",
+  `draft2version:315` "Promote the draft table at `draft_path` into a permanent
+  `version_path`.", and so on down the list. `Catalog`'s methods are thin
+  delegates onto them (`client.py:174` `table2view` → `operations.table2view`,
+  `:205` `datacopy` → `operations.datacopy`, same for the rest) and **not one
+  delegate has a docstring**, so none of that text reaches the object a notebook
+  actually holds.
+- **Why it matters:** the writing is already done and paid for; it is just one
+  layer below where anyone looks. `Shift+Tab` on `catalog.datacopy(` — the
+  natural way to check argument order mid-cell — shows the signature and
+  nothing else, while `operations.datacopy?` shows the paragraph that would have
+  answered the question. `help(Catalog)` has the same hole.
+- **Suggestion:** the cheapest fix that cannot drift is to copy the text at
+  class-definition time instead of retyping it — `datacopy.__doc__ =
+  operations.datacopy.__doc__` after the class body, or a tiny
+  `_delegates_to(operations.datacopy)` decorator that assigns `__doc__` **only**.
+  Deliberately not `functools.wraps`: that also rebinds `__name__`,
+  `__wrapped__` and `__signature__`, so the inspector would start showing the
+  module function's signature — including the leading `executor` argument that
+  `Catalog` supplies itself, which is exactly the confusion we'd be trying to
+  remove. If we'd rather stay explicit and boring, a one-line summary plus "See
+  `operations.datacopy`." is 19 lines of typing, once.
+- **Open question:** is `Catalog` the documented surface and `operations` the
+  internals, or are both public? `catalog/__init__.py` exports both and its
+  module docstring points at `operations` for callers who want to manage the
+  executor themselves — which argues both, and so argues for docstrings that
+  read correctly in either place.
+
+### Nothing pins the notebook environment the library is written for
+
+- **Status:** open
+- **Where:** `pyproject.toml:13-32` (`dependencies`) and `:34-41`
+  (`[project.optional-dependencies]`)
+- **Observation:** the package is notebook-facing by design, but nothing in the
+  repo installs, pins, or exercises a notebook: no `jupyterlab` or `ipykernel`
+  in the runtime dependencies or in the `dev` extra, no `.ipynb` anywhere in the
+  tree, and `tqdm` — the bar `dds_ingestion/progress.py` drives — comes in as
+  the plain terminal build rather than its notebook widget variant.
+- **Why it matters:** if we want to tell custodians "the API reference is
+  `Shift+Tab`", we need to be able to say *in which Jupyter*. Completion
+  behaviour is version-dependent (JupyterLab 4 is where the inline completer and
+  the LSP integration became first-class), and "it completes for me, not for
+  you" is unanswerable without a reproducible environment. It also means nobody
+  has ever run the notebook path in CI.
+- **Suggestion:** add a `notebook` extra — `jupyterlab>=4,<5` and `ipykernel`,
+  optionally `jupyterlab-lsp` + `python-lsp-server` if we want static completion
+  as well as the runtime kind — so `pip install -e ".[notebook]"` reproduces
+  what we document against. Two related loose ends worth folding in: `py.typed`
+  exists only under `dds_ingestion/`, not in `catalog/`, `data_preparation/` or
+  the package root, so a type checker or an LSP treats the rest of the package
+  as untyped despite `mypy strict`; and `pyproject.toml` declares no package
+  data at all, so it is worth confirming the marker actually lands in a built
+  wheel (`python -m build && unzip -l dist/*.whl | grep py.typed`).
+- **Open question:** do custodians run JupyterLab themselves, or in a hosted
+  environment where we control neither the Lab version nor the installed
+  extensions? That decides whether static/LSP completion is worth chasing at
+  all — if it isn't, everything rests on runtime introspection, which is to say
+  on the docstrings in the two entries above.
+
 ## Ideas / parking lot
 
 _Larger or fuzzier things that aren't defects — worth a conversation, not a ticket yet._
@@ -803,3 +917,7 @@ _Things we can't resolve from the code alone._
 
 - Is `docs/` intended to become a real documentation folder in this repo, or is
   documentation hosted elsewhere?
+- Which Jupyter do custodians actually run — JupyterLab 4 locally, an older
+  Notebook, or a hosted environment we don't control? If we intend tab-completion
+  and `Shift+Tab` to be the day-to-day API reference, that version is a
+  supported-platform decision, not a preference.
