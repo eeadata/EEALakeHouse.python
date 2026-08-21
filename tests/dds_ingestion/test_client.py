@@ -210,3 +210,31 @@ def test_begin_sends_sub_path_only_when_given(creds: DremioCreds) -> None:
 
         client.begin(sub_path="2026", **kwargs)  # type: ignore[arg-type]
         assert json.loads(route.calls.last.request.read())["sub_path"] == "2026"
+
+
+def test_commit_result_carries_the_physical_location() -> None:
+    """DI-11.9: ``storage_path`` says where permanently-stored files actually are.
+
+    ``table_path`` is where the table is queried; the two differ for a read-only
+    ingest that keeps its files. Absent (a staged ingest, or a server predating
+    the field) parses as ``None`` rather than failing — the models are
+    deliberately permissive about keys they do not know.
+    """
+    from eea_datalakehouse.dds_ingestion.models import CommitResult
+
+    kept = CommitResult.from_json(
+        {
+            "session_id": "s1",
+            "status": "done",
+            "table_path": "catalog/water/bwd/assessments",
+            "record_count": 12,
+            "storage_path": "local_s3/dh-prod-data/read/water/bwd/assessments",
+        }
+    )
+    assert kept.table_path == "catalog/water/bwd/assessments"
+    assert kept.storage_path == "local_s3/dh-prod-data/read/water/bwd/assessments"
+
+    staged = CommitResult.from_json(
+        {"session_id": "s2", "status": "done", "table_path": "x/y", "record_count": 1}
+    )
+    assert staged.storage_path is None

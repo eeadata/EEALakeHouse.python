@@ -1,4 +1,8 @@
-# Read-only ingest — the client half (DI-11.9)
+# Read-only ingest — the client half (DI-11.9) — **DONE**
+
+> Landed: `sub_path` (DI-11.12), the retry guard and `placement` (DI-11.7),
+> `CommitResult.storage_path` and the docs below (DI-11.9). mypy clean, 52 tests
+> pass. What is still open is recorded at the end of this file.
 
 Companion note for **this** repository. The full design lives with the server
 work it depends on:
@@ -23,9 +27,9 @@ DI-11 makes `read_only` mean *store the files permanently* under
 **Where the bytes land is chosen by the server**, in `begin`'s presigned targets,
 so this package needs no new parameter and no new call.
 
-## What changes here
+## What changed here
 
-0. **`sub_path` — the one new parameter** (DI-11.12). `FolderIngest(...,
+0. ✅ **`sub_path` — the one new parameter** (DI-11.12). `FolderIngest(...,
    sub_path="2026")`, passed straight through to `begin`; the server validates,
    normalises and scopes on it. It is what lets a read-only table accumulate:
 
@@ -41,20 +45,20 @@ so this package needs no new parameter and no new call.
    the original `rel_path`. `sub_path` is for filing a **flat** folder under a
    name they choose. Worth a worked example in `README.md`, and note that
    `replace` with a `sub_path` clears only that year.
-1. **Docs and docstrings** — `folder.py` class docstring + the `intent`
+1. ✅ **Docs and docstrings** — `folder.py` class docstring + the `intent`
    parameter, `dds_ingestion/README.md:38`, `__init__.py:16`: say what each
    intent now does (permanent raw folder + catalog view vs. Iceberg copy).
-2. **`CommitResult.storage_path`** (`models.py`) — optional, additive; the
+2. ✅ **`CommitResult.storage_path`** (`models.py`) — optional, additive; the
    physical Dremio path the server reports for a permanent ingest, so a notebook
    can print where the files actually are. Parse permissively as everywhere else
    (absent ⇒ `None`), so it works against an older server.
-3. **Resume/retry note** (`folder.py:305-322`, `retry()`): `_already_done`'s
+3. ✅ **Resume/retry note** (`folder.py:305-322`, `retry()`): `_already_done`'s
    docstring says a re-run is "an S3 overwrite of the identical key, which is
    harmless". Against a permanent folder in `append` mode that is only true if
    the server reuses the keys instead of numbering them. Align the wording with
    whatever DI-11.7 settles, and steer users to `attach()` + `retry()` rather
    than re-running `run()`.
-4. **Tests** — `tests/dds_ingestion/`: `storage_path` parsing, and a
+4. ✅ **Tests** — `tests/dds_ingestion/`: `storage_path` parsing, and a
    respx-mocked `begin` whose `key_prefix` is a permanent `read/...` prefix,
    asserting the client uploads to the issued targets unchanged.
 

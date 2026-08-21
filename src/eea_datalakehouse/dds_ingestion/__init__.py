@@ -13,10 +13,16 @@ Typical use inside a notebook (creds + base URL come from the kernel env)::
         folder="./my_data",
         target_catalog_path="biodiversity.uploads",
         data_format="parquet",
-        intent="read_only",
+        intent="read_only",   # keep the files as the table | "editable" → Iceberg
         parallelism=4,
     ).run()
     print(outcome.commit.table_path, outcome.commit.record_count)
+    print(outcome.commit.storage_path)   # where the files are, if kept
+
+``intent`` decides what the transfer leaves behind. On a server configured for
+permanent read-only storage, ``"read_only"`` keeps the uploaded files where the
+table lives and registers them; ``"editable"`` loads them into an Iceberg table
+and deletes the upload. See :class:`FolderIngest` for the full rule.
 """
 
 from __future__ import annotations

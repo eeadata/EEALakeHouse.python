@@ -113,12 +113,20 @@ class BeginResult:
 
 @dataclass(frozen=True, slots=True)
 class CommitResult:
-    """Response from ``POST /api/v1/ingest/commit``."""
+    """Response from ``POST /api/v1/ingest/commit``.
+
+    ``table_path`` is where the table is **queried** — the catalog path. For a
+    read-only ingest whose files are stored permanently, ``storage_path`` is
+    where those files physically **are** (the Dremio path of the promoted
+    folder); it is ``None`` for a staged ingest, whose upload was copied into the
+    catalog's own storage and deleted, and against any server predating it.
+    """
 
     session_id: str
     status: str
     table_path: str | None = None
     record_count: int | None = None
+    storage_path: str | None = None
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> CommitResult:
@@ -127,6 +135,7 @@ class CommitResult:
             status=data["status"],
             table_path=data.get("table_path"),
             record_count=data.get("record_count"),
+            storage_path=data.get("storage_path"),
         )
 
 

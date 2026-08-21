@@ -35,13 +35,26 @@ outcome = FolderIngest(
     folder="./my_data",
     target_catalog_path="biodiversity.uploads",
     data_format="parquet",      # one of parquet | csv | json
-    intent="read_only",         # or "editable"
+    intent="read_only",         # or "editable" — see below
     conflict_mode="fail",
     parallelism=4,              # concurrent uploads (default 4)
 ).run()
 
 print(outcome.commit.table_path, outcome.commit.record_count)
+print(outcome.commit.storage_path)   # where the files are, when they are kept
 ```
+
+`intent` decides what the transfer leaves behind:
+
+| | `read_only` | `editable` |
+|---|---|---|
+| your uploaded files | kept — they **are** the table | copied in, then deleted |
+| the table | the folder, registered, with a view at the catalog path | an Iceberg table |
+| good for | published data, data that accumulates | a table you will write to |
+
+(Storing read-only files permanently is a server setting. Where it is not
+enabled, both intents stage and load as before and only the table's shape
+differs — `storage_path` is then `None`.)
 
 `run()` performs `begin → upload(all files) → commit`, and leaves the session
 handle available afterwards.

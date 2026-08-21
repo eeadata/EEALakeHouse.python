@@ -94,6 +94,23 @@ def scan_folder(folder: Path, data_format: DataFormat) -> list[FileSpec]:
 class FolderIngest:
     """Orchestrate ingest of a local folder into a Dremio table via DDS.
 
+    ``intent`` decides what the transfer leaves behind, and on a server
+    configured for permanent read-only storage that includes **where the files
+    end up**:
+
+    * ``"read_only"`` — the upload is stored where the table lives and kept. The
+      folder is registered as the dataset (which is also what builds Dremio's
+      metadata: schema, file listing, Parquet statistics) and a view at the
+      catalog path points at it. Nothing is copied, and the files keep the shape
+      they were exported in. Use it for data that is published, not edited.
+    * ``"editable"`` — the upload is staged, loaded into an Iceberg table in the
+      catalog, and then deleted. Use it for a table that will be written to.
+
+    Against a server that has not enabled permanent storage, both intents stage
+    and load as before; the difference is then only the table's shape. Either way
+    the destination is the server's to choose — this class uploads to the targets
+    ``begin`` issues.
+
     ``sub_path`` files this upload under a named sub-folder of the table — the
     accumulating-dataset shape, one year at a time::
 
@@ -359,8 +376,15 @@ class FolderIngest:
         explicitly names under ``raw["uploaded"]``, so resume never wrongly drops
         a file. NOTE: the server populates that list for **server-run** transfers
         (``POST /ingest/folder``); a client-uploaded session reports nothing
-        there, so re-running one uploads every file again (an S3 overwrite of the
-        identical key, which is harmless).
+        there, so re-running one uploads every file again.
+
+        Re-running the SAME session is harmless — the keys are identical, so the
+        second upload overwrites the first. Starting a NEW session is a different
+        matter where the files are stored permanently: the server numbers an
+        incoming name that already exists, precisely so an append cannot
+        overwrite live data, and that turns a re-run into a second copy rather
+        than an overwrite. :meth:`retry` refuses exactly that case; prefer
+        :meth:`FolderIngest.attach` + :meth:`retry` over re-running :meth:`run`.
         """
 
         try:
