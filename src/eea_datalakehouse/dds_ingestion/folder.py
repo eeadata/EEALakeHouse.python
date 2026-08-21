@@ -92,7 +92,20 @@ def scan_folder(folder: Path, data_format: DataFormat) -> list[FileSpec]:
 
 
 class FolderIngest:
-    """Orchestrate ingest of a local folder into a Dremio table via DDS."""
+    """Orchestrate ingest of a local folder into a Dremio table via DDS.
+
+    ``sub_path`` files this upload under a named sub-folder of the table — the
+    accumulating-dataset shape, one year at a time::
+
+        FolderIngest(folder="./bw_2026", target_catalog_path=..., data_format="parquet",
+                     intent="read_only", table_name="water_temperature",
+                     sub_path="2026").run()
+
+    It applies to a **read-only** ingest whose files are stored permanently; the
+    server refuses it otherwise rather than filing the data somewhere else. A
+    folder that already has the structure locally needs nothing: ``scan_folder``
+    keeps sub-folders and the server preserves them.
+    """
 
     def __init__(
         self,
@@ -103,6 +116,7 @@ class FolderIngest:
         intent: Intent = "read_only",
         conflict_mode: str = "fail",
         table_name: str | None = None,
+        sub_path: str | None = None,
         parallelism: int = DEFAULT_PARALLELISM,
         idempotency_key: str | None = None,
         multipart: bool | None = None,
@@ -121,6 +135,7 @@ class FolderIngest:
         self.intent = intent
         self.conflict_mode = conflict_mode
         self.table_name = table_name
+        self.sub_path = sub_path
         self.parallelism = parallelism
         self.idempotency_key = idempotency_key
         self.multipart = multipart
@@ -219,6 +234,7 @@ class FolderIngest:
             conflict_mode=self.conflict_mode,
             files=files,
             table_name=self.table_name,
+            sub_path=self.sub_path,
             idempotency_key=self.idempotency_key,
             multipart=self.multipart,
         )
@@ -280,6 +296,15 @@ class FolderIngest:
           uploaded again. Any ``idempotency_key`` is dropped for that attempt, or
           the server would just replay the failed session.
 
+        **A transfer whose files are stored permanently is never re-uploaded
+        blindly.** There the upload landed in the table's own folder and stayed,
+        so a fresh session would add a *second* copy — the server numbers an
+        incoming name that already exists, precisely so an append can never
+        overwrite live data, and that protection turns a silent re-run into
+        duplicated rows. Such a transfer is resumable server-side by design, so
+        the first branch handles it; if the server says it is not, this raises
+        rather than guessing.
+
         Raises :class:`IngestStateError` if there is nothing to retry — no
         session, one that is still running, or one that already succeeded.
         """
@@ -304,6 +329,14 @@ class FolderIngest:
                 files_uploaded=0,
                 files_skipped=len(self._begin.s3.uploads) if self._begin else 0,
                 resumed=True,
+            )
+        if status.stores_permanently:
+            raise IngestStateError(
+                f"transfer {self._session_id} stored its files permanently and "
+                "cannot be resumed, so re-running it would upload a second copy "
+                "alongside the first. Inspect the table, then re-ingest "
+                "deliberately — with conflict_mode='replace' to redo it, or a "
+                "sub_path for data that belongs beside what is already there."
             )
         # Nothing to resume server-side: start over with a new session, which
         # means dropping the idempotency key that would replay the failed one.

@@ -113,6 +113,7 @@ class IngestClient:
         conflict_mode: str,
         files: list[FileSpec],
         table_name: str | None = None,
+        sub_path: str | None = None,
         idempotency_key: str | None = None,
         multipart: bool | None = None,
     ) -> BeginResult:
@@ -126,6 +127,8 @@ class IngestClient:
         }
         if table_name is not None:
             body["table_name"] = table_name
+        if sub_path:
+            body["sub_path"] = sub_path
         if idempotency_key is not None:
             body["idempotency_key"] = idempotency_key
         if multipart is not None:

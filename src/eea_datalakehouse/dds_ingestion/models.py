@@ -182,6 +182,23 @@ class StatusResult:
         return int(value) if value is not None else None
 
     @property
+    def placement(self) -> str:
+        """Where this transfer's files live: ``staged`` or ``read_permanent``.
+
+        ``staged`` (the default, and what a server without DI-11 reports by
+        omitting the field) means the upload was copied into the catalog and
+        deleted. ``read_permanent`` means the files were stored where the table
+        lives and kept — so re-uploading them is not a safe way to recover.
+        """
+        value = self.raw.get("placement")
+        return str(value) if value else "staged"
+
+    @property
+    def stores_permanently(self) -> bool:
+        """Whether this transfer's uploaded files ARE the table (DI-11)."""
+        return self.placement == "read_permanent"
+
+    @property
     def error(self) -> str | None:
         """Why the transfer failed, including the stage — e.g. ``"Dremio load
         failed: ..."`` or ``"S3 upload failed: ..."``. ``None`` unless failed."""

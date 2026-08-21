@@ -46,6 +46,32 @@ print(outcome.commit.table_path, outcome.commit.record_count)
 `run()` performs `begin → upload(all files) → commit`, and leaves the session
 handle available afterwards.
 
+## Read-only data that grows
+
+`intent="read_only"` on a server configured for permanent storage keeps your
+files as uploaded and registers them as the table — nothing is copied into the
+catalog. `sub_path` files each upload under a named sub-folder, so one table can
+accumulate:
+
+```python
+FolderIngest(
+    folder="./bw_2026",                       # a flat folder of parquet files
+    target_catalog_path="water_management_resources/bathing_water/bwd/reference",
+    data_format="parquet",
+    intent="read_only",
+    table_name="water_temperature",
+    sub_path="2026",                          # → .../water_temperature/2026/
+    conflict_mode="fail",                     # refuses if 2026 is already there
+).run()
+```
+
+Next year, the same call with `sub_path="2027"` adds to the same table;
+`conflict_mode="replace"` with a `sub_path` re-does **that year only** and leaves
+the others standing. If your local folder already has the structure
+(`2026/*.parquet`), you do not need `sub_path` — the layout is preserved as-is.
+The name is normalised server-side to the EEA convention (lowercase,
+underscores), so `"Q1 2026"` becomes `q1_2026`.
+
 ## Managing the transfer
 
 A transfer is a server-side session, so it can be inspected and resumed:

@@ -175,3 +175,38 @@ def test_error_response_raises_with_message(creds: DremioCreds) -> None:
         )
     assert exc.value.status_code == 409
     assert "exists" in str(exc.value)
+
+
+@respx.mock
+def test_begin_sends_sub_path_only_when_given(creds: DremioCreds) -> None:
+    """DI-11.12: the named sub-folder rides on ``begin`` and nowhere else.
+
+    Omitted when unset, so a client that never uses it sends the body it always
+    sent — an older server sees no new field.
+    """
+    import json
+
+    route = respx.post(f"{BASE_URL}/api/v1/ingest/begin").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "session_id": "sess-1",
+                "status": "open",
+                "s3": {"bucket": "b", "key_prefix": "p/", "uploads": []},
+                "collision": None,
+            },
+        )
+    )
+    kwargs: dict[str, object] = {
+        "target_catalog_path": "bio.uploads",
+        "intent": "read_only",
+        "data_format": "parquet",
+        "conflict_mode": "append",
+        "files": [FileSpec("a.parquet", 6)],
+    }
+    with IngestClient(BASE_URL, creds) as client:
+        client.begin(**kwargs)  # type: ignore[arg-type]
+        assert "sub_path" not in json.loads(route.calls.last.request.read())
+
+        client.begin(sub_path="2026", **kwargs)  # type: ignore[arg-type]
+        assert json.loads(route.calls.last.request.read())["sub_path"] == "2026"
