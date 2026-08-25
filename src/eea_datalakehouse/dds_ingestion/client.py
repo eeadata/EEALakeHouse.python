@@ -1,9 +1,25 @@
 """Thin, unit-testable HTTP client for the DDS Ingest API (v0.1).
 
 This layer knows nothing about local folders, parallelism or progress bars: it
-only translates the four ingest endpoints to/from the typed models in
-:mod:`eea_datalakehouse.dds_ingestion.models`. The orchestration logic lives in
-:mod:`eea_datalakehouse.dds_ingestion.folder`.
+only translates the ingest endpoints to/from the typed models in
+:mod:`eea_datalakehouse.dds_ingestion.models`. The orchestration logic
+lives in :mod:`eea_datalakehouse.dds_ingestion.folder`.
+
+One method per endpoint:
+
+===========================  ==========================================
+:meth:`IngestClient.begin`   ``POST /api/v1/ingest/begin``
+:meth:`~IngestClient.commit` ``POST /api/v1/ingest/commit``
+:meth:`~IngestClient.get_status`    ``GET /api/v1/ingest/{id}``
+:meth:`~IngestClient.list_sessions` ``GET /api/v1/ingest``
+:meth:`~IngestClient.retry`         ``POST /api/v1/ingest/{id}/retry``
+:meth:`~IngestClient.cancel`        ``DELETE /api/v1/ingest/{id}``
+:meth:`~IngestClient.estimate`      ``POST /api/v1/ingest/estimate``
+:meth:`~IngestClient.stage`         ``POST /api/v1/ingest/stage``
+===========================  ==========================================
+
+plus :meth:`~IngestClient.upload_file` / :meth:`~IngestClient.upload_file_multipart`,
+which talk to S3 through the presigned targets ``begin`` issued.
 
 Authentication uses a Bearer token (the Dremio PAT, which is the kernel's
 ``_DREMIO_PWD``) sent **only on the DDS API calls** — never on the presigned S3
@@ -23,22 +39,62 @@ from .models import (
     BeginResult,
     CommitResult,
     DataFormat,
+    EstimateResult,
     FileSpec,
     Intent,
+    StageResult,
     StatusResult,
     UploadTarget,
 )
 
 DEFAULT_TIMEOUT = 60.0
+# Error bodies are quoted back to the caller; cap them so an HTML error page
+# does not bury the status line it came with.
+_MAX_ERROR_CHARS = 500
 
 
 class IngestApiError(RuntimeError):
-    """A DDS ingest API call returned a non-success status."""
+    """A DDS ingest API call returned a non-success status.
 
-    def __init__(self, status_code: int, message: str) -> None:
-        super().__init__(f"DDS ingest API error {status_code}: {message}")
+    ``where`` names the call that failed (e.g. ``POST /api/v1/ingest/begin``).
+    It is part of the message because a transfer makes several different calls
+    to two different systems, and "API error 500" alone does not say which one
+    broke — see :class:`S3UploadError` for the other system.
+    """
+
+    def __init__(self, status_code: int, message: str, *, where: str | None = None) -> None:
+        super().__init__(
+            f"DDS ingest API error {status_code}"
+            f"{f' on {where}' if where else ''}: {message}"
+        )
         self.status_code = status_code
         self.message = message
+        self.where = where
+
+
+class S3UploadError(IngestApiError):
+    """A pre-signed upload to object storage failed — NOT a DDS API error.
+
+    The bytes go straight from here to S3 using the target ``begin`` issued, so
+    this failure is the object storage's (or whatever proxy sits in front of
+    it): a rejected policy, an unreachable endpoint, a gateway error. Reported
+    as its own class so a caller can tell "your upload never landed" from "the
+    Document Service refused the request", and so the message names the file and
+    the URL that actually answered.
+    """
+
+    def __init__(
+        self, status_code: int, message: str, *, rel_path: str, url: str
+    ) -> None:
+        RuntimeError.__init__(
+            self,
+            f"S3 upload of {rel_path!r} failed: HTTP {status_code} from {url}: {message}",
+        )
+        self.status_code = status_code
+        self.message = message
+        self.where = url
+        self.rel_path = rel_path
+        self.url = url
 
 
 class IngestClient:
@@ -95,6 +151,7 @@ class IngestClient:
         conflict_mode: str,
         files: list[FileSpec],
         table_name: str | None = None,
+        sub_path: str | None = None,
         idempotency_key: str | None = None,
         multipart: bool | None = None,
     ) -> BeginResult:
@@ -108,6 +165,8 @@ class IngestClient:
         }
         if table_name is not None:
             body["table_name"] = table_name
+        if sub_path:
+            body["sub_path"] = sub_path
         if idempotency_key is not None:
             body["idempotency_key"] = idempotency_key
         if multipart is not None:
@@ -132,11 +191,82 @@ class IngestClient:
         return CommitResult.from_json(data)
 
     def get_status(self, session_id: str) -> StatusResult:
+        """Current state of one session (``GET /api/v1/ingest/{id}``)."""
         resp = self._http.get(
             f"{self._base_url}/api/v1/ingest/{session_id}", headers=self._auth_headers
         )
-        self._raise_for_status(resp)
+        self._raise_for_status(resp, f"GET /api/v1/ingest/{session_id}")
         return StatusResult.from_json(resp.json())
+
+    def list_sessions(self, state: str | None = None) -> list[StatusResult]:
+        """Your ingest sessions (``GET /api/v1/ingest``).
+
+        ``state`` filters server-side: ``"active"`` (still running),
+        ``"failed"``, or ``"all"``. Omit for the server's default view.
+        """
+        params = {"state": state} if state else None
+        resp = self._http.get(
+            f"{self._base_url}/api/v1/ingest", params=params, headers=self._auth_headers
+        )
+        self._raise_for_status(resp, "GET /api/v1/ingest")
+        payload = resp.json()
+        rows = payload if isinstance(payload, list) else payload.get("sessions", [])
+        return [StatusResult.from_json(row) for row in rows]
+
+    def retry(self, session_id: str) -> StatusResult:
+        """Re-run a failed session's last stage (``POST /api/v1/ingest/{id}/retry``).
+
+        Only a ``failed`` session can be retried, and only the Dremio load stage
+        is resumable — the server kept the staged files for exactly that case
+        (see :attr:`StatusResult.is_resumable`). A session whose upload never
+        completed, or whose failure a re-run cannot fix, raises
+        :class:`IngestApiError` telling you to upload again.
+        """
+        resp = self._http.post(
+            f"{self._base_url}/api/v1/ingest/{session_id}/retry",
+            headers=self._auth_headers,
+        )
+        self._raise_for_status(resp, f"POST /api/v1/ingest/{session_id}/retry")
+        return StatusResult.from_json(resp.json())
+
+    def cancel(self, session_id: str) -> None:
+        """Discard a session and its staged data (``DELETE /api/v1/ingest/{id}``).
+
+        Use it to abandon a transfer: the staged objects are deleted and the
+        session is dropped. It does NOT remove a table that a previous commit
+        already created.
+        """
+        resp = self._http.delete(
+            f"{self._base_url}/api/v1/ingest/{session_id}", headers=self._auth_headers
+        )
+        self._raise_for_status(resp, f"DELETE /api/v1/ingest/{session_id}")
+
+    def estimate(self, session_id: str) -> EstimateResult:
+        """Row-count + size class for the staged data (``POST .../estimate``).
+
+        A pre-flight check between upload and commit. On a managed catalog the
+        count comes from the staged Parquet footers (CSV/JSON have none and
+        report 0).
+        """
+        data = self._post("/api/v1/ingest/estimate", {"session_id": session_id})
+        return EstimateResult.from_json(data)
+
+    def stage(self, session_id: str, rel_path: str, data: bytes) -> StageResult:
+        """Upload one file THROUGH the server (``POST /api/v1/ingest/stage``).
+
+        The fallback when the S3 endpoint is not reachable from this kernel: DDS
+        writes the bytes with its own catalog credentials instead of handing back
+        a presigned URL. Slower — the bytes transit the server — so prefer
+        :meth:`upload_file`, and use this when that fails to connect.
+        """
+        resp = self._http.post(
+            f"{self._base_url}/api/v1/ingest/stage",
+            data={"session_id": session_id, "rel_path": rel_path},
+            files={"file": (rel_path.rsplit("/", 1)[-1], data)},
+            headers=self._auth_headers,
+        )
+        self._raise_for_status(resp, "POST /api/v1/ingest/stage")
+        return StageResult.from_json(resp.json())
 
     def upload_file(self, target: UploadTarget, data: bytes) -> str | None:
         """Upload one file's bytes to its presigned target.
@@ -171,7 +301,7 @@ class IngestClient:
             resp = self._http.request(
                 target.method, target.url, content=data, headers=target.headers
             )
-        self._raise_for_status(resp)
+        self._raise_for_upload(resp, rel_path=target.rel_path, url=target.url)
         return resp.headers.get("ETag")
 
     def upload_file_multipart(
@@ -209,7 +339,7 @@ class IngestClient:
             start = index * chunk
             body = data[start : start + chunk] if chunk else b""
             resp = self._http.put(part.url, content=body)
-            self._raise_for_status(resp)
+            self._raise_for_upload(resp, rel_path=target.rel_path, url=part.url)
             etag = resp.headers.get("ETag")
             if etag is None:
                 raise IngestApiError(
@@ -226,14 +356,19 @@ class IngestClient:
         resp = self._http.post(
             f"{self._base_url}{path}", json=body, headers=self._auth_headers
         )
-        self._raise_for_status(resp)
+        self._raise_for_status(resp, f"POST {path}")
         result: dict[str, Any] = resp.json()
         return result
 
     @staticmethod
-    def _raise_for_status(resp: httpx.Response) -> None:
-        if resp.is_success:
-            return
+    def _error_message(resp: httpx.Response) -> str:
+        """The most useful text an error response carries.
+
+        A DDS error is ``{error, message, path}`` JSON, so quote its ``message``.
+        Anything else — an S3 XML fault, a proxy's HTML error page, Starlette's
+        bare ``Internal Server Error`` — is quoted verbatim but capped: those
+        pages run to kilobytes and only the first lines identify the sender.
+        """
         message = resp.text
         try:
             payload = resp.json()
@@ -241,4 +376,25 @@ class IngestClient:
                 message = str(payload.get("message") or payload.get("error") or message)
         except ValueError:
             pass
-        raise IngestApiError(resp.status_code, message)
+        message = message.strip()
+        if len(message) > _MAX_ERROR_CHARS:
+            message = message[:_MAX_ERROR_CHARS] + "… (truncated)"
+        return message or f"(empty {resp.status_code} response body)"
+
+    @classmethod
+    def _raise_for_status(cls, resp: httpx.Response, where: str) -> None:
+        """Raise :class:`IngestApiError` naming ``where`` unless the call succeeded."""
+        if resp.is_success:
+            return
+        raise IngestApiError(resp.status_code, cls._error_message(resp), where=where)
+
+    @classmethod
+    def _raise_for_upload(
+        cls, resp: httpx.Response, *, rel_path: str, url: str
+    ) -> None:
+        """Raise :class:`S3UploadError` unless the pre-signed upload succeeded."""
+        if resp.is_success:
+            return
+        raise S3UploadError(
+            resp.status_code, cls._error_message(resp), rel_path=rel_path, url=url
+        )
