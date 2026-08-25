@@ -27,7 +27,7 @@ and deletes the upload. See :class:`FolderIngest` for the full rule.
 
 from __future__ import annotations
 
-from .client import IngestApiError, IngestClient
+from .client import IngestApiError, IngestClient, S3UploadError
 from .credentials import (
     DremioCreds,
     MissingCredentialsError,
@@ -74,6 +74,7 @@ __all__ = [
     "MissingCredentialsError",
     "Progress",
     "S3Plan",
+    "S3UploadError",
     "StageResult",
     "StatusResult",
     "UploadPart",

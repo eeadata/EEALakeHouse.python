@@ -3,7 +3,11 @@ from __future__ import annotations
 import httpx
 import pytest
 import respx
-from eea_datalakehouse.dds_ingestion.client import IngestApiError, IngestClient
+from eea_datalakehouse.dds_ingestion.client import (
+    IngestApiError,
+    IngestClient,
+    S3UploadError,
+)
 from eea_datalakehouse.dds_ingestion.credentials import DremioCreds
 from eea_datalakehouse.dds_ingestion.models import FileSpec, UploadPart, UploadTarget
 
@@ -175,6 +179,67 @@ def test_error_response_raises_with_message(creds: DremioCreds) -> None:
         )
     assert exc.value.status_code == 409
     assert "exists" in str(exc.value)
+
+
+@respx.mock
+def test_dds_error_names_the_call_that_failed(creds: DremioCreds) -> None:
+    """A 500 with Starlette's bare body must still say WHICH call broke.
+
+    The message an ingest reported was "DDS ingest API error 500: Internal
+    Server Error" — true, and useless: a transfer calls begin, upload and commit
+    against two different systems.
+    """
+    respx.post(f"{BASE_URL}/api/v1/ingest/begin").mock(
+        return_value=httpx.Response(500, text="Internal Server Error")
+    )
+    with IngestClient(BASE_URL, creds) as client, pytest.raises(IngestApiError) as exc:
+        client.begin(
+            target_catalog_path="x",
+            intent="read_only",
+            data_format="parquet",
+            conflict_mode="fail",
+            files=[FileSpec("a.parquet", 6)],
+        )
+
+    assert exc.value.where == "POST /api/v1/ingest/begin"
+    assert "POST /api/v1/ingest/begin" in str(exc.value)
+    assert "Internal Server Error" in str(exc.value)
+
+
+@respx.mock
+def test_failed_presigned_upload_is_not_reported_as_a_dds_error(
+    creds: DremioCreds,
+) -> None:
+    """The upload goes straight to object storage; its failures are its own."""
+    respx.post("https://s3.example/bucket").mock(
+        return_value=httpx.Response(500, text="<html>gateway said no</html>")
+    )
+    target = UploadTarget(
+        rel_path="a.parquet", url="https://s3.example/bucket", method="POST"
+    )
+    with IngestClient(BASE_URL, creds) as client, pytest.raises(S3UploadError) as exc:
+        client.upload_file(target, b"PAR1")
+
+    assert exc.value.rel_path == "a.parquet"
+    assert exc.value.url == "https://s3.example/bucket"
+    message = str(exc.value)
+    assert message.startswith("S3 upload of 'a.parquet' failed: HTTP 500")
+    assert "https://s3.example/bucket" in message
+    assert "DDS ingest API error" not in message
+    # …and it is still an IngestApiError, so existing handling keeps working.
+    assert isinstance(exc.value, IngestApiError)
+
+
+@respx.mock
+def test_long_error_bodies_are_truncated(creds: DremioCreds) -> None:
+    respx.post(f"{BASE_URL}/api/v1/ingest/commit").mock(
+        return_value=httpx.Response(502, text="x" * 5000)
+    )
+    with IngestClient(BASE_URL, creds) as client, pytest.raises(IngestApiError) as exc:
+        client.commit(session_id="sess-1")
+
+    assert exc.value.message.endswith("… (truncated)")
+    assert len(exc.value.message) < 600
 
 
 @respx.mock
