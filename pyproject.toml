@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "EEADataLakehouse"
-version = "0.1.0"
-description = "Data preparation and validation utilities for the EEA data lakehouse ingestion pipeline."
+version = "0.1.10"
+description = "Data preparation and validation utilities for the EEA data lakehouse pipeline."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "EUPL-1.2" }
@@ -36,6 +36,7 @@ dev = [
     "mypy>=2.1",
     "respx>=0.23",       # mocks httpx for the ingestion test suite
     "types-tqdm",
+    "ipykernel>=6.29",   # run/debug notebooks against this environment
 ]
 
 [project.urls]

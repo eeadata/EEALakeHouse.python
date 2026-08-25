@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # Python dependencies declared in pyproject.toml.
+  #
+  # No explicit `labels:` here — Dependabot only attaches labels it's told
+  # about, it never creates them, and errors out if a listed label doesn't
+  # already exist in the repo. Leaving it unset falls back to Dependabot's
+  # own default label, which it *does* create automatically.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+
+  # Actions used by .github/workflows/*.yml (checkout, setup-python,
+  # action-gh-release, ...) — kept current for the same reason as the
+  # Python deps above, just a different ecosystem.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

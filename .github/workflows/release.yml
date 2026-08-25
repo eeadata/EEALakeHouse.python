@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - staging
 
 jobs:
   release:
@@ -11,17 +12,74 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
-      - name: Read package version
+      # staging bumps the patch version (0.{y}.{z} -> 0.{y}.{z+1}) and commits
+      # it — a staging build always gets a fresh version. main does not bump:
+      # it releases whatever version is already committed (typically the one
+      # staging just bumped to, once merged).
+      - name: Resolve release version
         id: version
         run: |
-          PKG_VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref_name }}" = "staging" ]; then
+            NEW_VERSION="$(python3 - <<'PY'
+          import re
+
+          path = "pyproject.toml"
+          text = open(path).read()
+          match = re.search(r'(?m)^version = "(\d+)\.(\d+)\.(\d+)"', text)
+          major, minor, patch = match.groups()
+          new_version = f"{major}.{minor}.{int(patch) + 1}"
+          text = text[: match.start()] + f'version = "{new_version}"' + text[match.end() :]
+          open(path, "w").write(text)
+          print(new_version)
+          PY
+          )"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add pyproject.toml
+            git commit -m "Bump version to $NEW_VERSION [skip ci]"
+            git push
+          else
+            NEW_VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          fi
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      # Keeps the README's `pip`/`%pip install ...@vX.Y.Z[-staging]` example
+      # lines from ever going stale — only touches this branch's own lines
+      # (matched by the trailing `"` for main, `-staging"` for staging, so
+      # a staging run can never clobber main's line and vice versa).
+      # [skip ci]: this push must not re-trigger this same workflow.
+      - name: Update README's install examples for this branch
+        run: |
+          NEW_VERSION="${{ steps.version.outputs.version }}"
+          if [ "${{ github.ref_name }}" = "staging" ]; then
+            sed -i -E "s#(EEALakeHouse\.python\.git@v)[0-9]+\.[0-9]+\.[0-9]+(-staging\")#\1${NEW_VERSION}\2#g" README.md
+          else
+            sed -i -E "s#(EEALakeHouse\.python\.git@v)[0-9]+\.[0-9]+\.[0-9]+\"#\1${NEW_VERSION}\"#g" README.md
+          fi
+          if git diff --quiet -- README.md; then
+            echo "README already up to date for this branch's version."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add README.md
+            git commit -m "Update README install examples to v${NEW_VERSION}${{ github.ref_name == 'staging' && '-staging' || '' }} [skip ci]"
+            git push
+          fi
+
+      # Tags the *build* (not the committed pyproject.toml) with its branch,
+      # via a PEP 440 local version segment ("+main"/"+staging") — this is
+      # what shows up in the wheel filename, e.g.
+      # eeadatalakehouseingestion-0.1.1+staging-py3-none-any.whl. Not
+      # committed: the working copy is discarded with the runner.
+      - name: Stamp the build version with its branch
+        run: |
+          sed -i 's/^version = "${{ steps.version.outputs.version }}"/version = "${{ steps.version.outputs.version }}+${{ github.ref_name }}"/' pyproject.toml
 
       - name: Install build tool
         run: pip install build
@@ -29,10 +87,64 @@ jobs:
       - name: Build sdist and wheel
         run: python -m build
 
+      # Only one release/tag is ever kept per branch — delete whatever this
+      # branch's previous release+tag was (main: a plain "v*" tag; staging:
+      # a "v*-staging" tag) before creating the new one below. Best-effort:
+      # a delete failure (e.g. nothing to delete yet) must not fail the
+      # release itself.
+      - name: Delete this branch's previous release and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          if [ "${{ github.ref_name }}" = "staging" ]; then
+            SUFFIX="-staging"
+          else
+            SUFFIX=""
+          fi
+          for TAG in $(gh release list --limit 100 --json tagName -q '.[].tagName'); do
+            case "$TAG" in
+              *-staging) TAG_SUFFIX="-staging" ;;
+              *) TAG_SUFFIX="" ;;
+            esac
+            if [ "$TAG_SUFFIX" = "$SUFFIX" ]; then
+              echo "Deleting previous release/tag for ${{ github.ref_name }}: $TAG"
+              gh release delete "$TAG" --cleanup-tag -y
+            fi
+          done
+
+      # target_commitish is required here: without it, the GitHub API creates
+      # a brand-new tag from the *repository's default branch* tip, not from
+      # github.sha (the commit that triggered this run) and not from the
+      # version-bump/README commits the earlier steps just pushed to this
+      # branch. Pointing it at github.ref_name makes the release tag land on
+      # this branch's actual current tip.
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: v${{ steps.version.outputs.version }}
+          tag_name: v${{ steps.version.outputs.version }}${{ github.ref_name == 'staging' && '-staging' || '' }}
+          name: v${{ steps.version.outputs.version }} (${{ github.ref_name }})
+          target_commitish: ${{ github.ref_name }}
           files: dist/*
           generate_release_notes: true
+          prerelease: ${{ github.ref_name == 'staging' }}
+
+      # A floating alias tag literally named after the branch (main/staging)
+      # that always points at whatever was just released — unlike the
+      # v{version}[-staging] tag above (deleted/recreated, so it names one
+      # specific release), this one just moves forward every time. Runs only
+      # once the real release above has succeeded.
+      #
+      # Sharing its name with the branch is deliberate: `git` resolves the
+      # ambiguity deterministically (a tag always wins over a same-named
+      # branch — see gitrevisions(7) on ref disambiguation order), so
+      # `pip install ...@main` / `...@staging` always resolves to this tag,
+      # i.e. the latest release — not necessarily the exact branch tip.
+      # Expect (and ignore) a "refname 'main' is ambiguous" warning from
+      # git/pip when that happens. The push uses fully-qualified refs on
+      # both sides specifically to sidestep that same ambiguity for the
+      # push command itself.
+      - name: Move the branch-name alias tag to this release
+        run: |
+          git tag -f "${{ github.ref_name }}"
+          git push origin "refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}" --force
