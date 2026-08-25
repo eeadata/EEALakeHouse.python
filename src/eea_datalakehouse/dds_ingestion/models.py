@@ -113,12 +113,20 @@ class BeginResult:
 
 @dataclass(frozen=True, slots=True)
 class CommitResult:
-    """Response from ``POST /api/v1/ingest/commit``."""
+    """Response from ``POST /api/v1/ingest/commit``.
+
+    ``table_path`` is where the table is **queried** — the catalog path. For a
+    read-only ingest whose files are stored permanently, ``storage_path`` is
+    where those files physically **are** (the Dremio path of the promoted
+    folder); it is ``None`` for a staged ingest, whose upload was copied into the
+    catalog's own storage and deleted, and against any server predating it.
+    """
 
     session_id: str
     status: str
     table_path: str | None = None
     record_count: int | None = None
+    storage_path: str | None = None
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> CommitResult:
@@ -127,6 +135,7 @@ class CommitResult:
             status=data["status"],
             table_path=data.get("table_path"),
             record_count=data.get("record_count"),
+            storage_path=data.get("storage_path"),
         )
 
 
@@ -147,7 +156,12 @@ class Progress:
 
 @dataclass(frozen=True, slots=True)
 class StatusResult:
-    """Response from ``GET /api/v1/ingest/{session_id}``."""
+    """Response from ``GET /api/v1/ingest/{session_id}`` (and the list/retry calls).
+
+    ``status`` is the lifecycle state — ``pending`` → ``uploading`` →
+    ``committing`` → ``done``, or ``failed`` / ``cancelled``. ``raw`` keeps the
+    whole payload so fields the client does not model yet stay reachable.
+    """
 
     status: str
     progress: Progress
@@ -159,4 +173,99 @@ class StatusResult:
             status=data["status"],
             progress=Progress.from_json(data.get("progress") or {}),
             raw=data,
+        )
+
+    @property
+    def session_id(self) -> str | None:
+        value = self.raw.get("session_id")
+        return str(value) if value is not None else None
+
+    @property
+    def table_path(self) -> str | None:
+        value = self.raw.get("table_path")
+        return str(value) if value is not None else None
+
+    @property
+    def record_count(self) -> int | None:
+        value = self.raw.get("record_count")
+        return int(value) if value is not None else None
+
+    @property
+    def placement(self) -> str:
+        """Where this transfer's files live: ``staged`` or ``read_permanent``.
+
+        ``staged`` (the default, and what a server without DI-11 reports by
+        omitting the field) means the upload was copied into the catalog and
+        deleted. ``read_permanent`` means the files were stored where the table
+        lives and kept — so re-uploading them is not a safe way to recover.
+        """
+        value = self.raw.get("placement")
+        return str(value) if value else "staged"
+
+    @property
+    def stores_permanently(self) -> bool:
+        """Whether this transfer's uploaded files ARE the table (DI-11)."""
+        return self.placement == "read_permanent"
+
+    @property
+    def error(self) -> str | None:
+        """Why the transfer failed, including the stage — e.g. ``"Dremio load
+        failed: ..."`` or ``"S3 upload failed: ..."``. ``None`` unless failed."""
+        value = self.raw.get("error")
+        return str(value) if value is not None else None
+
+    @property
+    def is_terminal(self) -> bool:
+        """Whether the session has finished, one way or another."""
+        return self.status in ("done", "failed", "cancelled")
+
+    @property
+    def is_resumable(self) -> bool:
+        """Whether :meth:`FolderIngest.retry` can re-run this transfer.
+
+        A failed transfer is resumable when the server kept its staged files —
+        which it does when the upload landed and only the Dremio load failed on
+        a managed catalog. Anything else has to be uploaded again.
+
+        This reads the server's own ``resumable`` verdict rather than re-deriving
+        it from ``failed_stage``: a load-stage failure the server could not hold
+        the bytes for reports ``failed_stage="load"`` too, and inferring from that
+        sent :meth:`~eea_datalakehouse.dds_ingestion.folder.FolderIngest.retry`
+        down the resume path to be told the staged data was gone — instead of
+        simply re-uploading. A server that does not send the field reads as not
+        resumable, which is the safe direction: the transfer is re-uploaded
+        under a new session.
+        """
+        return self.status == "failed" and bool(self.raw.get("resumable"))
+
+
+@dataclass(frozen=True, slots=True)
+class EstimateResult:
+    """Response from ``POST /api/v1/ingest/estimate`` (pre-flight sizing)."""
+
+    record_count: int
+    size_class: str
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> EstimateResult:
+        return cls(
+            record_count=int(data.get("record_count", 0)),
+            size_class=str(data.get("size_class", "")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class StageResult:
+    """Response from ``POST /api/v1/ingest/stage`` (server-proxied upload)."""
+
+    rel_path: str
+    key: str
+    bytes_written: int | None = None
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> StageResult:
+        return cls(
+            rel_path=str(data["rel_path"]),
+            key=str(data["key"]),
+            bytes_written=data.get("bytes"),
         )

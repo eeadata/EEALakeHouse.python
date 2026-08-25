@@ -6,7 +6,11 @@ import time
 from pathlib import Path
 
 import pytest
-from eea_datalakehouse.dds_ingestion.folder import FolderIngest, scan_folder
+from eea_datalakehouse.dds_ingestion.folder import (
+    FolderIngest,
+    IngestStateError,
+    scan_folder,
+)
 from eea_datalakehouse.dds_ingestion.models import (
     BeginResult,
     CommitResult,
@@ -28,6 +32,9 @@ class FakeClient:
         self.commit_calls: list[dict[str, object]] = []
         self.closed = False
         self._already_uploaded = already_uploaded or []
+        # Set to drive ``get_status`` from a test (e.g. a failed, unresumable
+        # session); ``None`` keeps the default "open" shape.
+        self.status_payload: dict[str, object] | None = None
         # concurrency instrumentation
         self._lock = threading.Lock()
         self._active = 0
@@ -46,6 +53,8 @@ class FakeClient:
         )
 
     def get_status(self, session_id: str) -> StatusResult:
+        if self.status_payload is not None:
+            return StatusResult.from_json(self.status_payload)
         return StatusResult.from_json(
             {
                 "status": "open",
@@ -204,3 +213,86 @@ def test_multipart_etags_threaded_into_commit(data_folder: Path) -> None:
     entry = by_rel["a.parquet"]
     assert entry["upload_id"] == "up-a.parquet"
     assert entry["parts"] == [{"part_number": 1, "etag": '"etag-a.parquet"'}]
+
+
+def test_sub_path_is_passed_through_to_begin(tmp_path: Path) -> None:
+    """DI-11.12: the class carries the custodian's chosen sub-folder, nothing more.
+
+    Normalising and scoping it is the server's job — the client would otherwise
+    be a second opinion about where the data lives.
+    """
+    (tmp_path / "a.parquet").write_bytes(b"PAR1")
+    client = FakeClient()
+    job = FolderIngest(
+        tmp_path,
+        "catalog/water/bwd",
+        data_format="parquet",
+        table_name="water_temperature",
+        sub_path="2026",
+        client=client,
+        show_progress=False,
+    )
+    job.run()
+    assert client.begin_calls[0]["sub_path"] == "2026"
+
+
+def test_sub_path_defaults_to_none(tmp_path: Path) -> None:
+    (tmp_path / "a.parquet").write_bytes(b"PAR1")
+    client = FakeClient()
+    FolderIngest(
+        tmp_path, "catalog/water/bwd", data_format="parquet",
+        client=client, show_progress=False,
+    ).run()
+    assert client.begin_calls[0]["sub_path"] is None
+
+
+def test_retry_refuses_to_re_upload_a_permanently_stored_transfer(
+    tmp_path: Path,
+) -> None:
+    """DI-11.7: a blind re-run there adds a second copy, so it must not happen.
+
+    The server numbers an incoming name that already exists — precisely so an
+    append can never overwrite live data — which turns a silent "start over"
+    into duplicated rows rather than a clean retry.
+    """
+    (tmp_path / "a.parquet").write_bytes(b"PAR1")
+    client = FakeClient()
+    client.status_payload = {
+        "status": "failed",
+        "progress": {},
+        "failed_stage": "load",
+        "resumable": False,
+        "placement": "read_permanent",
+    }
+    job = FolderIngest(
+        tmp_path, "catalog/water/bwd", data_format="parquet",
+        intent="read_only", client=client, show_progress=False,
+    )
+    job._session_id = "sess-1"
+
+    with pytest.raises(IngestStateError) as excinfo:
+        job.retry()
+    assert "second copy" in str(excinfo.value)
+    # And nothing was re-uploaded behind the user's back.
+    assert client.begin_calls == []
+    assert client.uploaded == []
+
+
+def test_retry_still_starts_over_for_a_staged_transfer(tmp_path: Path) -> None:
+    # The staged path is unchanged: its files were discarded, so re-uploading is
+    # the only way forward and is safe.
+    (tmp_path / "a.parquet").write_bytes(b"PAR1")
+    client = FakeClient()
+    client.status_payload = {
+        "status": "failed",
+        "progress": {},
+        "failed_stage": "upload",
+        "resumable": False,
+    }
+    job = FolderIngest(
+        tmp_path, "catalog/water/bwd", data_format="parquet",
+        client=client, show_progress=False,
+    )
+    job._session_id = "sess-1"
+    job.retry()
+    assert len(client.begin_calls) == 1
