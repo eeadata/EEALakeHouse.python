@@ -27,7 +27,12 @@ and deletes the upload. See :class:`FolderIngest` for the full rule.
 
 from __future__ import annotations
 
-from .client import IngestApiError, IngestClient, S3UploadError
+from .client import (
+    IngestApiError,
+    IngestClient,
+    S3UploadError,
+    StorageUnavailableError,
+)
 from .credentials import (
     DremioCreds,
     MissingCredentialsError,
@@ -77,6 +82,7 @@ __all__ = [
     "S3UploadError",
     "StageResult",
     "StatusResult",
+    "StorageUnavailableError",
     "UploadPart",
     "UploadTarget",
     "ingest_folder",
