@@ -72,6 +72,31 @@ class IngestApiError(RuntimeError):
         self.where = where
 
 
+class StorageUnavailableError(IngestApiError):
+    """DDS refused the transfer: it cannot write to its own S3 storage (503).
+
+    Not a fault in the folder, the target or the caller's rights — the service
+    verified, with its own credentials, that the object storage behind the
+    catalog rejects writes, and said so instead of handing out upload targets
+    that every file would fail against. Nothing has been uploaded; the fix is an
+    administrator's (credentials, bucket policy, endpoint), and the transfer can
+    simply be re-run once storage is working.
+
+    Raised only on DDS's own ``storage_unavailable`` answer, so a 503 from a
+    proxy or load balancer in front of the service stays a plain
+    :class:`IngestApiError` and is not mislabelled as a storage fault.
+    """
+
+    def __init__(self, status_code: int, message: str, *, where: str | None = None) -> None:
+        # The server's message is already written for the person reading this in
+        # a notebook; wrapping it in "DDS ingest API error 503 on POST ..." would
+        # bury the explanation behind plumbing. The class name carries the rest.
+        RuntimeError.__init__(self, message)
+        self.status_code = status_code
+        self.message = message
+        self.where = where
+
+
 class S3UploadError(IngestApiError):
     """A pre-signed upload to object storage failed — NOT a DDS API error.
 
@@ -381,12 +406,24 @@ class IngestClient:
             message = message[:_MAX_ERROR_CHARS] + "… (truncated)"
         return message or f"(empty {resp.status_code} response body)"
 
+    @staticmethod
+    def _error_slug(resp: httpx.Response) -> str:
+        """The machine-readable ``error`` slug of a DDS error body, or ``""``."""
+        try:
+            payload = resp.json()
+        except ValueError:
+            return ""
+        return str(payload.get("error", "")) if isinstance(payload, dict) else ""
+
     @classmethod
     def _raise_for_status(cls, resp: httpx.Response, where: str) -> None:
         """Raise :class:`IngestApiError` naming ``where`` unless the call succeeded."""
         if resp.is_success:
             return
-        raise IngestApiError(resp.status_code, cls._error_message(resp), where=where)
+        message = cls._error_message(resp)
+        if cls._error_slug(resp) == "storage_unavailable":
+            raise StorageUnavailableError(resp.status_code, message, where=where)
+        raise IngestApiError(resp.status_code, message, where=where)
 
     @classmethod
     def _raise_for_upload(
