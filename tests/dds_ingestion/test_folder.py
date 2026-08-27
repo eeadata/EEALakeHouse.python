@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import pytest
+from eea_datalakehouse.dds_ingestion.client import StorageUnavailableError
 from eea_datalakehouse.dds_ingestion.folder import (
     FolderIngest,
     IngestStateError,
@@ -296,3 +297,35 @@ def test_retry_still_starts_over_for_a_staged_transfer(tmp_path: Path) -> None:
     job._session_id = "sess-1"
     job.retry()
     assert len(client.begin_calls) == 1
+
+
+# --- storage DDS cannot write to -------------------------------------------
+
+
+class StorageDownClient(FakeClient):
+    """A server that refuses the transfer at ``begin``: its S3 rejects writes."""
+
+    def begin(self, *, files: list[FileSpec], **kwargs: object) -> BeginResult:
+        self.begin_calls.append({"files": files, **kwargs})
+        raise StorageUnavailableError(
+            503,
+            "this transfer cannot start: DDS cannot write to the S3 storage "
+            "behind the catalog … resolved by an administrator … nothing has "
+            "been uploaded.",
+            where="POST /api/v1/ingest/begin",
+        )
+
+
+def test_run_stops_before_uploading_when_dds_cannot_write_to_s3(
+    data_folder: Path,
+) -> None:
+    """The point of the server-side pre-flight: nothing is transferred."""
+    client = StorageDownClient()
+    job = _make_ingest(data_folder, client)
+
+    with pytest.raises(StorageUnavailableError) as exc:
+        job.run()
+
+    assert "administrator" in str(exc.value)
+    assert client.uploaded == []
+    assert client.commit_calls == []
