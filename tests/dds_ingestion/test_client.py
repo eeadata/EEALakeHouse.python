@@ -7,6 +7,7 @@ from eea_datalakehouse.dds_ingestion.client import (
     IngestApiError,
     IngestClient,
     S3UploadError,
+    StorageUnavailableError,
 )
 from eea_datalakehouse.dds_ingestion.credentials import DremioCreds
 from eea_datalakehouse.dds_ingestion.models import FileSpec, UploadPart, UploadTarget
@@ -303,3 +304,70 @@ def test_commit_result_carries_the_physical_location() -> None:
         {"session_id": "s2", "status": "done", "table_path": "x/y", "record_count": 1}
     )
     assert staged.storage_path is None
+
+
+# --- storage the service itself cannot write to (DDS 503) ------------------
+
+_STORAGE_DOWN = (
+    "this transfer cannot start: DDS cannot write to the S3 storage behind the "
+    "catalog, so every file would fail to upload. This is a dependency problem "
+    "between DDS and S3 that has to be resolved by an administrator — it is not "
+    "caused by your data or your permissions, and nothing has been uploaded. "
+    "Verified at 2026-08-25T14:02:11+00:00 — catalog bucket (ingest): write: "
+    "ClientError: AccessDenied (HTTP 403): Access Denied."
+)
+
+
+@respx.mock
+def test_storage_unavailable_is_its_own_error(creds: DremioCreds) -> None:
+    """DDS refusing up front is not the caller's mistake, and says so.
+
+    The server has already written the explanation for whoever is reading it in
+    a notebook, so it must arrive intact rather than wrapped in plumbing.
+    """
+    respx.post(f"{BASE_URL}/api/v1/ingest/begin").mock(
+        return_value=httpx.Response(
+            503,
+            json={
+                "error": "storage_unavailable",
+                "message": _STORAGE_DOWN,
+                "path": "bio.uploads",
+            },
+        )
+    )
+    with IngestClient(BASE_URL, creds) as client, pytest.raises(
+        StorageUnavailableError
+    ) as exc:
+        client.begin(
+            target_catalog_path="bio.uploads",
+            intent="read_only",
+            data_format="parquet",
+            conflict_mode="fail",
+            files=[FileSpec("a.parquet", 6)],
+        )
+
+    assert exc.value.status_code == 503
+    assert str(exc.value) == _STORAGE_DOWN
+    assert "DDS ingest API error" not in str(exc.value)
+    assert exc.value.where == "POST /api/v1/ingest/begin"
+    # …and still an IngestApiError, so existing handling keeps working.
+    assert isinstance(exc.value, IngestApiError)
+
+
+@respx.mock
+def test_a_503_from_a_proxy_is_not_called_a_storage_fault(creds: DremioCreds) -> None:
+    """Only DDS's own slug means storage; a gateway's 503 means the gateway."""
+    respx.post(f"{BASE_URL}/api/v1/ingest/begin").mock(
+        return_value=httpx.Response(503, text="<html>503 Service Unavailable</html>")
+    )
+    with IngestClient(BASE_URL, creds) as client, pytest.raises(IngestApiError) as exc:
+        client.begin(
+            target_catalog_path="bio.uploads",
+            intent="read_only",
+            data_format="parquet",
+            conflict_mode="fail",
+            files=[FileSpec("a.parquet", 6)],
+        )
+
+    assert not isinstance(exc.value, StorageUnavailableError)
+    assert "POST /api/v1/ingest/begin" in str(exc.value)
