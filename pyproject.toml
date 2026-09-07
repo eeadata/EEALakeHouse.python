@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "EEADataLakehouse"
-version = "0.1.12"
+version = "0.1.13"
 description = "Data preparation and validation utilities for the EEA data lakehouse pipeline."
 readme = "README.md"
 requires-python = ">=3.11"
