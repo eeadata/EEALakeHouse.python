@@ -36,7 +36,7 @@ pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@staging"    
 ```
 
 # staging's latest release (early access) — pin to the tag the "staging" badge above shows
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.12-staging"
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.13-staging"
 ```
 
 ## Usage
@@ -241,7 +241,7 @@ To pin to one specific release instead, use the exact tag the live badges under
 %pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.12"
 
 # staging's latest release (early access)
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.12-staging"
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.13-staging"
 ```
 
 Use the `%pip` magic rather than `!pip` — it installs into the kernel the
