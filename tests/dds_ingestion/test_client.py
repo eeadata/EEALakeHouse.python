@@ -3,7 +3,12 @@ from __future__ import annotations
 import httpx
 import pytest
 import respx
-from eea_datalakehouse.dds_ingestion.client import IngestApiError, IngestClient
+from eea_datalakehouse.dds_ingestion.client import (
+    IngestApiError,
+    IngestClient,
+    S3UploadError,
+    StorageUnavailableError,
+)
 from eea_datalakehouse.dds_ingestion.credentials import DremioCreds
 from eea_datalakehouse.dds_ingestion.models import FileSpec, UploadPart, UploadTarget
 
@@ -175,3 +180,194 @@ def test_error_response_raises_with_message(creds: DremioCreds) -> None:
         )
     assert exc.value.status_code == 409
     assert "exists" in str(exc.value)
+
+
+@respx.mock
+def test_dds_error_names_the_call_that_failed(creds: DremioCreds) -> None:
+    """A 500 with Starlette's bare body must still say WHICH call broke.
+
+    The message an ingest reported was "DDS ingest API error 500: Internal
+    Server Error" — true, and useless: a transfer calls begin, upload and commit
+    against two different systems.
+    """
+    respx.post(f"{BASE_URL}/api/v1/ingest/begin").mock(
+        return_value=httpx.Response(500, text="Internal Server Error")
+    )
+    with IngestClient(BASE_URL, creds) as client, pytest.raises(IngestApiError) as exc:
+        client.begin(
+            target_catalog_path="x",
+            intent="read_only",
+            data_format="parquet",
+            conflict_mode="fail",
+            files=[FileSpec("a.parquet", 6)],
+        )
+
+    assert exc.value.where == "POST /api/v1/ingest/begin"
+    assert "POST /api/v1/ingest/begin" in str(exc.value)
+    assert "Internal Server Error" in str(exc.value)
+
+
+@respx.mock
+def test_failed_presigned_upload_is_not_reported_as_a_dds_error(
+    creds: DremioCreds,
+) -> None:
+    """The upload goes straight to object storage; its failures are its own."""
+    respx.post("https://s3.example/bucket").mock(
+        return_value=httpx.Response(500, text="<html>gateway said no</html>")
+    )
+    target = UploadTarget(
+        rel_path="a.parquet", url="https://s3.example/bucket", method="POST"
+    )
+    with IngestClient(BASE_URL, creds) as client, pytest.raises(S3UploadError) as exc:
+        client.upload_file(target, b"PAR1")
+
+    assert exc.value.rel_path == "a.parquet"
+    assert exc.value.url == "https://s3.example/bucket"
+    message = str(exc.value)
+    assert message.startswith("S3 upload of 'a.parquet' failed: HTTP 500")
+    assert "https://s3.example/bucket" in message
+    assert "DDS ingest API error" not in message
+    # …and it is still an IngestApiError, so existing handling keeps working.
+    assert isinstance(exc.value, IngestApiError)
+
+
+@respx.mock
+def test_long_error_bodies_are_truncated(creds: DremioCreds) -> None:
+    respx.post(f"{BASE_URL}/api/v1/ingest/commit").mock(
+        return_value=httpx.Response(502, text="x" * 5000)
+    )
+    with IngestClient(BASE_URL, creds) as client, pytest.raises(IngestApiError) as exc:
+        client.commit(session_id="sess-1")
+
+    assert exc.value.message.endswith("… (truncated)")
+    assert len(exc.value.message) < 600
+
+
+@respx.mock
+def test_begin_sends_sub_path_only_when_given(creds: DremioCreds) -> None:
+    """DI-11.12: the named sub-folder rides on ``begin`` and nowhere else.
+
+    Omitted when unset, so a client that never uses it sends the body it always
+    sent — an older server sees no new field.
+    """
+    import json
+
+    route = respx.post(f"{BASE_URL}/api/v1/ingest/begin").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "session_id": "sess-1",
+                "status": "open",
+                "s3": {"bucket": "b", "key_prefix": "p/", "uploads": []},
+                "collision": None,
+            },
+        )
+    )
+    kwargs: dict[str, object] = {
+        "target_catalog_path": "bio.uploads",
+        "intent": "read_only",
+        "data_format": "parquet",
+        "conflict_mode": "append",
+        "files": [FileSpec("a.parquet", 6)],
+    }
+    with IngestClient(BASE_URL, creds) as client:
+        client.begin(**kwargs)  # type: ignore[arg-type]
+        assert "sub_path" not in json.loads(route.calls.last.request.read())
+
+        client.begin(sub_path="2026", **kwargs)  # type: ignore[arg-type]
+        assert json.loads(route.calls.last.request.read())["sub_path"] == "2026"
+
+
+def test_commit_result_carries_the_physical_location() -> None:
+    """DI-11.9: ``storage_path`` says where permanently-stored files actually are.
+
+    ``table_path`` is where the table is queried; the two differ for a read-only
+    ingest that keeps its files. Absent (a staged ingest, or a server predating
+    the field) parses as ``None`` rather than failing — the models are
+    deliberately permissive about keys they do not know.
+    """
+    from eea_datalakehouse.dds_ingestion.models import CommitResult
+
+    kept = CommitResult.from_json(
+        {
+            "session_id": "s1",
+            "status": "done",
+            "table_path": "catalog/water/bwd/assessments",
+            "record_count": 12,
+            "storage_path": "local_s3/dh-prod-data/read/water/bwd/assessments",
+        }
+    )
+    assert kept.table_path == "catalog/water/bwd/assessments"
+    assert kept.storage_path == "local_s3/dh-prod-data/read/water/bwd/assessments"
+
+    staged = CommitResult.from_json(
+        {"session_id": "s2", "status": "done", "table_path": "x/y", "record_count": 1}
+    )
+    assert staged.storage_path is None
+
+
+# --- storage the service itself cannot write to (DDS 503) ------------------
+
+_STORAGE_DOWN = (
+    "this transfer cannot start: DDS cannot write to the S3 storage behind the "
+    "catalog, so every file would fail to upload. This is a dependency problem "
+    "between DDS and S3 that has to be resolved by an administrator — it is not "
+    "caused by your data or your permissions, and nothing has been uploaded. "
+    "Verified at 2026-08-25T14:02:11+00:00 — catalog bucket (ingest): write: "
+    "ClientError: AccessDenied (HTTP 403): Access Denied."
+)
+
+
+@respx.mock
+def test_storage_unavailable_is_its_own_error(creds: DremioCreds) -> None:
+    """DDS refusing up front is not the caller's mistake, and says so.
+
+    The server has already written the explanation for whoever is reading it in
+    a notebook, so it must arrive intact rather than wrapped in plumbing.
+    """
+    respx.post(f"{BASE_URL}/api/v1/ingest/begin").mock(
+        return_value=httpx.Response(
+            503,
+            json={
+                "error": "storage_unavailable",
+                "message": _STORAGE_DOWN,
+                "path": "bio.uploads",
+            },
+        )
+    )
+    with IngestClient(BASE_URL, creds) as client, pytest.raises(
+        StorageUnavailableError
+    ) as exc:
+        client.begin(
+            target_catalog_path="bio.uploads",
+            intent="read_only",
+            data_format="parquet",
+            conflict_mode="fail",
+            files=[FileSpec("a.parquet", 6)],
+        )
+
+    assert exc.value.status_code == 503
+    assert str(exc.value) == _STORAGE_DOWN
+    assert "DDS ingest API error" not in str(exc.value)
+    assert exc.value.where == "POST /api/v1/ingest/begin"
+    # …and still an IngestApiError, so existing handling keeps working.
+    assert isinstance(exc.value, IngestApiError)
+
+
+@respx.mock
+def test_a_503_from_a_proxy_is_not_called_a_storage_fault(creds: DremioCreds) -> None:
+    """Only DDS's own slug means storage; a gateway's 503 means the gateway."""
+    respx.post(f"{BASE_URL}/api/v1/ingest/begin").mock(
+        return_value=httpx.Response(503, text="<html>503 Service Unavailable</html>")
+    )
+    with IngestClient(BASE_URL, creds) as client, pytest.raises(IngestApiError) as exc:
+        client.begin(
+            target_catalog_path="bio.uploads",
+            intent="read_only",
+            data_format="parquet",
+            conflict_mode="fail",
+            files=[FileSpec("a.parquet", 6)],
+        )
+
+    assert not isinstance(exc.value, StorageUnavailableError)
+    assert "POST /api/v1/ingest/begin" in str(exc.value)

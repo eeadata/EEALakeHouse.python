@@ -35,12 +35,8 @@ pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@main"       
 pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@staging"    # latest early access
 ```
 
-To pin to one *specific* release instead (e.g. for a reproducible lockfile), use the exact tag
-the badge above shows — but only one tag is ever kept per branch (see below), so an old pin will
-eventually stop resolving once a newer release replaces it:
-
-```bash
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.6"
+# staging's latest release (early access) — pin to the tag the "staging" badge above shows
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.12-staging"
 ```
 
 ## Usage
@@ -242,7 +238,10 @@ To pin to one specific release instead, use the exact tag the live badges under
 [Releasing a new version](#releasing-a-new-version)):
 
 ```python
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.6"
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.12"
+
+# staging's latest release (early access)
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.12-staging"
 ```
 
 Use the `%pip` magic rather than `!pip` — it installs into the kernel the
