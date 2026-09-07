@@ -61,6 +61,7 @@ from .models import (
     UploadPart,
     UploadTarget,
 )
+from .session import IngestCommitError, IngestCommitReport, IngestSession, IngestSessionError
 
 __all__ = [
     "DEFAULT_PARALLELISM",
@@ -73,7 +74,11 @@ __all__ = [
     "FolderIngest",
     "IngestApiError",
     "IngestClient",
+    "IngestCommitError",
+    "IngestCommitReport",
     "IngestOutcome",
+    "IngestSession",
+    "IngestSessionError",
     "IngestStateError",
     "Intent",
     "MissingCredentialsError",
