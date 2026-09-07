@@ -30,6 +30,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+notebook = [
+    "ipython>=8.18",     # eea_datalakehouse.notebook's %catalog/%ingest magics
+]
 dev = [
     "pytest>=7",
     "ruff>=0.15",
@@ -37,6 +40,7 @@ dev = [
     "respx>=0.23",       # mocks httpx for the ingestion test suite
     "types-tqdm",
     "ipykernel>=6.29",   # run/debug notebooks against this environment
+    "EEADataLakehouse[notebook]",
 ]
 
 [project.urls]
