@@ -30,12 +30,12 @@ from .operations import (
     deleteview,
     deletewiki,
     draft2version,
+    getmetafromwiki,
     gettableitemsfrom,
     gettablesfrom,
     gettagsfrom,
     getwikifrom,
     publishversion,
-    getmetafromwiki,
     retry_pending,
     setmeta2wiki,
     settagsto,
@@ -43,6 +43,7 @@ from .operations import (
     table2view,
 )
 from .rest import CatalogRestClient
+from .session import CatalogCommitError, CatalogSession, CatalogSessionError, CommitReport
 from .sql import (
     FLIGHT_LOCATION_ENV_VAR,
     TRANSPORT_ENV_VAR,
@@ -57,8 +58,12 @@ __all__ = [
     "FLIGHT_LOCATION_ENV_VAR",
     "TRANSPORT_ENV_VAR",
     "Catalog",
+    "CatalogCommitError",
     "CatalogOperationError",
     "CatalogRestClient",
+    "CatalogSession",
+    "CatalogSessionError",
+    "CommitReport",
     "EngineStartingError",
     "FlightSqlExecutor",
     "RestSqlExecutor",
