@@ -139,6 +139,7 @@ fewest lines that actually work.
 | see my transfers | `IngestClient(**_dds).list_sessions(state="failed")` |
 | create the target folders first | `ensure_catalog_path(url, token, "src/dom/sub/flow/draft")` |
 | turn an ingested table into a view | `catalog.table2view(view, source, idempotency_key=KEY)` |
+| …for every table in a folder | `for p in catalog.gettablesfrom(SRC, …): catalog.table2view(…)` |
 | copy / move a table | `catalog.datacopy(a, b, …)` · `catalog.datamove(a, b, …)` |
 | list everything under a folder | `catalog.gettablesfrom("bwd", idempotency_key=KEY)` |
 | schema + row count, no rows fetched | `catalog.gettableitemsfrom(path, idempotency_key=KEY)` |
@@ -370,6 +371,48 @@ catalog.table2view("bwd.consumer", "bwd.draft.bw_assessment", idempotency_key=KE
 
 The source is checked first, and `view_path`'s containing folder is created if
 missing (`create_target_folder=True` by default).
+
+### Turn every table in a folder into views in another folder
+
+`table2view` is **one table to one view** — it does not accept a folder. A
+folder as `source_path` fails the existence check with
+`source 'bwd.draft' does not exist`, because that check queries
+`INFORMATION_SCHEMA."TABLES"`, which lists tables and views and never folders.
+(The folder-aware `cp source dest/` behaviour belongs to `datacopy`/`datamove`,
+and even there only for the *target*.)
+
+Compose it from `gettablesfrom` instead — one listing query, then one view per
+table:
+
+```python
+SRC, DST = "bwd.draft", "bwd.consumer"
+
+for path in catalog.gettablesfrom(SRC, idempotency_key=f"{KEY}-list"):
+    rel = path[len(SRC) + 1:]                 # "bw_assessment", "nested.deep_table"
+    catalog.table2view(f"{DST}.{rel}", path, idempotency_key=f"{KEY}-{rel}")
+```
+
+> ⚠ **Never point `DST` at `SRC`.** `table2view` starts with
+> `DROP TABLE IF EXISTS <view_path>` — that is the whole point when a location
+> is *becoming* a view — so identical paths drop the source table and then
+> create a view selecting from what was just dropped.
+
+Four things that loop is doing deliberately:
+
+- **`DST` must not sit inside `SRC`.** `gettablesfrom` recurses the entire
+  subtree, so a target nested under the source gets re-read on the next run and
+  you end up building views over your own views.
+- **The listing includes views, not just tables.** `INFORMATION_SCHEMA."TABLES"`
+  covers both and `gettablesfrom` does not return `TABLE_TYPE`, so there is no
+  public way to filter. Harmless when the source folder holds only ingested
+  tables; check it yourself if it might not.
+- **`rel` preserves nesting.** `bwd.draft.nested.deep_table` becomes
+  `bwd.consumer.nested.deep_table`, and the missing `bwd.consumer.nested` is
+  created on the way. Using `path.rsplit(".", 1)[-1]` instead would flatten the
+  tree, and two sub-folders holding the same table name would silently collide.
+- **One key per table.** A cold engine stalling on the fifth table then leaves
+  the first four cleared and that one alone retryable, with
+  `catalog.retry_pending(f"{KEY}-{rel}")`.
 
 ### Copy a table
 
@@ -1086,6 +1129,14 @@ clear message rather than a confusing `CREATE VIEW` error. With
 containing folder exists, creating missing levels — that needs a
 `catalog_rest`; pass `False` if you know the folder is there. The `DROP` is
 `IF EXISTS`, so the whole thing is safe to re-run from the start.
+
+**One table to one view — folders are not accepted.** Both paths name a single
+catalog entry. `source_path` is checked against `INFORMATION_SCHEMA."TABLES"`,
+which lists tables and views only, so passing a folder raises
+`CatalogOperationError: source '…' does not exist` before anything is dropped or
+created. Nothing in the library fans an operation out over a folder's contents —
+to convert a whole folder, loop over `gettablesfrom`:
+[recipe](#turn-every-table-in-a-folder-into-views-in-another-folder).
 
 **`deleteview(view_path)`** — `DROP VIEW IF EXISTS`. Idempotent. If `view_path`
 is actually a table, this fails loudly rather than dropping the wrong kind of
