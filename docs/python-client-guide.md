@@ -1018,7 +1018,7 @@ channel and performs the handshake lazily, on first real use, so a `Catalog`
 that never copies data pays nothing for the Flight stack.
 
 ```python
-with Catalog(DREMIO_BASE_URL, DREMIO_TOKEN, username=DREMIO_USERNAME) as catalog:
+with Catalog(DREMIO_URL, DREMIO_TOKEN, username=DREMIO_USERNAME) as catalog:
     catalog.table2view("bwd.consumer", "bwd.draft.bw_assessment",
                        idempotency_key="bwd-v2025_1")
 ```
