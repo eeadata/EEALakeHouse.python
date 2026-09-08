@@ -16,6 +16,11 @@ They share no code and no credentials object. You can use either alone.
 - Ingest quick-start for notebook users: [`../src/eea_datalakehouse/dds_ingestion/README.md`](../src/eea_datalakehouse/dds_ingestion/README.md)
 - Open findings and proposals: [`dev-notes.md`](dev-notes.md)
 
+**Just want to get something done?** Go straight to
+[Recipes](#recipes--every-task-as-one-snippet) — one setup cell, then a complete
+pasteable snippet per task. The two reference parts after it explain the
+behaviour behind those snippets.
+
 > **Scope of verification.** Everything below is documented from the code as it
 > stands. Where the code itself flags an assumption as *unverified against a real
 > Dremio deployment*, this guide repeats that warning rather than hiding it —
@@ -27,6 +32,12 @@ They share no code and no credentials object. You can use either alone.
 
 - [Install and requirements](#install-and-requirements)
 - [Environment variables](#environment-variables)
+- **[Recipes — every task as one snippet](#recipes--every-task-as-one-snippet)** ← start here
+  - [Cheat sheet](#cheat-sheet)
+  - [The setup cell](#the-setup-cell)
+  - [Ingest recipes](#ingest-recipes)
+  - [Catalog recipes](#catalog-recipes)
+  - [End to end, in one cell](#end-to-end-in-one-cell)
 - [Part 1 — `dds_ingestion`](#part-1--dds_ingestion)
   - [The transfer model](#the-transfer-model)
   - [`FolderIngest`](#folderingest)
@@ -104,6 +115,428 @@ it (see [Progress bars](#progress-bars)).
 
 `Catalog(base_url, token, username=...)` takes its Dremio credentials as
 arguments, not from the environment — they are *not* the DDS credentials above.
+
+---
+
+# Recipes — every task as one snippet
+
+Everything here is written for **single-shot execution**: a notebook cell you run
+once, or a scheduled script. Each recipe is complete and pasteable on its own,
+assumes only [the setup cell](#the-setup-cell) has run, and is kept to the
+fewest lines that actually work.
+
+## Cheat sheet
+
+| I want to… | Call |
+|---|---|
+| send a folder to the lakehouse as a table | `ingest("./data", "path.to.target", data_format="parquet")` |
+| …and keep the handle, so a failure is resumable | `job = FolderIngest(..., **_dds); job.run()` |
+| add this year to a table that grows | `ingest(..., intent="read_only", table_name="t", sub_path="2026")` |
+| redo one year only | `ingest(..., sub_path="2026", conflict_mode="replace")` |
+| resume a failed transfer | `job.retry()` |
+| pick a transfer up in a later kernel | `FolderIngest.attach(session_id, ..., **_dds)` |
+| abandon a transfer | `job.cancel()` |
+| see my transfers | `IngestClient(**_dds).list_sessions(state="failed")` |
+| create the target folders first | `ensure_catalog_path(url, token, "src/dom/sub/flow/draft")` |
+| turn an ingested table into a view | `catalog.table2view(view, source, idempotency_key=KEY)` |
+| copy / move a table | `catalog.datacopy(a, b, …)` · `catalog.datamove(a, b, …)` |
+| list everything under a folder | `catalog.gettablesfrom("bwd", idempotency_key=KEY)` |
+| schema + row count, no rows fetched | `catalog.gettableitemsfrom(path, idempotency_key=KEY)` |
+| create / delete a folder | `catalog.createfolder(p, …)` · `catalog.deletefolder(p, …)` |
+| describe a folder | `catalog.setwikito(p, text, …)` · `catalog.setmeta2wiki(p, tags=…, …)` |
+| tag a table | `catalog.settagsto(path, ["a", "b"], idempotency_key=KEY)` |
+| the engine was cold — finish it later | `catalog.retry_pending(KEY)` |
+
+---
+
+## The setup cell
+
+One cell, once per kernel. It assumes the usual globals are already bound —
+`DREMIO_USERNAME`, `DREMIO_TOKEN`, `DREMIO_URL`, `DDS_BASE_URL` — which is what
+`%init` leaves behind in a Hub kernel and what the local stack and scheduled
+runs export:
+
+```python
+from functools import partial
+from eea_datalakehouse.catalog import Catalog
+from eea_datalakehouse.dds_ingestion import DremioCreds, FolderIngest, IngestClient, ingest_folder
+
+_dds = {"base_url": DDS_BASE_URL, "creds": DremioCreds(DREMIO_USERNAME, DREMIO_TOKEN)}
+ingest = partial(ingest_folder, **_dds)                                    # one-shot transfers
+
+catalog = Catalog(DREMIO_URL, DREMIO_TOKEN, username=DREMIO_USERNAME)      # catalog operations
+KEY = "my-job-2026-09-08"          # any stable string; reuse it to resume — see below
+```
+
+That is the only setup any recipe below needs. Three things worth knowing about
+it, none of which need code:
+
+- **`**_dds` is only carrying credentials.** Where the environment instead
+  carries `_DREMIO_USER` / `_DREMIO_PWD` / `DDS_BASE_URL` — the names
+  `FolderIngest` reads by default — you can drop `**_dds` from every call and
+  pass nothing at all. Keeping it works either way, which is why the recipes use
+  it.
+- **`username=` is only needed for `datacopy`/`datamove`**, which authenticate
+  over Arrow Flight. Every other catalog operation works without it.
+- **Close the catalog** in your last cell: `catalog.close()`. A forgotten one is
+  still disposed at interpreter exit or on SIGTERM — see
+  [Lifecycle and cleanup](#lifecycle-and-cleanup).
+
+If `%init` itself is missing (this project's own container ships no Hub
+extension), register the stand-in before it — same cell is fine; see
+[Notebook helpers](#notebook-helpers-dds_ingestioncommon) for what it binds:
+
+```python
+from eea_datalakehouse.dds_ingestion.common.dremio_identity import ensure_init_magic
+ensure_init_magic()
+%init
+```
+
+---
+
+## Ingest recipes
+
+### Send a folder to the lakehouse as a table
+
+The whole `begin → upload → commit` flow, one call:
+
+```python
+out = ingest("./my_data", "biodiversity.uploads", data_format="parquet")
+print(out.commit.table_path, out.commit.record_count, out.commit.storage_path)
+```
+
+`data_format` is `"parquet"`, `"csv"` or `"json"` and picks which files are
+scanned — anything else in the folder is ignored, not an error. Sub-folders are
+kept as they are. Defaults you did not pass: `intent="read_only"`,
+`conflict_mode="fail"`, `parallelism=4`, progress bar on.
+
+### …and keep the handle, so a failure is resumable
+
+`ingest()` is one-shot: it closes the client and the session handle is gone. If
+the load might fail, drive the class instead — same call, two more lines:
+
+```python
+job = FolderIngest("./my_data", "biodiversity.uploads", data_format="parquet", **_dds)
+out = job.run()
+```
+
+Everything below that says `job` assumes this form.
+
+### Add this year to a table that grows
+
+`sub_path` files the upload under a named slice of the same table:
+
+```python
+ingest("./bw_2026", "water_management_resources.bathing_water.bwd.reference",
+       data_format="parquet", intent="read_only",
+       table_name="water_temperature", sub_path="2026")
+```
+
+Next year, the same call with `sub_path="2027"`. The name is normalised
+server-side (`"Q1 2026"` → `q1_2026`). If your folder already has the structure
+locally (`2026/*.parquet`), drop `sub_path` — the layout is preserved as-is.
+
+### Redo one year, leave the others standing
+
+```python
+ingest("./bw_2026", "water_management_resources.bathing_water.bwd.reference",
+       data_format="parquet", intent="read_only",
+       table_name="water_temperature", sub_path="2026", conflict_mode="replace")
+```
+
+### The transfer failed — resume it without re-uploading
+
+```python
+job = FolderIngest("./my_data", "biodiversity.uploads", data_format="parquet", **_dds)
+try:
+    job.run()
+except Exception:
+    print(job.status().error)
+    job.retry()          # re-runs only the step that failed, when the server kept the files
+```
+
+`retry()` decides from the server's own report. It re-runs just the load step
+when the staged files survived, starts a fresh session when they did not, and
+**raises rather than guessing** for a permanently-stored transfer that a blind
+re-run would duplicate. The full decision table is
+[here](#managing-resuming-and-abandoning-a-transfer).
+
+### Pick a transfer up in a later kernel
+
+The session lives on the server, so yesterday's transfer is still there:
+
+```python
+job = FolderIngest.attach("sess-123", "./my_data", "biodiversity.uploads",
+                          data_format="parquet", **_dds)
+s = job.status()
+print(s.status, s.placement, s.error)
+job.retry()              # or job.cancel()
+```
+
+`folder` must still point at the same local data, so a re-upload is possible if
+the staged copy is gone.
+
+### Abandon a transfer
+
+Deletes the staged data and drops the session. It does **not** drop a table an
+earlier successful commit already created:
+
+```python
+job.cancel()
+```
+
+### See my transfers
+
+```python
+with IngestClient(**_dds) as c:
+    for s in c.list_sessions(state="failed"):     # "active" | "failed" | "all"
+        print(s.session_id, s.status, s.placement, s.error)
+```
+
+### How many rows actually staged?
+
+For a session that has uploaded but not yet committed — typically one whose
+commit failed. On a managed catalog the count comes from the staged Parquet
+footers; CSV and JSON have none and report `0`:
+
+```python
+job = FolderIngest.attach("sess-123", "./my_data", "bio.uploads",
+                          data_format="parquet", **_dds)
+print(job.estimate())        # EstimateResult(record_count=…, size_class=…)
+```
+
+### Create the target folders before ingesting
+
+Ingest does not create its target, and `commit` fails with
+`Namespace does not exist: …` if it is absent. Note the **slashes** here — this
+helper takes a path, not a dotted catalog name. Check first with `dry_run=True`:
+
+```python
+from eea_datalakehouse.dds_ingestion.common.catalog import ensure_catalog_path, print_report
+
+path = "water_management_resources/bathing_water/bwd/draft"
+print_report(ensure_catalog_path(DDS_BASE_URL, DREMIO_TOKEN, path, dry_run=True))
+print_report(ensure_catalog_path(DDS_BASE_URL, DREMIO_TOKEN, path))
+```
+
+The source, domain and subdomain must already exist — a missing one raises,
+because that is a taxonomy question to raise, not a folder to invent. Only the
+dataflow level and below are created.
+
+### S3 is unreachable from this kernel — send the bytes through the server
+
+The fallback when presigned uploads cannot connect. Slower, since every byte
+transits DDS:
+
+```python
+from pathlib import Path
+from eea_datalakehouse.dds_ingestion import scan_folder
+
+folder = Path("./my_data")
+with IngestClient(**_dds) as c:
+    begin = c.begin(target_catalog_path="biodiversity.uploads", intent="read_only",
+                    data_format="parquet", conflict_mode="fail",
+                    files=scan_folder(folder, "parquet"))
+    for t in begin.s3.uploads:
+        c.stage(begin.session_id, t.rel_path, (folder / t.rel_path).read_bytes())
+    print(c.commit(session_id=begin.session_id))
+```
+
+### Tell staged from permanent
+
+Whether your uploaded files *are* the table matters before you re-run anything:
+
+```python
+s = job.status()
+print(s.placement)            # "staged" (copied in, upload deleted) | "read_permanent" (kept)
+print(s.stores_permanently)   # True only for read_permanent
+```
+
+---
+
+## Catalog recipes
+
+Every operation takes `idempotency_key=` and it is **required**. Use one stable
+string per job (the `KEY` from the setup cell): if a cold Dremio engine stalls
+the call, that key is what lets you finish it later.
+
+### Turn a freshly ingested table into a view
+
+The one-time transition for a location that arrived as a physical table:
+
+```python
+catalog.table2view("bwd.consumer", "bwd.draft.bw_assessment", idempotency_key=KEY)
+```
+
+The source is checked first, and `view_path`'s containing folder is created if
+missing (`create_target_folder=True` by default).
+
+### Copy a table
+
+Always over Arrow Flight, so the setup cell's `username=` matters here:
+
+```python
+catalog.datacopy("bwd.draft.bw", "bwd.versions.v2026", idempotency_key=KEY)
+```
+
+Into an existing **folder** — `cp source dest/` semantics, the source's own name
+is appended:
+
+```python
+catalog.datacopy("bwd.draft.bw", "bwd.versions", idempotency_key=KEY)   # → bwd.versions.bw
+```
+
+Replacing something already there, and creating the target folder on the way:
+
+```python
+catalog.datacopy("bwd.draft.bw", "bwd.versions.v2026",
+                 overwrite=True, create_target_folder=True, idempotency_key=KEY)
+```
+
+### Move a table or view
+
+Copy, then drop the source. The kind (`TABLE`/`VIEW`) is detected for you, and
+the target is verified to exist before it reports success:
+
+```python
+catalog.datamove("bwd.draft.bw", "bwd.versions.v2026", idempotency_key=KEY)
+```
+
+### Delete a view
+
+`DROP VIEW IF EXISTS` — safe to re-run, and it fails loudly rather than dropping
+a table by mistake:
+
+```python
+catalog.deleteview("bwd.consumer", idempotency_key=KEY)
+```
+
+### List everything under a folder
+
+Recurses the whole subtree in one query, returning full dotted paths:
+
+```python
+for path in catalog.gettablesfrom("bwd", idempotency_key=KEY):
+    print(path)
+```
+
+### Schema and row count, without fetching a single row
+
+```python
+info = catalog.gettableitemsfrom("bwd.versions.v2026.assessments", idempotency_key=KEY)
+print(info.row_count)
+for column, dtype in info.schema.items():
+    print(f"{column:30} {dtype}")
+```
+
+### Create and delete folders
+
+Both are idempotent — already there, or already gone, is not an error:
+
+```python
+catalog.createfolder("bwd.versions.v2026", create_parents=True, idempotency_key=KEY)
+catalog.deletefolder("bwd.scratch", cascade=True, idempotency_key=KEY)   # cascade = rm -r
+```
+
+Without `create_parents`, a missing parent raises instead of quietly creating a
+deep path. Without `cascade`, a non-empty folder raises. The space or source
+itself (the leftmost segment) is never created automatically.
+
+### Describe a folder — wiki text and metadata tags
+
+Dremio's own tags exist only on tables and views, so **folders** carry metadata
+as tags embedded in the wiki instead:
+
+```python
+catalog.setwikito("bwd.reference", "Bathing water reference data.", idempotency_key=KEY)
+
+catalog.setmeta2wiki("bwd.reference", tags=[
+    {"tag_name": "owner",  "tag_value": "EEA",  "tag_title": "Owner"},
+    {"tag_name": "update", "tag_value": "2026", "tag_title": "Last update"},
+], idempotency_key=KEY)
+
+catalog.getmetafromwiki("bwd.reference", "owner", idempotency_key=KEY)
+# {'tag_name': 'owner', 'tag_value': 'EEA', 'tag_title': 'Owner'}
+```
+
+`setmeta2wiki` rewrites only the `# Meta Data` section and leaves the prose
+above it alone. Pass `overwrite=False` to merge into the tags already there
+(nothing is deduplicated). Without a `tag_name`, `getmetafromwiki` returns the
+whole list.
+
+```python
+print(catalog.getwikifrom("bwd.reference", idempotency_key=KEY))
+catalog.deletewiki("bwd.reference", idempotency_key=KEY)     # idempotent
+```
+
+### Tag a table or view
+
+Dremio's real tags — **tables and views only**, and `settagsto` *replaces* the
+set rather than adding to it:
+
+```python
+catalog.settagsto("bwd.versions.v2026.assessments", ["bathing-water", "2026"],
+                  idempotency_key=KEY)
+
+print(catalog.gettagsfrom("bwd.versions.v2026.assessments", idempotency_key=KEY))
+catalog.deletetags("bwd.versions.v2026.assessments", ["2026"], idempotency_key=KEY)
+```
+
+To add without losing what is there, pass the union:
+
+```python
+current = catalog.gettagsfrom(path, idempotency_key=KEY)
+catalog.settagsto(path, [*current, "new-tag"], idempotency_key=KEY)
+```
+
+### The engine was cold — finish the job later
+
+`EngineStartingError` is a **stall, not a failure**. The attempt is written to
+disk under your key, so you can pick it up from a later cell, a later notebook,
+or another process entirely:
+
+```python
+from eea_datalakehouse.catalog import EngineStartingError
+
+try:
+    catalog.table2view("bwd.consumer", "bwd.draft.bw_assessment", idempotency_key=KEY)
+except EngineStartingError:
+    print("Dremio engine is starting — run the retry cell in a few minutes")
+```
+
+```python
+catalog.retry_pending(KEY)      # same arguments, no need to retype them
+```
+
+### What is still waiting on a retry?
+
+```python
+from eea_datalakehouse.catalog import retry_state
+
+for p in retry_state.list_pending():
+    print(p.idempotency_key, p.operation, p.target, f"{p.attempts}x", p.last_error)
+```
+
+### Close the connection
+
+```python
+catalog.close()
+```
+
+---
+
+## End to end, in one cell
+
+Land a folder and publish it as a view — the whole single-shot flow:
+
+```python
+out = ingest("./bw_2026", "water_management_resources.bathing_water.bwd.draft",
+             data_format="parquet", table_name="bw_assessment")
+print(out.commit.table_path, out.commit.record_count)
+
+catalog.table2view("water_management_resources.bathing_water.bwd.consumer.bw_assessment",
+                   out.commit.table_path, idempotency_key=KEY)
+```
 
 ---
 
