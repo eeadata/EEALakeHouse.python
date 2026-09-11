@@ -56,6 +56,7 @@ catalog context from a JupyterLab tree click".
 
 from __future__ import annotations
 
+import inspect
 import os
 from typing import Any
 
@@ -75,6 +76,31 @@ _USAGE = {
     ),
 }
 
+# One short line per public method — shown by `%catalog help`/`%ingest help`.
+# Kept separate from each method's own (much longer) docstring on purpose:
+# this is a quick-reference table, not a replacement for reading the real
+# docstring in `catalog/session.py`/`dds_ingestion/session.py`.
+_CATALOG_HELP = [
+    (
+        "set_context",
+        "Set the current path; a later relative path (leading '.') resolves against it.",
+    ),
+    ("copy", "Queue a copy. Reversible unless overwrite=True."),
+    ("move", "Queue a move. Reversible unless overwrite=True."),
+    ("tag", "Queue replacing a path's tag set."),
+    ("untag", "Queue removing tags from a path's tag set."),
+    ("set_wiki", "Queue setting a path's wiki text."),
+    ("delete_wiki", "Queue deleting a path's wiki text."),
+    ("set_meta", "Queue setting a folder's Meta Data wiki section."),
+    ("create_folder", "Queue creating a folder."),
+    ("delete_folder", "Queue deleting a folder. Never reversible."),
+    ("commit", "Run every queued step as one all-or-nothing batch."),
+]
+_INGEST_HELP = [
+    ("ingest", "Queue one folder ingest (see FolderIngest for what each argument means)."),
+    ("commit", "Run every queued ingest in order; stops at the first failure."),
+]
+
 
 def _build_catalog_session() -> CatalogSession:
     base_url = os.environ.get("DREMIO_BASE_URL")
@@ -85,6 +111,51 @@ def _build_catalog_session() -> CatalogSession:
             "%catalog needs DREMIO_BASE_URL and DREMIO_TOKEN set in the kernel environment"
         )
     return CatalogSession(Catalog(base_url, token, username=username))
+
+
+def _is_help(line: str) -> bool:
+    return line.strip() in ("help", "help()")
+
+
+def _format_signature(func: Any) -> str:
+    """Render `func`'s signature (minus `self`) the way it reads in source —
+    `inspect.Signature`'s own `str()` wraps string annotations in quotes
+    (they're plain `str`s at runtime because of this module's, and the
+    session modules', `from __future__ import annotations`), which is
+    accurate but noisy for a notebook help message."""
+    sig = inspect.signature(func)
+    parts = []
+    seen_star = False
+    for name, param in sig.parameters.items():
+        if name == "self":
+            continue
+        if param.kind is inspect.Parameter.KEYWORD_ONLY and not seen_star:
+            parts.append("*")
+            seen_star = True
+        piece = name
+        if param.annotation is not inspect.Parameter.empty:
+            piece += f": {param.annotation}"
+        if param.default is not inspect.Parameter.empty:
+            piece += f" = {param.default!r}"
+        parts.append(piece)
+    rendered = f"({', '.join(parts)})"
+    if sig.return_annotation is not inspect.Signature.empty:
+        rendered += f" -> {sig.return_annotation}"
+    return rendered
+
+
+def _print_help(cls: type, methods: list[tuple[str, str]], label: str) -> None:
+    """Print every method in `methods` with its real signature (introspected
+    from `cls`, so it can't drift from the source) and a one-line
+    description. Signatures drop `self`; everything else — parameter names,
+    defaults, `*`-only markers, return types — comes straight from `cls`."""
+    print(f"%{label} methods — usage: {_USAGE[label]}")
+    print()
+    for name, description in methods:
+        print(f"  {name}{_format_signature(getattr(cls, name))}")
+        print(f"      {description}")
+    print()
+    print(f"%{label} help  — show this message")
 
 
 def _dispatch(
@@ -164,6 +235,9 @@ class EEALakehouseMagics(Magics):
 
     @line_magic
     def catalog(self, line: str) -> Any:
+        if _is_help(line):
+            _print_help(CatalogSession, _CATALOG_HELP, "catalog")
+            return None
         if self._catalog_session is None:
             try:
                 self._catalog_session = _build_catalog_session()
@@ -179,6 +253,9 @@ class EEALakehouseMagics(Magics):
 
     @line_magic
     def ingest(self, line: str) -> Any:
+        if _is_help(line):
+            _print_help(IngestSession, _INGEST_HELP, "ingest")
+            return None
         if self._ingest_session is None:
             self._ingest_session = IngestSession()
         return _dispatch(
