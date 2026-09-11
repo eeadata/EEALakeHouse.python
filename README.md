@@ -263,7 +263,7 @@ To pin to one specific release instead, use the exact tag the live badges under
 [Releasing a new version](#releasing-a-new-version)):
 
 ```python
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.13"
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.14"
 
 # staging's latest release (early access)
 %pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.14-staging"
