@@ -36,7 +36,7 @@ pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@staging"    
 ```
 
 # staging's latest release (early access) — pin to the tag the "staging" badge above shows
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.13-staging"
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.14-staging"
 ```
 
 ## Usage
@@ -169,6 +169,31 @@ exact same arguments.
 - `catalog.close()` (or `with Catalog(...) as catalog:`) — disposes the REST/Flight session(s).
   Idempotent, and covered by a process-exit/SIGTERM fallback if you forget.
 
+## Notebook facade (`%catalog` / `%ingest`)
+
+For interactive use in JupyterLab, `eea_datalakehouse.notebook` registers two line magics —
+thin, queue-then-commit wrappers over `CatalogSession`/`IngestSession` aimed at data
+custodians rather than application developers. See
+`docs/notebook-facade-for-data-scientists.md` for the full design, and
+`docs/notebooks/catalog_session_example.ipynb` / `ingest_session_example.ipynb` for worked
+examples. Install the extra this needs once: `pip install "EEADataLakehouse[notebook]"`.
+
+```python
+import eea_datalakehouse.notebook  # registers %catalog/%ingest — no %load_ext needed
+
+%catalog copy("draft.raw_2026", "bwd.reference.water_temperature")
+%catalog tag(".water_temperature", ["reviewed"])
+%catalog commit(retry=True)
+
+%ingest ingest(folder="./bw_2026", target_catalog_path="bwd.reference",
+                data_format="parquet", table_name="water_temperature")
+%ingest commit(retry=True)
+```
+
+`%catalog help` (or `%catalog help()`) lists every `CatalogSession` method with its
+signature and a short description; `%ingest help` does the same for `IngestSession` — handy
+when you don't remember an exact parameter name mid-notebook.
+
 ## Layout
 
 | Path | Purpose |
@@ -241,7 +266,7 @@ To pin to one specific release instead, use the exact tag the live badges under
 %pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.13"
 
 # staging's latest release (early access)
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.13-staging"
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.14-staging"
 ```
 
 Use the `%pip` magic rather than `!pip` — it installs into the kernel the
