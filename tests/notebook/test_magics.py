@@ -134,3 +134,31 @@ def test_empty_line_prints_usage(ip: Any, capsys: pytest.CaptureFixture[str]) ->
 
     out = capsys.readouterr().out
     assert "usage:" in out
+
+
+@pytest.mark.parametrize("line", ["help", "help()"])
+def test_catalog_help_lists_methods_without_needing_credentials(
+    ip: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], line: str
+) -> None:
+    monkeypatch.delenv("DREMIO_BASE_URL", raising=False)
+    monkeypatch.delenv("DREMIO_TOKEN", raising=False)
+
+    ip.run_line_magic("catalog", line)
+
+    out = capsys.readouterr().out
+    assert "%catalog methods" in out
+    assert "copy(source_path: str, target_path: str" in out
+    assert "commit(*, retry: bool = False" in out
+    assert "DREMIO_BASE_URL" not in out  # never tried to build a session
+    assert _magics_instance(ip)._catalog_session is None
+
+
+@pytest.mark.parametrize("line", ["help", "help()"])
+def test_ingest_help_lists_methods(ip: Any, capsys: pytest.CaptureFixture[str], line: str) -> None:
+    ip.run_line_magic("ingest", line)
+
+    out = capsys.readouterr().out
+    assert "%ingest methods" in out
+    assert "ingest(folder: str | Path, target_catalog_path: str" in out
+    assert "commit(*, retry: bool = False, max_retries: int = 3)" in out
+    assert _magics_instance(ip)._ingest_session is None
