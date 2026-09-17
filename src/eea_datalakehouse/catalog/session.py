@@ -6,16 +6,16 @@ reimplements catalog behaviour — it only hides the ceremony (idempotency
 keys) and adds queue/commit/rollback on top::
 
     session = CatalogSession(catalog)
-    session.copy("draft.raw_2026", "bwd.reference.water_temperature")
-    session.tag("bwd.reference.water_temperature", ["reviewed"])
+    session.data_copy("draft.raw_2026", "bwd.reference.water_temperature")
+    session.set_tags("bwd.reference.water_temperature", ["reviewed"])
     session.commit(retry=True)
 
 `commit()` is all-or-nothing: every queued step runs in order, and the
 moment one fails, everything already done in *this* commit is undone before
 the failure is reported — see each verb's own docstring below for exactly
 what its compensating action is, and where one isn't possible (`delete_folder`,
-or `copy`/`move` with `overwrite=True`) that limitation is raised as part of
-the failure, not hidden.
+`delete_view`/`delete_table`, or `data_copy`/`data_move` with `overwrite=True`)
+that limitation is raised as part of the failure, not hidden.
 
 This is NOT the same "session" `dds_ingestion.folder.FolderIngest` already
 has (a server-side transfer identified by `session_id`, resumed via
@@ -34,11 +34,11 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Literal
 
 from . import operations
 from .client import Catalog
 from .errors import CatalogOperationError, EngineStartingError
+from .operations import TableInfo
 
 _Undo = Callable[[], None]
 
@@ -53,7 +53,8 @@ class CatalogCommitError(CatalogSessionError):
     `rolled_back` is `True` only if every already-succeeded step in this
     commit was cleanly undone. When it's `False`, `unresolved` names which
     steps are NOT undone — either because that verb has no compensating
-    action at all (`delete_folder`; `copy`/`move` with `overwrite=True`), or
+    action at all (`delete_folder`, `delete_view`/`delete_table`; `data_copy`/
+    `data_move` with `overwrite=True`), or
     because undoing it was attempted and itself failed. Either way, the
     catalog is left in a state this object cannot fully explain away, and a
     human needs to look.
@@ -105,11 +106,12 @@ def _read_wiki_or_none(catalog: Catalog, path: str, *, idempotency_key: str) -> 
 def _drop_entry(catalog: Catalog, path: str, *, idempotency_key: str) -> None:
     """Drop whatever entity (table or view) now sits at `path`.
 
-    Used to undo a fresh `copy`. Reaches into `operations`' own private
+    Used to undo a fresh `data_copy`. Reaches into `operations`' own private
     helpers (`_entry_kind`, `_quote_path`) rather than a public op, because
-    there isn't one: `deleteview` only drops VIEWs, and a plain `datacopy`
-    target is always a TABLE (`CREATE TABLE ... AS SELECT`). Acceptable
-    here since this module lives in the same package as `operations.py`.
+    the public `deleteview`/`deletetable` (via `Catalog`) run over REST, not
+    Flight — this needs to stay on `catalog._flight_executor` like the
+    `data_copy`/`data_move` it's undoing. Acceptable here since this module
+    lives in the same package as `operations.py`.
     """
     executor = catalog._flight_executor  # noqa: SLF001 — same-package internal, see docstring
     kind = operations._entry_kind(executor, path, idempotency_key=idempotency_key)  # noqa: SLF001
@@ -122,12 +124,13 @@ def _drop_entry(catalog: Catalog, path: str, *, idempotency_key: str) -> None:
 class CatalogSession:
     """Queue catalog verbs against `catalog`, then `commit()` them as one batch.
 
-    Every queueing method (`copy`, `move`, `tag`, `untag`, `set_wiki`,
-    `delete_wiki`, `set_meta`, `create_folder`, `delete_folder`) only records
-    the intent — nothing reaches Dremio until `commit()`. Each returns
+    Every queueing method (`data_copy`, `data_move`, `create_view`, `set_tags`,
+    `delete_tags`, `set_wiki`, `delete_wiki`, `create_folder`,
+    `delete_folder`, `delete_view`, `delete_table`) only records the intent —
+    nothing reaches Dremio until `commit()`. Each returns
     `self`, so calls chain::
 
-        session.copy(...).tag(...).commit()
+        session.data_copy(...).set_tags(...).commit()
 
     `idempotency_key`s are generated internally (`session-<id>-<n>`, one per
     step) — never pass or think about one; that's exactly the ceremony this
@@ -151,12 +154,17 @@ class CatalogSession:
     def set_context(self, path: str | None) -> CatalogSession:
         """Set the "current" catalog path — a later relative path (a leading
         `.`, e.g. `.water_temperature`) resolves against this. `None` clears it.
+        `path` here is always taken literally, even if it itself starts with
+        `.` — see `use` for a version that resolves a leading `.` against
+        whatever context already exists, which is what a data custodian
+        deliberately narrowing the context (e.g. `%%catalog use(".2027")`)
+        actually wants.
 
-        Not something a data custodian should normally call: ordinary use
-        already keeps this up to date on its own (see `_resolve` — every
-        queued step updates it from whatever path it just touched), and an
-        integration (the JupyterLab catalog-tree extension pushing a
-        selected leaf through a Comm — see
+        Not something a data custodian should normally call directly:
+        ordinary use already keeps this up to date on its own (see
+        `_resolve` — every queued step updates it from whatever path it
+        just touched), and an integration (the JupyterLab catalog-tree
+        extension pushing a selected leaf through a Comm — see
         `docs/notebook-facade-for-data-scientists.md`, "Pre-filling catalog
         context") is the other caller, seeding it before any path has been
         typed yet.
@@ -164,11 +172,78 @@ class CatalogSession:
         self._context = path
         return self
 
+    def use(self, path: str | None) -> CatalogSession:
+        """Set the current path for every call after this one — same as
+        `set_context`, but `path` may also be relative rather than only a
+        whole path, and `None` clears it exactly like `set_context(None)`.
+        A relative `path` may lead with a `.` (`".2027"`) or not
+        (`"2027"`) — both resolve against whatever context already exists
+        the same way; the dot is optional sugar here, unlike everywhere
+        else in this class (every other verb's `path`/`source_path`/
+        `target_path` still requires it to mean relative, so an absolute
+        path can always be passed even with a context already set — see
+        `_resolve_path`). Once a context exists, `use` therefore has no way
+        to jump straight to an unrelated absolute path without a leading
+        dot; clear it first (`use(None)`) if that's what's needed. `path`
+        may also lead with one or more `../` (or be a bare `..`) to walk
+        up that many levels of the context first — `use("../stations")`
+        moves to a sibling of the context, `use("..")` to its parent.
+
+        This is the one custodian-facing way to set context deliberately
+        (see `%%catalog use(path)` — the cell magic sets it once at the
+        top of a cell, for every call in that cell and every cell after
+        it, until changed again); ordinary use already keeps context
+        current on its own, so this is only needed to jump somewhere a
+        queued step hasn't already touched.
+
+        Unlike everything else in this class, this makes a live call
+        against Dremio: the resolved path must already exist as some
+        catalog entity (folder, table, or view) — raises
+        `CatalogSessionError` otherwise, so context never silently points
+        somewhere real work would fail against later. Always stores the
+        fully resolved path — never a `.`/`..`-prefixed fragment — so
+        `get_context()` reads back exactly what `use` just checked.
+        """
+        if path is None:
+            self._context = None
+            return self
+        if self._context is not None and not path.startswith("."):
+            path = f".{path}"
+        resolved = self._resolve_path(path)
+        try:
+            found = self._catalog._catalog_rest.exists(resolved)  # noqa: SLF001 — see module docstring
+        except (CatalogOperationError, EngineStartingError) as exc:
+            raise CatalogSessionError(
+                f"could not check whether {resolved!r} exists: {exc}"
+            ) from exc
+        if not found:
+            raise CatalogSessionError(f"{resolved!r} does not exist in the catalog")
+        self._context = resolved
+        return self
+
+    def get_context(self) -> str | None:
+        """The current path, always the full resolved path — never a
+        `.`/`..`-prefixed fragment, even right after a relative `use` —
+        see `use`/`set_context`. `None` if nothing has been set yet."""
+        return self._context
+
     def _resolve_path(self, path: str) -> str:
-        """Just the relative -> absolute resolution (a leading `.` resolves
-        against the current context) — does NOT update the context; see
-        `_resolve` for the verbs where the touched path also becomes the
-        new context."""
+        """Just the relative -> absolute resolution — does NOT update the
+        context; see `_resolve` for the verbs where the touched path also
+        becomes the new context. Always returns a full, already-resolved
+        path (never a `.`/`..`-prefixed fragment), so a value stored from
+        here — including into `self._context` — is safe to read back as-is
+        (see `get_context`).
+
+        A leading `.` resolves against the current context
+        (`".water_temperature"` -> `f"{context}.water_temperature"`). One
+        or more leading `../` segments (or a bare `..`) instead walk up
+        that many levels of the context *first* — `"../stations"` is a
+        sibling of the context, `"../../stations"` a level further up, and
+        so on; `".."` alone (no name after it) resolves to the context's
+        parent itself."""
+        if path == ".." or path.startswith("../"):
+            return self._resolve_parent_path(path)
         if not path.startswith("."):
             return path
         if self._context is None:
@@ -178,21 +253,47 @@ class CatalogSession:
             )
         return f"{self._context}{path}"
 
+    def _resolve_parent_path(self, path: str) -> str:
+        """The `..`/`../...` half of `_resolve_path` — walk `self._context`
+        up one level per leading `../` (or the single `..`), then append
+        whatever's left, if anything."""
+        if self._context is None:
+            raise CatalogSessionError(
+                f"{path!r} is relative (starts with '..') but no context is set yet — "
+                "use an absolute path first, or call set_context()"
+            )
+        ancestor = self._context
+        remainder = path
+        while remainder == ".." or remainder.startswith("../"):
+            parent = operations._parent_path(ancestor)  # noqa: SLF001 — same-package internal
+            if parent is None:
+                raise CatalogSessionError(
+                    f"{path!r} goes above the top of the current context {self._context!r}"
+                )
+            ancestor = parent
+            remainder = remainder[3:] if remainder.startswith("../") else ""
+        if not remainder:
+            return ancestor
+        if not remainder.startswith("."):
+            remainder = f".{remainder}"
+        return f"{ancestor}{remainder}"
+
     def _resolve(self, path: str) -> str:
         """Resolve `path` (see `_resolve_path`), then update the context to
         its own parent — so the next short name keeps resolving against
         wherever this one just landed, without anyone calling
-        `set_context` again. Verbs with two paths (`copy`/`move`) resolve
-        both against the *same* starting context via `_resolve_path`
-        directly instead — only the target should become the new context,
-        not whatever `source_path`'s own folder happens to be."""
+        `set_context` again. Verbs with two paths (`data_copy`/`data_move`/
+        `create_view`) resolve both against the *same* starting context via
+        `_resolve_path` directly instead — only the target should become
+        the new context, not whatever `source_path`'s own folder happens
+        to be."""
         resolved = self._resolve_path(path)
         self._context = operations._parent_path(resolved) or self._context  # noqa: SLF001
         return resolved
 
     # -- queueing verbs ---------------------------------------------------
 
-    def copy(
+    def data_copy(
         self,
         source_path: str,
         target_path: str,
@@ -200,7 +301,7 @@ class CatalogSession:
         overwrite: bool = False,
         create_target_folder: bool = False,
     ) -> CatalogSession:
-        """Queue a `datacopy`. Reversible only when `overwrite=False` (there
+        """Queue a `data_copy`. Reversible only when `overwrite=False` (there
         was nothing at `target_path` to lose) — undo drops the table this
         step created. With `overwrite=True`, whatever used to be at
         `target_path` is gone the moment this step runs; there is nothing to
@@ -229,22 +330,22 @@ class CatalogSession:
 
             return undo
 
-        self._steps.append(_Step(f"copy {source_path!r} -> {target_path!r}", run))
+        self._steps.append(_Step(f"data_copy {source_path!r} -> {target_path!r}", run))
         return self
 
-    def move(
+    def data_move(
         self,
         source_path: str,
         target_path: str,
         *,
-        entry_type: Literal["TABLE", "VIEW"] | None = None,
         overwrite: bool = False,
         create_target_folder: bool = False,
     ) -> CatalogSession:
-        """Queue a `datamove`. Reversible only when `overwrite=False` — undo
-        is a `datamove` back from `target_path` to `source_path` (the
-        target's kind is re-detected at undo time, not assumed). Same
-        `overwrite=True` limitation as `copy`.
+        """Queue a `data_move`, always as a TABLE — use `create_view` instead
+        to create a view over `source_path` without touching it. Reversible
+        only when `overwrite=False` — undo is a `data_move` back from
+        `target_path` to `source_path`. Same `overwrite=True` limitation as
+        `data_copy`.
 
         Either path may be relative (a leading `.`) to the session's current
         context — see `set_context`; `target_path` becomes the new context
@@ -257,7 +358,7 @@ class CatalogSession:
             catalog.datamove(
                 source_path,
                 target_path,
-                entry_type=entry_type,
+                entry_type="TABLE",
                 overwrite=overwrite,
                 create_target_folder=create_target_folder,
                 idempotency_key=key,
@@ -266,26 +367,62 @@ class CatalogSession:
                 raise _Irreversible("overwrote an existing target; its previous content is gone")
 
             def undo() -> None:
-                undo_key = f"{key}-undo"
-                kind = operations._entry_kind(  # noqa: SLF001 — see _drop_entry
-                    catalog._flight_executor,  # noqa: SLF001
-                    target_path,
-                    idempotency_key=f"{undo_key}-detect",
-                )
                 catalog.datamove(
                     target_path,
                     source_path,
-                    entry_type=kind,
+                    entry_type="TABLE",
                     overwrite=False,
-                    idempotency_key=undo_key,
+                    idempotency_key=f"{key}-undo",
                 )
 
             return undo
 
-        self._steps.append(_Step(f"move {source_path!r} -> {target_path!r}", run))
+        self._steps.append(_Step(f"data_move {source_path!r} -> {target_path!r}", run))
         return self
 
-    def tag(self, path: str, tags: list[str]) -> CatalogSession:
+    def create_view(
+        self,
+        source_path: str,
+        target_path: str,
+        *,
+        overwrite: bool = False,
+        create_target_folder: bool = False,
+    ) -> CatalogSession:
+        """Queue a `createview` — creates a VIEW at `target_path` over
+        `source_path`, leaving `source_path` itself untouched (unlike
+        `data_move`). Reversible only when `overwrite=False` (there was nothing
+        at `target_path` to lose) — undo drops the view this step created.
+        With `overwrite=True`, whatever used to be at `target_path` is gone
+        the moment this step runs; there is nothing to restore, so this
+        step cannot be undone (see `CatalogCommitError`).
+
+        Either path may be relative (a leading `.`) to the session's current
+        context — see `set_context`; `target_path` becomes the new context
+        afterwards."""
+        source_path = self._resolve_path(source_path)
+        target_path = self._resolve_path(target_path)
+        self._context = operations._parent_path(target_path) or self._context  # noqa: SLF001
+
+        def run(catalog: Catalog, key: str) -> _Undo | None:
+            catalog.createview(
+                source_path,
+                target_path,
+                overwrite=overwrite,
+                create_target_folder=create_target_folder,
+                idempotency_key=key,
+            )
+            if overwrite:
+                raise _Irreversible("overwrote an existing target; its previous content is gone")
+
+            def undo() -> None:
+                _drop_entry(catalog, target_path, idempotency_key=f"{key}-undo")
+
+            return undo
+
+        self._steps.append(_Step(f"create view {source_path!r} -> {target_path!r}", run))
+        return self
+
+    def set_tags(self, path: str, tags: list[str]) -> CatalogSession:
         """Queue `settagsto` (replaces the tag set). Undo restores whatever
         tags were on `path` immediately before this step ran.
 
@@ -302,10 +439,10 @@ class CatalogSession:
 
             return undo
 
-        self._steps.append(_Step(f"tag {path!r} with {tags!r}", run))
+        self._steps.append(_Step(f"set tags {tags!r} on {path!r}", run))
         return self
 
-    def untag(self, path: str, tags: list[str]) -> CatalogSession:
+    def delete_tags(self, path: str, tags: list[str]) -> CatalogSession:
         """Queue `deletetags`. Undo restores the full tag set `path` had
         immediately before this step ran.
 
@@ -322,7 +459,7 @@ class CatalogSession:
 
             return undo
 
-        self._steps.append(_Step(f"untag {tags!r} from {path!r}", run))
+        self._steps.append(_Step(f"delete tags {tags!r} from {path!r}", run))
         return self
 
     def set_wiki(
@@ -373,37 +510,6 @@ class CatalogSession:
         self._steps.append(_Step(f"delete wiki on {path!r}", run))
         return self
 
-    def set_meta(
-        self, path: str, tags: list[dict[str, str]] | None = None, *, overwrite: bool = True
-    ) -> CatalogSession:
-        """Queue `setmeta2wiki`. Undo restores the whole previous wiki text
-        (not just its Meta Data section) verbatim, or deletes it if `path`
-        had none.
-
-        `path` may be relative (a leading `.`) to the session's current
-        context — see `set_context`. Unlike a leaf-level verb (`tag`,
-        `set_wiki`, ...), `path` here is a folder (see `_require_folder`),
-        so it becomes the new context *itself*, not its parent — the next
-        short name is expected to name something *inside* it."""
-        path = self._resolve_path(path)
-        self._context = path
-
-        def run(catalog: Catalog, key: str) -> _Undo:
-            existing = _read_wiki_or_none(catalog, path, idempotency_key=f"{key}-read")
-            catalog.setmeta2wiki(path, tags=tags, overwrite=overwrite, idempotency_key=key)
-
-            def undo() -> None:
-                undo_key = f"{key}-undo"
-                if existing is None:
-                    catalog.deletewiki(path, idempotency_key=undo_key)
-                else:
-                    catalog.setwikito(path, existing, idempotency_key=undo_key)
-
-            return undo
-
-        self._steps.append(_Step(f"set metadata on {path!r}", run))
-        return self
-
     def create_folder(self, path: str, *, create_parents: bool = False) -> CatalogSession:
         """Queue `createfolder`. Undo deletes it — but only if this step
         actually created it; `createfolder` is idempotent, so a `path`
@@ -446,6 +552,108 @@ class CatalogSession:
 
         self._steps.append(_Step(f"delete folder {path!r}", run))
         return self
+
+    def delete_view(self, path: str) -> CatalogSession:
+        """Queue `deleteview`. **Never reversible** — the dropped view's
+        definition isn't captured anywhere, so there's nothing to recreate
+        it from. Unlike `Catalog.deleteview`'s own `DROP VIEW IF EXISTS`
+        (idempotent — a no-op on a missing path), this raises
+        `CatalogOperationError` if `path` doesn't exist at all, so a typo
+        fails clearly instead of silently doing nothing.
+
+        `path` may be relative (a leading `.`) to the session's current
+        context — see `set_context`. Does not change the context itself —
+        there's nothing meaningful to navigate into once it's deleted."""
+        path = self._resolve_path(path)
+
+        def run(catalog: Catalog, key: str) -> _Undo | None:
+            if not catalog._catalog_rest.exists(path):  # noqa: SLF001 — see module docstring
+                raise CatalogOperationError(f"{path!r} does not exist")
+            catalog.deleteview(path, idempotency_key=key)
+            raise _Irreversible("dropped view's definition cannot be recreated")
+
+        self._steps.append(_Step(f"delete view {path!r}", run))
+        return self
+
+    def delete_table(self, path: str) -> CatalogSession:
+        """Queue `deletetable`. **Never reversible** — the dropped table's
+        data isn't captured anywhere, so there's nothing to recreate it
+        from. Unlike `Catalog.deletetable`'s own `DROP TABLE IF EXISTS`
+        (idempotent — a no-op on a missing path), this raises
+        `CatalogOperationError` if `path` doesn't exist at all, so a typo
+        fails clearly instead of silently doing nothing.
+
+        `path` may be relative (a leading `.`) to the session's current
+        context — see `set_context`. Does not change the context itself —
+        there's nothing meaningful to navigate into once it's deleted."""
+        path = self._resolve_path(path)
+
+        def run(catalog: Catalog, key: str) -> _Undo | None:
+            if not catalog._catalog_rest.exists(path):  # noqa: SLF001 — see module docstring
+                raise CatalogOperationError(f"{path!r} does not exist")
+            catalog.deletetable(path, idempotency_key=key)
+            raise _Irreversible("dropped table's data cannot be recreated")
+
+        self._steps.append(_Step(f"delete table {path!r}", run))
+        return self
+
+    # -- read-only queries — answered immediately, never queued -------------
+
+    def get_wiki(self, path: str) -> str:
+        """The wiki text at `path` (see `getwikifrom`). Answered immediately
+        — not queued, since there's nothing to commit or undo. Raises
+        `CatalogOperationError` if `path` doesn't exist, or exists but has
+        no wiki at all.
+
+        `path` may be relative (a leading `.`) to the session's current
+        context — see `set_context`."""
+        path = self._resolve_path(path)
+        return self._catalog.getwikifrom(path, idempotency_key=self._key())
+
+    def get_tags(self, path: str) -> list[str]:
+        """The tags on `path` (see `gettagsfrom`) — tables/views only.
+        Answered immediately — not queued, since there's nothing to commit
+        or undo. Raises `CatalogOperationError` if `path` doesn't exist or
+        isn't a table/view (folders have Dremio's own wiki Meta Data
+        section for this instead — see `Catalog.setmeta2wiki`).
+
+        `path` may be relative (a leading `.`) to the session's current
+        context — see `set_context`."""
+        path = self._resolve_path(path)
+        return self._catalog.gettagsfrom(path, idempotency_key=self._key())
+
+    def list(self, path: str) -> list[str]:
+        """Full paths of every table and view under `path`, at any depth
+        (see `gettablesfrom`). Answered immediately — not queued, since
+        there's nothing to commit or undo. Raises `CatalogOperationError`
+        if `path` doesn't exist — `gettablesfrom` itself doesn't check this
+        (an empty result and "nothing there" look the same to it), so this
+        checks first rather than returning `[]` for a typo'd path.
+
+        `path` may be relative (a leading `.`) to the session's current
+        context — see `set_context`."""
+        path = self._resolve_path(path)
+        if not self._catalog._catalog_rest.exists(path):  # noqa: SLF001 — see module docstring
+            raise CatalogOperationError(f"{path!r} does not exist")
+        return self._catalog.gettablesfrom(path, idempotency_key=self._key())
+
+    def schema(self, path: str) -> TableInfo:
+        """The column schema and row count of `path` (see
+        `gettableitemsfrom`) — never fetches the actual rows. Answered
+        immediately — not queued, since there's nothing to commit or undo.
+        `path` must be a table or view — raises `CatalogOperationError`
+        otherwise (a folder has no schema of its own), or if `path` doesn't
+        exist at all.
+
+        `path` may be relative (a leading `.`) to the session's current
+        context — see `set_context`."""
+        path = self._resolve_path(path)
+        operations._require_table_or_view(  # noqa: SLF001 — see module docstring
+            self._catalog._catalog_rest,  # noqa: SLF001
+            path,
+            "schema",
+        )
+        return self._catalog.gettableitemsfrom(path, idempotency_key=self._key())
 
     # -- commit -------------------------------------------------------------
 
