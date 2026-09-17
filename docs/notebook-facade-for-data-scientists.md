@@ -15,6 +15,38 @@ catalog context" — see `docs/notebooks/catalog_session_example.ipynb` and
 a prototype behind an opt-in `notebook` extra, not reviewed or adopted — the
 rest of this file is the design reasoning behind it, kept as written.
 
+**Update:** `%catalog` no longer exposes queue-then-commit at the magic
+level — each call now commits itself immediately (`CatalogSession` still
+does the committing underneath, one call at a time, so the retry/rollback
+behaviour described below is unchanged; there's just no longer a separate
+`%catalog commit` a custodian has to remember). `%ingest` is unaffected and
+still queues/commits as described throughout this doc. Context has also
+grown past what's described below: `use(path)` (also via `%%catalog
+use(path)`, the cell-magic form) sets it deliberately — making a live
+check that the resolved path exists in the catalog first, unlike
+everything else here, and always storing the full resolved path, never a
+raw `.`/`..`-prefixed fragment — `get_context()` reads it back, and a
+leading `../` (or a bare `..`) on any relative path, not just inside
+`use`, walks up that many levels of the context first. `copy`/`move` were
+later renamed `datacopy`/`datamove`, matching `Catalog`'s own names instead
+of inventing friendlier ones, then renamed again to `data_copy`/`data_move`
+for consistency with the rest of the facade's underscored verbs (`Catalog`'s
+own `datacopy`/`datamove` are unchanged — only the `CatalogSession`/
+`%catalog` wrapper got the underscore); six more verbs were added — read-only
+`get_wiki`, `get_tags`, `list`, `schema` (answered immediately, like
+`get_context`), and queued `delete_view`/`delete_table` (never reversible,
+like `delete_folder`, but unlike the idempotent `Catalog.deleteview`/
+`deletetable` they wrap, require `path` to already exist — originally
+named `deleteview`/`deletetable` to match, then renamed with an underscore
+for consistency with `delete_folder`/`delete_wiki`). `tag`/`untag` were
+similarly renamed `set_tags`/`delete_tags` (matching `set_wiki`/
+`delete_wiki`'s pattern), and `set_meta` was removed — the raw
+`Catalog.setmeta2wiki`/`getmetafromwiki` are still there for a folder's
+wiki Meta Data section, just not wrapped by `CatalogSession` any more. See
+`src/eea_datalakehouse/notebook/magics.py`'s module docstring and
+`src/eea_datalakehouse/catalog/session.py`'s `use`/`get_context`/
+`_resolve_path` for the current, authoritative behaviour.
+
 ## The facade's surface, end to end
 
 A consolidated view of what all the sections below amount to — every other
@@ -35,13 +67,19 @@ result, in one place.
 
 **What it exposes** — a small, curated verb set, not the full developer API:
 
-| catalog | ingestion |
+| catalog (runs immediately) | ingestion (queue, then commit) |
 | --- | --- |
-| `copy`, `move` | `ingest` |
-| `tag`, `untag` | |
-| `set_wiki`, `delete_wiki`, `set_meta` | |
+| `data_copy`, `data_move` (data) | `ingest` |
+| `list`, `schema`, `delete_table` (table) | |
+| `create_view`, `delete_view` (view) | |
+| `set_wiki`, `delete_wiki`, `get_wiki` (wiki) | |
+| `set_tags`, `delete_tags`, `get_tags` (tags) | |
 | `create_folder`, `delete_folder` | |
-| `commit(retry=True)` | `commit(retry=True)` |
+| `use` (also via `%%catalog use(path)`), `get_context` | |
+| | `commit(retry=True)` |
+
+(`%catalog help`'s own ordering follows the same five groups — data, table,
+view, wiki, tags — then folders, with `use`/`get_context` always first.)
 
 Every call takes a path and the arguments a custodian actually thinks in
 (`overwrite=True`, a list of tag strings, a folder path) — never an
@@ -58,16 +96,16 @@ import eea_datalakehouse.notebook
 %ingest ingest(folder="./bw_2026", target_catalog_path="bwd.reference", data_format="parquet")
 %ingest commit(retry=True)
 
-%catalog tag(".water_temperature", ["reviewed"])
-%catalog set_meta(".", tags=[{"tag_name": "owner", "tag_value": "bw-team", "tag_title": "Owner"}])
-%catalog commit(retry=True)
+%catalog set_tags(".water_temperature", ["reviewed"])
+%catalog set_wiki(".", "# Water temperature\n\nBathing water assessments.")
 ```
 
-Ingest first and commit it fully; only then touch the catalog side, in a
-separate `%catalog` batch — that ordering is enforced by convention (two
-sessions), not by code. Nothing reaches Dremio until a `commit`; a failure
-prints a short message and (catalog side) undoes whatever it safely can,
-rather than a traceback.
+Ingest first and commit it fully; only then touch the catalog side — that
+ordering is enforced by convention (a catalog operation can't run before its
+target exists), not by code. `%ingest` doesn't reach Dremio until a
+`commit`; `%catalog` reaches it the moment each call runs. Either way a
+failure prints a short message and undoes whatever it safely can, rather
+than a traceback.
 
 ## The problem
 
@@ -135,7 +173,7 @@ facade; it has no business appearing in a signature a data scientist calls.
 
 ## Two sessions, not one — ingestion and catalog are sequential, not peers
 
-Catalog operations can't run before their target exists — a `datacopy`, tag or
+Catalog operations can't run before their target exists — a `data_copy`, tag or
 wiki update on a table that hasn't been ingested yet has nothing to act on. So
 ingestion and catalog aren't two halves of one atomic batch; they're two
 phases, strictly ordered: an ingest fully lands and commits, *then* — and only
@@ -150,8 +188,8 @@ ingest.ingest(folder="./bw_2026", target_catalog_path="…/bwd/reference", ...)
 ingest.commit(retry=True)          # must fully succeed before anything below runs
 
 catalog = lakehouse.catalog_session()
-catalog.copy("draft.raw_2026", "bwd.reference.water_temperature", overwrite=True)
-catalog.tag("bwd.reference.water_temperature", reviewed_by="jdoe")
+catalog.data_copy("draft.raw_2026", "bwd.reference.water_temperature", overwrite=True)
+catalog.set_tags("bwd.reference.water_temperature", reviewed_by="jdoe")
 catalog.commit(retry=True)          # all-or-nothing, but only across catalog steps
 ```
 
@@ -279,15 +317,17 @@ This splits into two sides that live in two different repositories.
 **The receiving side, here — implemented and encapsulated on both routes in:**
 `CatalogSession.set_context(path)`/`_resolve` (`catalog/session.py`) resolve the
 open question below with an explicit marker (a leading `.`, e.g.
-`session.tag(".water_temperature", ...)`), and — critically — `set_context`
-itself is not something a data custodian is expected to call:
+`session.set_tags(".water_temperature", ...)`), and — critically — `set_context`
+itself is not something a data custodian is expected to call directly
+(`use`, added later, is the custodian-facing entry point built on the same
+mechanism — see "What it exposes" above):
 
 - **Ordinary use already keeps it current on its own.** Every queueing verb
   updates the context from whatever path it just touched (the target's
-  parent for `copy`/`move`; the touched path itself for a folder-scoped verb
-  like `create_folder`/`set_meta`), so a script that never once calls
-  `set_context` still gets working relative paths after its first absolute
-  one.
+  parent for `data_copy`/`data_move`; the touched path itself for a
+  folder-scoped verb like `create_folder`), so a script that never once
+  calls `set_context` still gets working relative paths after its first
+  absolute one.
 - **The Comm channel below is the *other* caller**, not the custodian either.
 
 **The emitting side, in `eeadata/EEALakeHouse` — still not built:** the
@@ -309,10 +349,12 @@ repository, which this session doesn't have open.
   `rich`/notebook-display block) rather than surfaced as a raw
   `CatalogOperationError` traceback.
 - A handful of high-level verbs matching how a custodian actually thinks about
-  the task, e.g. `session.copy(...)`, `session.tag(...)`, rather than the full
-  `datacopy`/`gettagsfrom`/`settagsto` vocabulary — queued and committed as
-  above, possibly also reachable as one-shot `%magic` commands for a true
-  single-call use.
+  the task, e.g. `session.set_tags(...)`, rather than the full `gettagsfrom`/
+  `settagsto` vocabulary — queued and committed as above, possibly also
+  reachable as one-shot `%magic` commands for a true single-call use.
+  (`datacopy`/`datamove` are the one deliberate exception — later renamed
+  back to match `Catalog`'s own names, rather than staying `copy`/`move`;
+  see `%catalog help`'s current vocabulary for what actually shipped.)
 - Ties into the same gaps `dev-notes.md` already flags: missing docstrings on
   `Catalog`'s delegate methods (so `Shift+Tab` shows nothing useful today), and
   no pinned notebook environment to develop/test this against

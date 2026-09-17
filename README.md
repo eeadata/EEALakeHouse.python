@@ -100,6 +100,11 @@ exact same arguments.
   `CREATE VIEW` transition for a location that started as a physical table (straight off ingest)
   and is moving to being a view. Checks `source_path` exists first; by default also creates
   `view_path`'s containing folder if missing.
+- `createview(source_path, target_path, overwrite=False, create_target_folder=False)` —
+  `CREATE VIEW ... AS SELECT * FROM source_path`, leaving `source_path` untouched (unlike
+  `datamove`). No data of its own — a view is a saved query — so this runs over REST like
+  every other metadata-only operation, not Arrow Flight. Same folder-append and `overwrite`
+  behavior as `datacopy`/`datamove`.
 - `draft2version(draft_path, version_path)` / `publishversion(consumer_view_path, version_path)`
   — **not implemented yet** (both raise `NotImplementedError`); promoting a draft table into a
   permanent version and repointing a consumer-facing view at it.
@@ -171,9 +176,11 @@ exact same arguments.
 
 ## Notebook facade (`%catalog` / `%ingest`)
 
-For interactive use in JupyterLab, `eea_datalakehouse.notebook` registers two line magics —
-thin, queue-then-commit wrappers over `CatalogSession`/`IngestSession` aimed at data
-custodians rather than application developers. See
+For interactive use in JupyterLab, `eea_datalakehouse.notebook` registers two line magics
+aimed at data custodians rather than application developers, thin wrappers over
+`CatalogSession`/`IngestSession`. `%catalog` runs each call **immediately** — no commit
+step to remember. `%ingest` still queues and needs an explicit `commit()`, since a catalog
+operation can't run before its target has actually been ingested. See
 `docs/notebook-facade-for-data-scientists.md` for the full design, and
 `docs/notebooks/catalog_session_example.ipynb` / `ingest_session_example.ipynb` for worked
 examples. Install the extra this needs once: `pip install "EEADataLakehouse[notebook]"`.
@@ -181,18 +188,58 @@ examples. Install the extra this needs once: `pip install "EEADataLakehouse[note
 ```python
 import eea_datalakehouse.notebook  # registers %catalog/%ingest — no %load_ext needed
 
-%catalog copy("draft.raw_2026", "bwd.reference.water_temperature")
-%catalog tag(".water_temperature", ["reviewed"])
-%catalog commit(retry=True)
+%catalog data_copy("draft.raw_2026", "bwd.reference.water_temperature")
+%catalog set_tags(".water_temperature", ["reviewed"])
 
 %ingest ingest(folder="./bw_2026", target_catalog_path="bwd.reference",
                 data_format="parquet", table_name="water_temperature")
 %ingest commit(retry=True)
 ```
 
-`%catalog help` (or `%catalog help()`) lists every `CatalogSession` method with its
-signature and a short description; `%ingest help` does the same for `IngestSession` — handy
-when you don't remember an exact parameter name mid-notebook.
+`%catalog help` (or `%catalog help()`) prints every command as a plain table — name,
+parameters, description — rather than a raw Python signature, since its audience is a data
+custodian, not necessarily a developer. `%ingest help` does the same for `IngestSession`,
+listing its (fewer) methods with their real signatures — handy when you don't remember an
+exact parameter name mid-notebook.
+
+`%%catalog` (the cell-magic form) sets the context once, with `use(path)` on its magic line,
+then runs every other line of the cell in order under that context, without repeating the full
+path on each line. A leading `.` resolves any `path`/`source_path`/`target_path` against the
+context (so `data_copy`/`set_tags`/`create_folder`/... all understand it); `use` alone also accepts a bare
+path with no dot, once a context exists — `"2027"` and `".2027"` narrow it the same way there.
+One or more leading `../` (or a bare `..`) instead walks up that many levels of the context
+first, everywhere a relative path is understood, not just in `use` — `"../water_temperature"` is
+a sibling of the context, `"../../water_temperature"` a level further up. `use` also makes a live
+check that the resolved path actually exists in the catalog, raising if it doesn't, rather than
+silently pointing context somewhere later calls would fail against anyway; `use(None)` clears the
+context. `get_context()` shows what it currently is — always the full resolved path:
+
+```python
+%%catalog use("bwd.reference")
+set_tags(".water_temperature", ["reviewed"])
+create_folder(".2027")    # create_folder still needs the dot — only use() makes it optional
+
+%catalog use("bwd.reference")   # back to a path that already exists
+%catalog use("2027")            # bare, no dot — same as use(".2027"); already created above
+%catalog get_context()          # -> 'bwd.reference.2027'
+%catalog set_tags("../water_temperature", ["archived"])  # ../ works for any verb, not just use()
+```
+
+`get_wiki(path)`, `get_tags(path)`, `list(path)` (every table/view under `path`, at any depth)
+and `schema(path)` (column types + row count) answer immediately, like `get_context()` — nothing
+to commit or undo. `delete_view(path)`/`delete_table(path)` queue like every other write, but —
+unlike the idempotent `DROP ... IF EXISTS` `Catalog.deleteview`/`deletetable` wrap — require
+`path` to already exist, and (like `delete_folder`) can never be undone. Every one of these
+raises `CatalogOperationError` if `path` doesn't exist; `schema` also requires it to be a table
+or view, not a folder:
+
+```python
+%catalog get_wiki("bwd.reference.water_temperature")
+%catalog get_tags("bwd.reference.water_temperature")
+%catalog list("bwd.reference")      # -> ['bwd.reference.water_temperature', ...]
+%catalog schema("bwd.reference.water_temperature")   # -> TableInfo(schema={...}, row_count=...)
+%catalog delete_view("bwd.reference.old_view")
+```
 
 ## Layout
 

@@ -244,8 +244,31 @@ class Catalog:
             idempotency_key=idempotency_key,
         )
 
+    def createview(
+        self,
+        source_path: str,
+        target_path: str,
+        *,
+        overwrite: bool = False,
+        create_target_folder: bool = False,
+        idempotency_key: str,
+    ) -> SqlResult:
+        # Metadata-only (no data moves) — REST, not Flight, like table2view.
+        return operations.createview(
+            self._executor,
+            source_path,
+            target_path,
+            overwrite=overwrite,
+            create_target_folder=create_target_folder,
+            catalog_rest=self._catalog_rest,
+            idempotency_key=idempotency_key,
+        )
+
     def deleteview(self, view_path: str, *, idempotency_key: str) -> SqlResult:
         return operations.deleteview(self._executor, view_path, idempotency_key=idempotency_key)
+
+    def deletetable(self, table_path: str, *, idempotency_key: str) -> SqlResult:
+        return operations.deletetable(self._executor, table_path, idempotency_key=idempotency_key)
 
     def gettablesfrom(self, schema_path: str, *, idempotency_key: str) -> list[str]:
         return operations.gettablesfrom(

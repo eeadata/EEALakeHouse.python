@@ -87,6 +87,7 @@ class FakeCatalogRest:
         raise_on_set_tags: Exception | None = None,
         raise_on_create_folder: Exception | None = None,
         raise_on_delete_folder: Exception | None = None,
+        raise_on_exists: Exception | None = None,
     ) -> None:
         self.existing = set(existing or set())
         self.folders = set(folders or set())
@@ -100,8 +101,11 @@ class FakeCatalogRest:
         self._raise_on_set_tags = raise_on_set_tags
         self._raise_on_create_folder = raise_on_create_folder
         self._raise_on_delete_folder = raise_on_delete_folder
+        self._raise_on_exists = raise_on_exists
 
     def exists(self, path: str) -> bool:
+        if self._raise_on_exists is not None:
+            raise self._raise_on_exists
         return path in self.existing
 
     def is_folder(self, path: str) -> bool:
