@@ -242,50 +242,9 @@ def _is_help(line: str) -> bool:
     return line.strip() in ("help", "help()")
 
 
-def _format_signature(func: Any) -> str:
-    """Render `func`'s signature (minus `self`) the way it reads in source —
-    `inspect.Signature`'s own `str()` wraps string annotations in quotes
-    (they're plain `str`s at runtime because of this module's, and the
-    session modules', `from __future__ import annotations`), which is
-    accurate but noisy for a notebook help message."""
-    sig = inspect.signature(func)
-    parts = []
-    seen_star = False
-    for name, param in sig.parameters.items():
-        if name == "self":
-            continue
-        if param.kind is inspect.Parameter.KEYWORD_ONLY and not seen_star:
-            parts.append("*")
-            seen_star = True
-        piece = name
-        if param.annotation is not inspect.Parameter.empty:
-            piece += f": {param.annotation}"
-        if param.default is not inspect.Parameter.empty:
-            piece += f" = {param.default!r}"
-        parts.append(piece)
-    rendered = f"({', '.join(parts)})"
-    if sig.return_annotation is not inspect.Signature.empty:
-        rendered += f" -> {sig.return_annotation}"
-    return rendered
-
-
-def _print_help(cls: type, methods: list[tuple[str, str]], label: str) -> None:
-    """Print every method in `methods` with its real signature (introspected
-    from `cls`, so it can't drift from the source) and a one-line
-    description. Signatures drop `self`; everything else — parameter names,
-    defaults, `*`-only markers, return types — comes straight from `cls`."""
-    print(f"%{label} methods — usage: {_USAGE[label]}")
-    print()
-    for name, description in methods:
-        print(f"  {name}{_format_signature(getattr(cls, name))}")
-        print(f"      {description}")
-    print()
-    print(f"%{label} help  — show this message")
-
-
 def _plain_params(func: Any) -> str:
     """Comma-separated parameter names (minus `self`), for a non-developer
-    reading `%catalog help`'s table — no Python type-hint syntax (a bare
+    reading `%catalog help`'s/`%ingest help`'s table — no Python type-hint syntax (a bare
     `str | None` union means nothing to a data custodian, and would collide
     visually with the table's own `|` column separators anyway) and no `*`
     keyword-only marker. A parameter with a default is shown as `name=default`
@@ -299,26 +258,35 @@ def _plain_params(func: Any) -> str:
     return ", ".join(parts)
 
 
-_CATALOG_HELP_HEADER_STYLE = (
+_HELP_TABLE_HEADER_STYLE = (
     "text-align:left; padding:4px 12px; border-bottom:2px solid currentColor;"
 )
-_CATALOG_HELP_CELL_STYLE = (
+_HELP_TABLE_CELL_STYLE = (
     "text-align:left; padding:4px 12px; border-bottom:1px solid currentColor; vertical-align:top;"
 )
-_CATALOG_HELP_CODE_STYLE = _CATALOG_HELP_CELL_STYLE + " font-family:monospace; white-space:pre;"
+_HELP_TABLE_CODE_STYLE = _HELP_TABLE_CELL_STYLE + " font-family:monospace; white-space:pre;"
+
+# Catalog-specific: printed once above %catalog help's table, not per-row,
+# since it applies across every path/source_path/target_path. %ingest help
+# has no equivalent note.
+_CATALOG_HELP_NOTE = (
+    "A path/source_path/target_path starting with '.' resolves against the current "
+    "context (see use); one or more leading '../' (or a bare '..') walks up that many "
+    "levels first. Ordinary use already keeps context current on its own."
+)
 
 
-def _catalog_help_html(rows: list[tuple[str, str, str]]) -> str:
-    """Build the `<table>` markup for `%catalog help` — inline styles only
-    (no external stylesheet, no hardcoded background/text color — just
-    `currentColor` borders) so it reads correctly in both a light and a dark
-    notebook theme without knowing which one is active."""
+def _help_table_html(rows: list[tuple[str, str, str]]) -> str:
+    """Build the `<table>` markup shared by `%catalog help`/`%ingest help` —
+    inline styles only (no external stylesheet, no hardcoded background/text
+    color — just `currentColor` borders) so it reads correctly in both a
+    light and a dark notebook theme without knowing which one is active."""
 
     def th(text: str) -> str:
-        return f'<th style="{_CATALOG_HELP_HEADER_STYLE}">{_escape(text)}</th>'
+        return f'<th style="{_HELP_TABLE_HEADER_STYLE}">{_escape(text)}</th>'
 
     def td(text: str, *, code: bool = False) -> str:
-        style = _CATALOG_HELP_CODE_STYLE if code else _CATALOG_HELP_CELL_STYLE
+        style = _HELP_TABLE_CODE_STYLE if code else _HELP_TABLE_CELL_STYLE
         return f'<td style="{style}">{_escape(text)}</td>'
 
     head = f"<tr>{th('Command')}{th('Parameters')}{th('Description')}</tr>"
@@ -329,28 +297,24 @@ def _catalog_help_html(rows: list[tuple[str, str, str]]) -> str:
     return f'<table style="border-collapse:collapse;">{head}{body}</table>'
 
 
-def _print_catalog_help_table() -> None:
-    """`%catalog help` — a real HTML `<table>` (Command / Parameters /
-    Description), rendered via `IPython.display` rather than `_print_help`'s
-    ASCII Python-signature listing: this magic's audience is a data
-    custodian reading it in JupyterLab, not necessarily someone comfortable
-    with a Python type signature or a monospace grid. Only this one magic's
-    help gets the rich-display treatment — everything else in this module
-    stays plain `print()` (see the module docstring's "eval() below runs
-    exactly the Python the user typed" — errors and usage lines are meant to
-    read like ordinary interpreter output, not a UI)."""
-    print(f"%catalog methods — usage: {_USAGE['catalog']}")
-    print(
-        "A path/source_path/target_path starting with '.' resolves against the current "
-        "context (see use); one or more leading '../' (or a bare '..') walks up that many "
-        "levels first. Ordinary use already keeps context current on its own."
-    )
+def _print_help_table(
+    cls: type, methods: list[tuple[str, str]], label: str, *, note: str | None = None
+) -> None:
+    """`%catalog help`/`%ingest help` — a real HTML `<table>` (Command /
+    Parameters / Description), rendered via `IPython.display` rather than a
+    raw Python-signature listing: both magics' audience is a data custodian
+    reading them in JupyterLab, not necessarily someone comfortable with a
+    Python type signature or a monospace grid. Only `help` output gets the
+    rich-display treatment — everything else in this module stays plain
+    `print()` (see the module docstring's "eval() below runs exactly the
+    Python the user typed" — errors and usage lines are meant to read like
+    ordinary interpreter output, not a UI)."""
+    print(f"%{label} methods — usage: {_USAGE[label]}")
+    if note:
+        print(note)
 
-    rows = [
-        (name, _plain_params(getattr(CatalogSession, name)), description)
-        for name, description in _CATALOG_HELP
-    ]
-    display(HTML(_catalog_help_html(rows)))
+    rows = [(name, _plain_params(getattr(cls, name)), description) for name, description in methods]
+    display(HTML(_help_table_html(rows)))
 
 
 def _dispatch(
@@ -461,7 +425,7 @@ class EEALakehouseMagics(Magics):
     @line_magic
     def catalog(self, line: str) -> Any:
         if _is_help(line):
-            _print_catalog_help_table()
+            _print_help_table(CatalogSession, _CATALOG_HELP, "catalog", note=_CATALOG_HELP_NOTE)
             return None
         if not self._ensure_catalog_session():
             return None
@@ -481,7 +445,7 @@ class EEALakehouseMagics(Magics):
         `CatalogSession.use`) instead of repeating a path on every line::
 
             %%catalog use("bwd.reference")
-            tag(".water_temperature", ["reviewed"])
+            set_tags(".water_temperature", ["reviewed"])
             create_folder(".2027")
 
         Each line dispatches exactly like a `%catalog` line-magic call
@@ -512,7 +476,7 @@ class EEALakehouseMagics(Magics):
     @line_magic
     def ingest(self, line: str) -> Any:
         if _is_help(line):
-            _print_help(IngestSession, _INGEST_HELP, "ingest")
+            _print_help_table(IngestSession, _INGEST_HELP, "ingest")
             return None
         if self._ingest_session is None:
             self._ingest_session = IngestSession()
