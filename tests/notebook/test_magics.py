@@ -304,11 +304,24 @@ def test_catalog_help_lists_methods_without_needing_credentials(
 
 
 @pytest.mark.parametrize("line", ["help", "help()"])
-def test_ingest_help_lists_methods(ip: Any, capsys: pytest.CaptureFixture[str], line: str) -> None:
+def test_ingest_help_lists_methods(
+    ip: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], line: str
+) -> None:
+    # Same HTML-table rendering as %catalog help — see that test for why
+    # display() is captured directly rather than via capsys.
+    displayed = []
+    monkeypatch.setattr(magics_module, "display", displayed.append)
+
     ip.run_line_magic("ingest", line)
 
     out = capsys.readouterr().out
     assert "%ingest methods" in out
-    assert "ingest(folder: str | Path, target_catalog_path: str" in out
-    assert "commit(*, retry: bool = False, max_retries: int = 3)" in out
+
+    assert len(displayed) == 1
+    table_html = displayed[0].data
+    assert "Command" in table_html and "Parameters" in table_html and "Description" in table_html
+    assert ">ingest<" in table_html and ">commit<" in table_html
+    assert "folder, target_catalog_path" in table_html
+    assert "retry=False, max_retries=3" in table_html
+    assert "str | None" not in table_html  # no Python type-hint syntax leaking into the table
     assert _magics_instance(ip)._ingest_session is None

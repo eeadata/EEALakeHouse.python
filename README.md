@@ -196,11 +196,10 @@ import eea_datalakehouse.notebook  # registers %catalog/%ingest — no %load_ext
 %ingest commit(retry=True)
 ```
 
-`%catalog help` (or `%catalog help()`) prints every command as a plain table — name,
+`%catalog help` (or `%catalog help()`) renders every command as an HTML table — name,
 parameters, description — rather than a raw Python signature, since its audience is a data
-custodian, not necessarily a developer. `%ingest help` does the same for `IngestSession`,
-listing its (fewer) methods with their real signatures — handy when you don't remember an
-exact parameter name mid-notebook.
+custodian, not necessarily a developer. `%ingest help` does the same for `IngestSession`'s
+(fewer) methods — handy when you don't remember an exact parameter name mid-notebook.
 
 `%%catalog` (the cell-magic form) sets the context once, with `use(path)` on its magic line,
 then runs every other line of the cell in order under that context, without repeating the full
