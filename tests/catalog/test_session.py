@@ -27,7 +27,7 @@ def _isolated_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _catalog(rest: FakeCatalogRest, executor: FakeExecutor | None = None) -> Catalog:
     executor = executor or FakeExecutor()
-    # datacopy/datamove always go over flight_executor — share one FakeExecutor
+    # data_copy/data_move always go over flight_executor — share one FakeExecutor
     # so a test can reason about one single call log regardless of which verb
     # made the call.
     return Catalog(BASE_URL, "pat", executor=executor, flight_executor=executor, catalog_rest=rest)
@@ -47,12 +47,12 @@ def test_commit_runs_queued_steps_in_order_and_clears_the_queue() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.table1"})
     session = CatalogSession(_catalog(rest))
 
-    session.create_folder("bwd.newfolder").tag("bwd.table1", ["reviewed"])
+    session.create_folder("bwd.newfolder").set_tags("bwd.table1", ["reviewed"])
     report = session.commit()
 
     assert report.succeeded == [
         "create folder 'bwd.newfolder'",
-        "tag 'bwd.table1' with ['reviewed']",
+        "set tags ['reviewed'] on 'bwd.table1'",
     ]
     assert rest.created == ["bwd.newfolder"]
     assert rest.get_tags("bwd.table1") == ["reviewed"]
@@ -67,7 +67,7 @@ def test_commit_rolls_back_a_cleanly_reversible_batch_on_failure() -> None:
     # step 1 succeeds and is reversible; step 2 fails because the target
     # already exists and overwrite defaults to False.
     session.create_folder("bwd.newfolder")
-    session.copy("bwd.table1", "bwd.table1")
+    session.data_copy("bwd.table1", "bwd.table1")
 
     with pytest.raises(CatalogCommitError) as exc_info:
         session.commit()
@@ -75,10 +75,64 @@ def test_commit_rolls_back_a_cleanly_reversible_batch_on_failure() -> None:
     error = exc_info.value
     assert error.rolled_back is True
     assert error.unresolved == []
-    assert error.failed_step == "copy 'bwd.table1' -> 'bwd.table1'"
+    assert error.failed_step == "data_copy 'bwd.table1' -> 'bwd.table1'"
     assert rest.created == ["bwd.newfolder"]
     assert rest.deleted == ["bwd.newfolder"]  # step 1's undo ran
     assert repr(session) == "CatalogSession(pending=0)"  # a failed commit still clears the queue
+
+
+def test_data_move_rollback_moves_the_table_back() -> None:
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.table1"})
+    # Six fetch_all calls in order: the forward move's source-exists,
+    # target-empty, and verify-target-exists checks, then the same three
+    # again for the undo's data_move back from table2 to table1.
+    executor = FakeExecutor(
+        rows_sequence=[
+            [{"TABLE_NAME": "table1"}],
+            [],
+            [{"TABLE_NAME": "table2"}],
+            [{"TABLE_NAME": "table2"}],
+            [],
+            [{"TABLE_NAME": "table1"}],
+        ]
+    )
+    session = CatalogSession(_catalog(rest, executor))
+
+    session.data_move("bwd.table1", "bwd.table2")  # reversible
+    session.set_tags("bwd.missing", ["x"])  # fails: path does not exist
+
+    with pytest.raises(CatalogCommitError) as exc_info:
+        session.commit()
+
+    error = exc_info.value
+    assert error.rolled_back is True
+    assert error.failed_step == "set tags ['x'] on 'bwd.missing'"  # step 2 is what actually failed
+    # step 1 (the move) succeeded, then got undone: a data_move back from
+    # table2 to table1, always as a TABLE — no re-detection needed, since
+    # move can no longer create a VIEW either.
+    assert 'CREATE TABLE "bwd"."table1" AS SELECT * FROM "bwd"."table2"' in executor.statements
+    assert 'DROP TABLE "bwd"."table2"' in executor.statements
+
+
+def test_create_view_rollback_drops_the_view() -> None:
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.table1"})
+    executor = FakeExecutor(
+        rows_sequence=[[{"TABLE_NAME": "table1"}], []],  # source-exists, target-empty
+        rows=[{"TABLE_TYPE": "VIEW"}],  # answers the undo's kind-detection lookup
+    )
+    session = CatalogSession(_catalog(rest, executor))
+
+    session.create_view("bwd.table1", "bwd.view1")  # reversible — source is untouched either way
+    session.set_tags("bwd.missing", ["x"])  # fails: path does not exist
+
+    with pytest.raises(CatalogCommitError) as exc_info:
+        session.commit()
+
+    error = exc_info.value
+    assert error.rolled_back is True
+    assert error.failed_step == "set tags ['x'] on 'bwd.missing'"  # step 2 is what actually failed
+    assert 'DROP VIEW IF EXISTS "bwd"."view1"' in executor.statements  # undo: drop what it created
+    assert "bwd.table1" in rest.existing  # source was never touched
 
 
 def test_commit_reports_what_it_could_not_undo() -> None:
@@ -87,8 +141,8 @@ def test_commit_reports_what_it_could_not_undo() -> None:
     session = CatalogSession(_catalog(rest, executor))
 
     session.create_folder("bwd.newfolder")  # reversible
-    session.copy("bwd.table1", "bwd.table1", overwrite=True)  # succeeds, but NOT reversible
-    session.tag("bwd.missing", ["x"])  # fails: path does not exist
+    session.data_copy("bwd.table1", "bwd.table1", overwrite=True)  # succeeds, but NOT reversible
+    session.set_tags("bwd.missing", ["x"])  # fails: path does not exist
 
     with pytest.raises(CatalogCommitError) as exc_info:
         session.commit()
