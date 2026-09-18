@@ -39,12 +39,23 @@ def _catalog(rest: FakeCatalogRest, executor: FakeExecutor | None = None) -> Cat
     return Catalog(BASE_URL, "pat", executor=executor, flight_executor=executor, catalog_rest=rest)
 
 
+def _session(rest: FakeCatalogRest, executor: FakeExecutor | None = None) -> CatalogSession:
+    """A `CatalogSession` with context cleared. This file's fixture paths
+    are short absolute stand-ins (e.g. `"bwd.table1"`) that predate
+    `CatalogSession`'s own default context (the catalog root, per
+    `_ROOT_SOURCE`) — clearing it keeps them absolute rather than
+    silently getting `"catalog."` prepended."""
+    session = CatalogSession(_catalog(rest, executor))
+    session.set_context(None)
+    return session
+
+
 # -- get_wiki -----------------------------------------------------------------
 
 
 def test_get_wiki_returns_the_wiki_text() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.table1"}, wikis={"bwd.table1": "hello"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     assert session.get_wiki("bwd.table1") == "hello"
 
@@ -54,7 +65,7 @@ def test_get_wiki_resolves_a_relative_path() -> None:
         existing={"a", "bwd", "bwd.reference", "bwd.reference.table1"},
         wikis={"bwd.reference.table1": "hi"},
     )
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
     session.use("bwd.reference")
 
     assert session.get_wiki(".table1") == "hi"
@@ -62,7 +73,7 @@ def test_get_wiki_resolves_a_relative_path() -> None:
 
 def test_get_wiki_raises_when_path_does_not_exist() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     with pytest.raises(CatalogOperationError, match="does not exist"):
         session.get_wiki("bwd.missing")
@@ -70,7 +81,7 @@ def test_get_wiki_raises_when_path_does_not_exist() -> None:
 
 def test_get_wiki_does_not_queue_anything() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.table1"}, wikis={"bwd.table1": "hi"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     session.get_wiki("bwd.table1")
 
@@ -82,14 +93,14 @@ def test_get_wiki_does_not_queue_anything() -> None:
 
 def test_get_tags_returns_the_tags() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.table1"}, tags={"bwd.table1": ["reviewed"]})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     assert session.get_tags("bwd.table1") == ["reviewed"]
 
 
 def test_get_tags_raises_when_path_does_not_exist() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     with pytest.raises(CatalogOperationError, match="does not exist"):
         session.get_tags("bwd.missing")
@@ -97,7 +108,7 @@ def test_get_tags_raises_when_path_does_not_exist() -> None:
 
 def test_get_tags_raises_on_a_folder() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.folder1"}, folders={"bwd.folder1"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     with pytest.raises(CatalogOperationError, match="only works on tables/views"):
         session.get_tags("bwd.folder1")
@@ -111,7 +122,7 @@ def test_list_returns_full_paths() -> None:
     executor = FakeExecutor(
         rows=[{"TABLE_SCHEMA": "bwd.reference", "TABLE_NAME": "water_temperature"}]
     )
-    session = CatalogSession(_catalog(rest, executor))
+    session = _session(rest, executor)
 
     assert session.list("bwd.reference") == ["bwd.reference.water_temperature"]
 
@@ -119,7 +130,7 @@ def test_list_returns_full_paths() -> None:
 def test_list_resolves_a_relative_path() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference"})
     executor = FakeExecutor(rows=[])
-    session = CatalogSession(_catalog(rest, executor))
+    session = _session(rest, executor)
     session.use("bwd")
 
     session.list(".reference")  # must not raise — "bwd.reference" exists
@@ -134,7 +145,7 @@ def test_list_resolves_a_bare_relative_path_too() -> None:
     # one exception — see test_session_context.py).
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference"})
     executor = FakeExecutor(rows=[])
-    session = CatalogSession(_catalog(rest, executor))
+    session = _session(rest, executor)
     session.use("bwd")
 
     session.list("reference")  # bare, no dot — still resolves to "bwd.reference"
@@ -147,7 +158,7 @@ def test_list_with_no_path_lists_the_context_itself() -> None:
     executor = FakeExecutor(
         rows=[{"TABLE_SCHEMA": "bwd.reference", "TABLE_NAME": "water_temperature"}]
     )
-    session = CatalogSession(_catalog(rest, executor))
+    session = _session(rest, executor)
     session.use("bwd.reference")
 
     assert session.list() == ["bwd.reference.water_temperature"]
@@ -156,7 +167,7 @@ def test_list_with_no_path_lists_the_context_itself() -> None:
 def test_list_with_empty_path_lists_the_context_itself() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference"})
     executor = FakeExecutor(rows=[])
-    session = CatalogSession(_catalog(rest, executor))
+    session = _session(rest, executor)
     session.use("bwd.reference")
 
     session.list("")  # explicit empty string — same as omitting path
@@ -166,7 +177,7 @@ def test_list_with_empty_path_lists_the_context_itself() -> None:
 
 def test_list_with_no_path_and_no_context_raises() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     with pytest.raises(CatalogSessionError, match="no context is set"):
         session.list()
@@ -177,7 +188,7 @@ def test_list_absolute_path_still_works_with_no_context() -> None:
     executor = FakeExecutor(
         rows=[{"TABLE_SCHEMA": "bwd.reference", "TABLE_NAME": "water_temperature"}]
     )
-    session = CatalogSession(_catalog(rest, executor))
+    session = _session(rest, executor)
 
     assert session.list("bwd.reference") == ["bwd.reference.water_temperature"]
 
@@ -186,7 +197,7 @@ def test_list_raises_when_path_does_not_exist() -> None:
     # Unlike the raw gettablesfrom (which would just return []), list()
     # checks first rather than treating a typo as "nothing found".
     rest = FakeCatalogRest(existing={"a", "bwd"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     with pytest.raises(CatalogOperationError, match="does not exist"):
         session.list("bwd.missing")
@@ -200,7 +211,7 @@ def test_schema_returns_table_info() -> None:
     executor = FakeExecutor(
         rows_sequence=[[{"COLUMN_NAME": "id", "DATA_TYPE": "INTEGER"}], [{"row_count": 5}]]
     )
-    session = CatalogSession(_catalog(rest, executor))
+    session = _session(rest, executor)
 
     assert session.schema("bwd.table1") == TableInfo(schema={"id": "INTEGER"}, row_count=5)
 
@@ -208,7 +219,7 @@ def test_schema_returns_table_info() -> None:
 def test_schema_raises_on_a_folder() -> None:
     # The explicit requirement: schema() only works on a table or view.
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.folder1"}, folders={"bwd.folder1"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     with pytest.raises(CatalogOperationError, match="only works on tables/views"):
         session.schema("bwd.folder1")
@@ -216,7 +227,7 @@ def test_schema_raises_on_a_folder() -> None:
 
 def test_schema_raises_when_path_does_not_exist() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     with pytest.raises(CatalogOperationError, match="does not exist"):
         session.schema("bwd.missing")
@@ -228,7 +239,7 @@ def test_schema_raises_when_path_does_not_exist() -> None:
 def test_delete_view_drops_the_view() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.view1"})
     executor = FakeExecutor()
-    session = CatalogSession(_catalog(rest, executor))
+    session = _session(rest, executor)
 
     session.delete_view("bwd.view1")
     report = session.commit()
@@ -240,7 +251,7 @@ def test_delete_view_drops_the_view() -> None:
 def test_delete_view_resolves_a_relative_path() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference", "bwd.reference.view1"})
     executor = FakeExecutor()
-    session = CatalogSession(_catalog(rest, executor))
+    session = _session(rest, executor)
     session.use("bwd.reference")
 
     session.delete_view(".view1")
@@ -253,7 +264,7 @@ def test_delete_view_raises_when_path_does_not_exist() -> None:
     # Unlike the raw Catalog.deleteview (DROP VIEW IF EXISTS — a no-op on a
     # missing path), CatalogSession.delete_view requires it to be real.
     rest = FakeCatalogRest(existing={"a", "bwd"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
     session.delete_view("bwd.missing")
 
     with pytest.raises(CatalogCommitError, match="does not exist"):
@@ -262,7 +273,7 @@ def test_delete_view_raises_when_path_does_not_exist() -> None:
 
 def test_delete_view_is_never_reversible() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.view1"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     session.delete_view("bwd.view1")  # succeeds, but not reversible
     session.set_tags("bwd.missing", ["x"])  # fails: path does not exist
@@ -282,7 +293,7 @@ def test_delete_view_is_never_reversible() -> None:
 def test_delete_table_drops_the_table() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.table1"})
     executor = FakeExecutor()
-    session = CatalogSession(_catalog(rest, executor))
+    session = _session(rest, executor)
 
     session.delete_table("bwd.table1")
     report = session.commit()
@@ -293,7 +304,7 @@ def test_delete_table_drops_the_table() -> None:
 
 def test_delete_table_raises_when_path_does_not_exist() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
     session.delete_table("bwd.missing")
 
     with pytest.raises(CatalogCommitError, match="does not exist"):
@@ -302,7 +313,7 @@ def test_delete_table_raises_when_path_does_not_exist() -> None:
 
 def test_delete_table_is_never_reversible() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.table1"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     session.delete_table("bwd.table1")  # succeeds, but not reversible
     session.set_tags("bwd.missing", ["x"])  # fails: path does not exist

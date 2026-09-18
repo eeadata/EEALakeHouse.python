@@ -1,9 +1,10 @@
 """CatalogSession's "current path" context: relative paths (a leading `.`),
-auto-inferred from usage, `set_context()` as an explicit seed.
+set only via `use()`/`set_context()` — no other verb ever changes it, even
+though most resolve their own `path` against it.
 
-See src/eea_datalakehouse/catalog/session.py's `_resolve`/`_resolve_path`
-and docs/notebook-facade-for-data-scientists.md ("Pre-filling catalog
-context").
+See src/eea_datalakehouse/catalog/session.py's `use`/`set_context`/
+`_resolve_path` and docs/notebook-facade-for-data-scientists.md
+("Pre-filling catalog context").
 """
 
 from __future__ import annotations
@@ -31,30 +32,52 @@ def _catalog(rest: FakeCatalogRest, executor: FakeExecutor | None = None) -> Cat
     return Catalog(BASE_URL, "pat", executor=executor, flight_executor=executor, catalog_rest=rest)
 
 
+def _session(rest: FakeCatalogRest, executor: FakeExecutor | None = None) -> CatalogSession:
+    """A `CatalogSession` with context cleared. This file's fixture paths
+    are short absolute stand-ins (e.g. `"bwd.table1"`) that predate
+    `CatalogSession`'s own default context (the catalog root, per
+    `_ROOT_SOURCE`) — clearing it keeps them absolute rather than
+    silently getting `"catalog."` prepended. Tests that exercise the
+    "no context set yet" error paths, or the new default itself, construct
+    a plain `CatalogSession(_catalog(rest))` directly instead."""
+    session = CatalogSession(_catalog(rest, executor))
+    session.set_context(None)
+    return session
+
+
+def test_new_session_defaults_context_to_the_catalog_root() -> None:
+    # A freshly built session already has something to resolve a relative
+    # path against — the catalog root — rather than None; use()/
+    # set_context(None) are still the only way to clear it explicitly.
+    rest = FakeCatalogRest(existing={"a"})
+    session = CatalogSession(_catalog(rest))
+
+    assert session.get_context() == "catalog"
+
+
 def test_relative_path_without_any_context_raises() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.table1"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     with pytest.raises(CatalogSessionError, match="no context is set"):
         session.set_tags(".table1", ["reviewed"])
 
 
-def test_touching_a_leaf_infers_context_for_a_later_relative_call() -> None:
+def test_ordinary_verbs_never_change_or_infer_the_context() -> None:
+    # Only use()/set_context() may change context — set_tags below fully
+    # resolves an absolute path, but that never becomes the new context
+    # (unlike the old "ordinary use keeps context current" behaviour), so
+    # a later relative call still has nothing to resolve against.
     rest = FakeCatalogRest(
         existing={"a", "bwd", "bwd.reference.water_temperature", "bwd.reference.stations"}
     )
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
-    session.set_tags("bwd.reference.water_temperature", ["reviewed"])  # -> bwd.reference
-    session.set_tags(".stations", ["reviewed"])  # resolves to bwd.reference.stations
+    session.set_tags("bwd.reference.water_temperature", ["reviewed"])
 
-    report = session.commit()
-
-    assert report.succeeded == [
-        "set tags ['reviewed'] on 'bwd.reference.water_temperature'",
-        "set tags ['reviewed'] on 'bwd.reference.stations'",
-    ]
-    assert rest.get_tags("bwd.reference.stations") == ["reviewed"]
+    assert session.get_context() is None
+    with pytest.raises(CatalogSessionError, match="no context is set"):
+        session.set_tags(".stations", ["reviewed"])
 
 
 def test_bare_path_starting_with_root_source_stays_absolute_even_with_context_set() -> None:
@@ -148,49 +171,191 @@ def test_use_always_takes_a_bare_path_literally() -> None:
     assert session.get_context() == "bwd.other"
 
 
-def test_use_none_clears_context_like_set_context() -> None:
+def test_use_none_or_empty_resets_context_to_the_catalog_root() -> None:
+    # Unlike set_context(None) (still "no context at all"), use(None)/
+    # use("") reset to _ROOT_SOURCE — the same starting point a freshly
+    # built session already has (see test_new_session_defaults_context_to_the_catalog_root).
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference", "bwd.other"})
     session = CatalogSession(_catalog(rest))
 
     session.use("bwd.reference")
     session.use(None)
 
-    assert session.get_context() is None
+    assert session.get_context() == "catalog"
 
     session.use("bwd.other")
-    assert session.get_context() == "bwd.other"
+    session.use("")
+
+    assert session.get_context() == "catalog"
 
 
-def test_get_context_reflects_state_set_by_other_verbs() -> None:
-    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference.water_temperature"})
+def test_set_context_none_still_clears_context_entirely() -> None:
+    # set_context (the lower-level primitive, not normally called by a data
+    # custodian directly) keeps the old "no context at all" behaviour —
+    # only use()'s own None/"" handling changed.
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference"})
     session = CatalogSession(_catalog(rest))
+
+    session.use("bwd.reference")
+    session.set_context(None)
 
     assert session.get_context() is None
 
-    session.set_tags("bwd.reference.water_temperature", ["reviewed"])  # auto-updates context
 
-    assert session.get_context() == "bwd.reference"
-
-
-def test_create_folder_context_becomes_the_folder_itself_not_its_parent() -> None:
+def test_get_context_is_unaffected_by_other_verbs() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference.water_temperature"})
+    session = _session(rest)
+
+    assert session.get_context() is None
+
+    session.set_tags("bwd.reference.water_temperature", ["reviewed"])
+
+    assert session.get_context() is None
+
+
+def test_create_folder_does_not_change_the_context() -> None:
+    # The exact case reported: create_folder used to leave its own path as
+    # the new context (a deliberate design choice at the time), which then
+    # surprised a custodian who only ever wanted that to come from use().
+    rest = FakeCatalogRest(existing={"a", "bwd"})
+    session = _session(rest)
+
+    session.create_folder("bwd.reference.2027", create_parents=True)
+
+    assert session.get_context() is None
+
+    session.use("bwd")
+    session.create_folder(".reference")  # relative to the context use() set
+
+    assert session.get_context() == "bwd"  # still what use() set — create_folder didn't touch it
+
+
+def test_create_folder_and_delete_folder_resolve_a_bare_relative_path() -> None:
+    # Same dot-optional resolution as every other single-path verb: a bare
+    # path with no leading '.' still appends to the context once one exists.
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference"})
     session = CatalogSession(_catalog(rest))
 
-    session.create_folder("bwd.reference.2027", create_parents=True)  # context -> that folder
-    session.set_context("bwd.reference")  # re-seed for the rest of this test
-    session.set_tags(".water_temperature", ["reviewed"])
+    session.use("bwd.reference")
+    session.create_folder("2027")  # bare, no dot — still bwd.reference.2027
+    session.delete_folder("2027")
 
     report = session.commit()
 
     assert report.succeeded == [
         "create folder 'bwd.reference.2027'",
-        "set tags ['reviewed'] on 'bwd.reference.water_temperature'",
+        "delete folder 'bwd.reference.2027'",
     ]
 
 
-def test_data_copy_resolves_both_paths_against_the_same_starting_context() -> None:
+def test_create_folder_and_delete_folder_keep_a_root_source_path_absolute() -> None:
+    # "catalog" is this deployment's one real top-level source (_ROOT_SOURCE)
+    # — a bare path starting with it is unambiguous, so it's never appended
+    # to an existing context (see test_bare_path_starting_with_root_source_
+    # stays_absolute_even_with_context_set for the general rule).
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference", "catalog", "catalog.other_root"})
+    session = CatalogSession(_catalog(rest))
+
+    session.use("bwd.reference")
+    session.create_folder("catalog.other_root.new_folder")
+    session.delete_folder("catalog.other_root.new_folder")
+
+    report = session.commit()
+
+    assert report.succeeded == [
+        "create folder 'catalog.other_root.new_folder'",
+        "delete folder 'catalog.other_root.new_folder'",
+    ]
+
+
+def test_queued_write_verbs_resolve_relative_and_root_source_absolute_paths() -> None:
+    # set_wiki/delete_wiki/set_tags/delete_tags/delete_view/delete_table all
+    # share the exact same _resolve_path call as every other verb — a bare
+    # relative name appends to context, a catalog.-prefixed path stays
+    # absolute even with a context set.
     rest = FakeCatalogRest(
-        existing={"a", "bwd", "bwd.draft.raw_2026", "bwd.reference", "bwd.reference.stations"}
+        existing={
+            "a",
+            "bwd",
+            "bwd.reference",
+            "bwd.reference.table1",
+            "bwd.reference.view1",
+            "catalog",
+            "catalog.other_root",
+            "catalog.other_root.table1",
+            "catalog.other_root.view1",
+        }
+    )
+    session = CatalogSession(_catalog(rest))
+
+    session.use("bwd.reference")
+    session.set_wiki("table1", "hello")  # relative
+    session.set_wiki("catalog.other_root.table1", "hello, absolute")  # absolute
+    session.delete_wiki("table1")
+    session.delete_wiki("catalog.other_root.table1")
+    session.set_tags("table1", ["x"])
+    session.set_tags("catalog.other_root.table1", ["x-abs"])
+    session.delete_tags("table1", ["x"])
+    session.delete_tags("catalog.other_root.table1", ["x-abs"])
+    session.delete_view("view1")
+    session.delete_view("catalog.other_root.view1")
+    session.delete_table("table1")
+    session.delete_table("catalog.other_root.table1")
+
+    report = session.commit()
+
+    assert report.succeeded == [
+        "set wiki on 'bwd.reference.table1'",
+        "set wiki on 'catalog.other_root.table1'",
+        "delete wiki on 'bwd.reference.table1'",
+        "delete wiki on 'catalog.other_root.table1'",
+        "set tags ['x'] on 'bwd.reference.table1'",
+        "set tags ['x-abs'] on 'catalog.other_root.table1'",
+        "delete tags ['x'] from 'bwd.reference.table1'",
+        "delete tags ['x-abs'] from 'catalog.other_root.table1'",
+        "delete view 'bwd.reference.view1'",
+        "delete view 'catalog.other_root.view1'",
+        "delete table 'bwd.reference.table1'",
+        "delete table 'catalog.other_root.table1'",
+    ]
+
+
+def test_read_only_verbs_resolve_relative_and_root_source_absolute_paths() -> None:
+    # get_wiki/get_tags aren't queued, but resolve their own path the same
+    # dot-optional, root-source-aware way as every write verb.
+    rest = FakeCatalogRest(
+        existing={
+            "a",
+            "bwd",
+            "bwd.reference",
+            "bwd.reference.table1",
+            "catalog",
+            "catalog.other_root",
+            "catalog.other_root.table1",
+        },
+        wikis={"bwd.reference.table1": "hi", "catalog.other_root.table1": "hi, absolute"},
+        tags={"bwd.reference.table1": ["x"], "catalog.other_root.table1": ["x-abs"]},
+    )
+    session = CatalogSession(_catalog(rest))
+
+    session.use("bwd.reference")
+
+    assert session.get_wiki("table1") == "hi"  # relative
+    assert session.get_wiki("catalog.other_root.table1") == "hi, absolute"  # absolute
+    assert session.get_tags("table1") == ["x"]  # relative
+    assert session.get_tags("catalog.other_root.table1") == ["x-abs"]  # absolute
+
+
+def test_data_copy_resolves_both_paths_against_the_current_context() -> None:
+    rest = FakeCatalogRest(
+        existing={
+            "a",
+            "bwd",
+            "bwd.draft.raw_2026",
+            "catalog",
+            "catalog.other_root",
+            "catalog.other_root.water_temperature",
+        }
     )
     executor = FakeExecutor(
         rows_sequence=[
@@ -201,24 +366,23 @@ def test_data_copy_resolves_both_paths_against_the_same_starting_context() -> No
     session = CatalogSession(_catalog(rest, executor))
 
     session.set_context("bwd.draft")
-    session.data_copy(".raw_2026", "bwd.reference.water_temperature")  # target NOT under bwd.draft
-    session.set_tags(".stations", ["reviewed"])  # resolves against the target's parent
+    session.data_copy(".raw_2026", "catalog.other_root.water_temperature")  # NOT under bwd.draft
 
     report = session.commit()
 
     assert report.succeeded == [
-        "data_copy 'bwd.draft.raw_2026' -> 'bwd.reference.water_temperature'",
-        "set tags ['reviewed'] on 'bwd.reference.stations'",
+        "data_copy 'bwd.draft.raw_2026' -> 'catalog.other_root.water_temperature'",
     ]
+    assert session.get_context() == "bwd.draft"  # data_copy never changes it
 
 
-def test_data_copy_bare_target_path_stays_absolute_even_with_context_set() -> None:
-    # data_copy/data_move/create_view are the deliberate exception to the
-    # dot-optional rule: they resolve source_path/target_path independently
-    # against the same starting context, so a bare path must stay absolute
-    # even with a context set — otherwise pairing a relative source with a
-    # genuinely unrelated absolute target would be inexpressible.
-    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.draft.raw_2026", "other.reference"})
+def test_data_copy_resolves_a_bare_relative_path_for_both_paths() -> None:
+    # data_copy/data_move/create_view are no longer an exception to the
+    # dot-optional rule — a bare path resolves relative to context here
+    # too, same as every other verb, since a genuinely absolute path in
+    # this deployment always starts with _ROOT_SOURCE and so is never
+    # ambiguous with a deliberately relative one in the same call.
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference", "bwd.reference.raw_2026"})
     executor = FakeExecutor(
         rows_sequence=[
             [{"TABLE_NAME": "raw_2026"}],  # source exists
@@ -227,19 +391,26 @@ def test_data_copy_bare_target_path_stays_absolute_even_with_context_set() -> No
     )
     session = CatalogSession(_catalog(rest, executor))
 
-    session.set_context("bwd.draft")
-    session.data_copy(".raw_2026", "other.reference.water_temperature")  # bare, unrelated root
+    session.use("bwd.reference")
+    session.data_copy("raw_2026", "archive")  # bare, no dot — both resolve under bwd.reference
 
     report = session.commit()
 
     assert report.succeeded == [
-        "data_copy 'bwd.draft.raw_2026' -> 'other.reference.water_temperature'",
+        "data_copy 'bwd.reference.raw_2026' -> 'bwd.reference.archive'",
     ]
 
 
-def test_data_move_resolves_both_paths_against_the_same_starting_context() -> None:
+def test_data_move_resolves_both_paths_against_the_current_context() -> None:
     rest = FakeCatalogRest(
-        existing={"a", "bwd", "bwd.draft.raw_2026", "bwd.reference", "bwd.reference.stations"}
+        existing={
+            "a",
+            "bwd",
+            "bwd.draft.raw_2026",
+            "catalog",
+            "catalog.other_root",
+            "catalog.other_root.water_temperature",
+        }
     )
     executor = FakeExecutor(
         rows_sequence=[
@@ -251,20 +422,47 @@ def test_data_move_resolves_both_paths_against_the_same_starting_context() -> No
     session = CatalogSession(_catalog(rest, executor))
 
     session.set_context("bwd.draft")
-    session.data_move(".raw_2026", "bwd.reference.water_temperature")  # target NOT under bwd.draft
-    session.set_tags(".stations", ["reviewed"])  # resolves against the target's parent
+    session.data_move(".raw_2026", "catalog.other_root.water_temperature")  # NOT under bwd.draft
 
     report = session.commit()
 
     assert report.succeeded == [
-        "data_move 'bwd.draft.raw_2026' -> 'bwd.reference.water_temperature'",
-        "set tags ['reviewed'] on 'bwd.reference.stations'",
+        "data_move 'bwd.draft.raw_2026' -> 'catalog.other_root.water_temperature'",
+    ]
+    assert session.get_context() == "bwd.draft"  # data_move never changes it
+
+
+def test_data_move_resolves_a_bare_relative_path_for_both_paths() -> None:
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference", "bwd.reference.raw_2026"})
+    executor = FakeExecutor(
+        rows_sequence=[
+            [{"TABLE_NAME": "raw_2026"}],  # source exists
+            [],  # target does not exist yet
+            [{"TABLE_NAME": "archive"}],  # verify target exists after the move
+        ]
+    )
+    session = CatalogSession(_catalog(rest, executor))
+
+    session.use("bwd.reference")
+    session.data_move("raw_2026", "archive")  # bare, no dot — both resolve under bwd.reference
+
+    report = session.commit()
+
+    assert report.succeeded == [
+        "data_move 'bwd.reference.raw_2026' -> 'bwd.reference.archive'",
     ]
 
 
-def test_create_view_resolves_both_paths_against_the_same_starting_context() -> None:
+def test_create_view_resolves_both_paths_against_the_current_context() -> None:
     rest = FakeCatalogRest(
-        existing={"a", "bwd", "bwd.draft.raw_2026", "bwd.reference", "bwd.reference.stations"}
+        existing={
+            "a",
+            "bwd",
+            "bwd.draft.raw_2026",
+            "catalog",
+            "catalog.other_root",
+            "catalog.other_root.water_temperature",
+        }
     )
     executor = FakeExecutor(
         rows_sequence=[
@@ -275,40 +473,101 @@ def test_create_view_resolves_both_paths_against_the_same_starting_context() -> 
     session = CatalogSession(_catalog(rest, executor))
 
     session.set_context("bwd.draft")
-    session.create_view(".raw_2026", "bwd.reference.water_temperature")  # target NOT bwd.draft
-    session.set_tags(".stations", ["reviewed"])  # resolves against the target's parent
+    session.create_view(".raw_2026", "catalog.other_root.water_temperature")  # target NOT bwd.draft
 
     report = session.commit()
 
     assert report.succeeded == [
-        "create view 'bwd.draft.raw_2026' -> 'bwd.reference.water_temperature'",
-        "set tags ['reviewed'] on 'bwd.reference.stations'",
+        "create view 'bwd.draft.raw_2026' -> 'catalog.other_root.water_temperature'",
     ]
+    assert session.get_context() == "bwd.draft"  # create_view never changes it
+
+
+def test_create_view_resolves_a_bare_relative_path_for_both_paths() -> None:
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference", "bwd.reference.raw_2026"})
+    executor = FakeExecutor(
+        rows_sequence=[
+            [{"TABLE_NAME": "raw_2026"}],  # source exists
+            [],  # target does not exist yet
+        ]
+    )
+    session = CatalogSession(_catalog(rest, executor))
+
+    session.use("bwd.reference")
+    session.create_view("raw_2026", "archive")  # bare, no dot — both resolve under bwd.reference
+
+    report = session.commit()
+
+    assert report.succeeded == [
+        "create view 'bwd.reference.raw_2026' -> 'bwd.reference.archive'",
+    ]
+
+
+def test_bare_dot_resolves_to_the_context_itself() -> None:
+    # "." alone used to append a stray trailing "." to the context instead
+    # of meaning the context itself — get_wiki (a read-only verb, so the
+    # resolved path is directly observable rather than via a step
+    # description) proves the fix rather than just _resolve_path directly.
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference"}, wikis={"bwd.reference": "hi"})
+    session = CatalogSession(_catalog(rest))
+
+    session.use("bwd.reference")
+
+    assert session.get_wiki(".") == "hi"
+    assert session.get_wiki("./") == "hi"
+
+
+def test_bare_dot_with_no_context_yet_raises() -> None:
+    rest = FakeCatalogRest(existing={"a", "bwd"})
+    session = _session(rest)
+
+    with pytest.raises(CatalogSessionError, match="no context is set"):
+        session.get_wiki(".")
+
+
+def test_dot_slash_name_means_the_same_as_dot_name() -> None:
+    rest = FakeCatalogRest(
+        existing={"a", "bwd", "bwd.reference", "bwd.reference.water_temperature"},
+        wikis={"bwd.reference.water_temperature": "hi"},
+    )
+    session = CatalogSession(_catalog(rest))
+
+    session.use("bwd.reference")
+
+    assert session.get_wiki("./water_temperature") == "hi"
 
 
 def test_bare_dotdot_resolves_to_the_parent_of_the_context() -> None:
     # use() no longer accepts '..' at all (see test_use_never_resolves_a_
     # leading_dot_relatively) — create_folder exercises the same
     # _resolve_path/_resolve_parent_path machinery every other verb shares.
+    # It never changes context though, so the resolution is checked via
+    # the committed step's own description, not get_context().
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference", "bwd.reference.2027"})
     session = CatalogSession(_catalog(rest))
 
     session.use("bwd.reference.2027")
     session.create_folder("..")
 
-    assert session.get_context() == "bwd.reference"
+    report = session.commit()
+
+    assert report.succeeded == ["create folder 'bwd.reference'"]
+    assert session.get_context() == "bwd.reference.2027"  # unchanged — still what use() set
 
 
 def test_dotdot_slash_name_resolves_to_a_sibling_of_the_context() -> None:
     rest = FakeCatalogRest(
-        existing={"a", "bwd", "bwd.reference.2027.stations", "bwd.reference.2027.water_temp"}
+        existing={"a", "bwd", "bwd.reference.2027", "bwd.reference.2027.stations"}
     )
     session = CatalogSession(_catalog(rest))
 
     session.use("bwd.reference.2027.stations")
     session.create_folder("../water_temp")  # sibling of the current context
 
-    assert session.get_context() == "bwd.reference.2027.water_temp"
+    report = session.commit()
+
+    assert report.succeeded == ["create folder 'bwd.reference.2027.water_temp'"]
+    assert session.get_context() == "bwd.reference.2027.stations"  # unchanged
 
 
 def test_chained_dotdot_walks_up_multiple_levels() -> None:
@@ -319,13 +578,15 @@ def test_chained_dotdot_walks_up_multiple_levels() -> None:
 
     session.use("bwd.reference.2027.stations")
     session.create_folder("../../../archive")  # up three levels, then into "archive"
+    session.create_folder("../..")  # up two levels, no name after it — still off the same context
 
-    assert session.get_context() == "bwd.archive"
+    report = session.commit()
 
-    session.set_context("bwd.reference.2027.stations")  # re-seed for the second half
-    session.create_folder("../..")  # up two levels, no name after it
-
-    assert session.get_context() == "bwd.reference"
+    assert report.succeeded == [
+        "create folder 'bwd.archive'",
+        "create folder 'bwd.reference'",
+    ]
+    assert session.get_context() == "bwd.reference.2027.stations"  # unchanged throughout
 
 
 def test_dotdot_past_the_top_of_the_context_raises() -> None:
@@ -340,7 +601,7 @@ def test_dotdot_past_the_top_of_the_context_raises() -> None:
 
 def test_dotdot_with_no_context_yet_raises() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     with pytest.raises(CatalogSessionError, match="no context is set"):
         session.create_folder("../reference")
@@ -366,18 +627,7 @@ def test_dotdot_works_for_ordinary_verbs() -> None:
     report = session.commit()
 
     assert report.succeeded == ["set tags ['reviewed'] on 'bwd.reference.water_temperature'"]
-
-
-def test_get_context_after_dotdot_is_the_full_resolved_path() -> None:
-    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference", "bwd.reference.2027"})
-    session = CatalogSession(_catalog(rest))
-
-    session.use("bwd.reference.2027")
-    session.create_folder("..")
-
-    context = session.get_context()
-    assert context == "bwd.reference"
-    assert not context.startswith(".")  # never a raw relative fragment
+    assert session.get_context() == "bwd.reference.2027"  # set_tags never changes it
 
 
 def test_use_raises_when_the_resolved_path_does_not_exist() -> None:

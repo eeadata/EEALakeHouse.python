@@ -29,14 +29,38 @@ def test_exists_false_on_404() -> None:
 
 
 @respx.mock
-def test_exists_raises_on_other_errors() -> None:
+def test_exists_false_on_other_errors() -> None:
+    # Best-effort, same as is_folder/is_table_or_view below — a lookup
+    # failure can't be told apart from "not found", so it's never raised.
     respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
         return_value=httpx.Response(500, text="boom")
     )
     client = CatalogRestClient(BASE_URL, "pat")
 
-    with pytest.raises(CatalogOperationError):
-        client.exists("a.b")
+    assert client.exists("a.b") is False
+
+
+@respx.mock
+def test_exists_false_on_a_broken_by_path_lookup_rather_than_raising() -> None:
+    # The real error this project hit: a Dremio source type whose by-path
+    # lookup rejects a nested, not-yet-created item with a 400, not a 404 —
+    # this is what let CatalogSession.create_folder's own "is it already
+    # there?" check block folder creation outright (see
+    # test_session_context.py's create_folder/delete_folder coverage).
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/catalog/deep/nested").mock(
+        return_value=httpx.Response(
+            400,
+            json={
+                "errorMessage": (
+                    "Can not get internal item from non-filesystem source [catalog] "
+                    "of type [com.dremio.plugins.dremiocatalog.store.DremioCatalogLocalPlugin]"
+                )
+            },
+        )
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert client.exists("catalog.deep.nested") is False
 
 
 @respx.mock

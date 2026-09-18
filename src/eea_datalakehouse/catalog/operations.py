@@ -953,7 +953,16 @@ def setwikito(
     appended to `text` before it's sent (see `_render_wiki_metadata`). The
     rendered text, metadata included, is what a retry remembers and
     re-sends — `tags` itself is never persisted to retry_state.
+
+    Ignored outright when `path` is a table or view: those already have
+    Dremio's own native tags/labels (`settagsto`/`gettagsfrom`) for exactly
+    this — the wiki Meta Data convention exists only because a *folder*
+    has no such native concept (see `get_tags`' own docstring). Silently
+    dropped rather than raised, since a caller passing `tags` alongside a
+    table/view `path` almost certainly meant `settagsto`, not this.
     """
+    if tags and catalog_rest.is_table_or_view(path):
+        tags = None
     if tags:
         _validate_tags(tags)
         text = f"{text}\n\n{_render_wiki_metadata(tags)}"
@@ -1244,6 +1253,7 @@ def createfolder(
 
 
 def deletefolder(
+    executor: SqlExecutor,
     catalog_rest: CatalogRestClient,
     path: str,
     *,
@@ -1252,15 +1262,35 @@ def deletefolder(
 ) -> None:
     """Delete the folder at `path`.
 
-    REST-only (see module docstring) — folder deletion has no SQL or
-    Flight equivalent. Idempotent: a folder that's already gone is not an
-    error. `cascade=False` (the default) raises `CatalogOperationError` if
-    the folder still has contents — `rmdir` vs `rm -r`. `cascade=True`
-    deletes every table/view and subfolder inside first, depth-first, then
-    the folder itself (see `CatalogRestClient.delete_folder`).
+    Folder deletion itself has no SQL or Flight equivalent, so the folder
+    (and any subfolder) always goes through `catalog_rest` directly.
+    Idempotent: a folder that's already gone is not an error.
+    `cascade=False` (the default) raises `CatalogOperationError` if the
+    folder still has contents — `rmdir` vs `rm -r`. `cascade=True` deletes
+    every table/view and subfolder inside first, depth-first, then the
+    folder itself (see `CatalogRestClient.delete_folder`) — a dataset child
+    goes through the same SQL `DROP TABLE`/`DROP VIEW` `deletetable`/
+    `deleteview` themselves use (`_entry_kind` tells the two apart via
+    INFORMATION_SCHEMA), not the REST catalog API's own generic delete,
+    which this project has never confirmed actually drops a *physical*
+    table's underlying data rather than just forgetting its catalog entry.
     """
+    step = 0
+
+    def delete_dataset(dataset_path: str) -> None:
+        nonlocal step
+        step += 1
+        sub_key = f"{idempotency_key}-cascade-{step}"
+        kind = _entry_kind(executor, dataset_path, idempotency_key=sub_key)
+        if kind == "VIEW":
+            deleteview(executor, dataset_path, idempotency_key=sub_key)
+        else:
+            deletetable(executor, dataset_path, idempotency_key=sub_key)
+
     try:
-        catalog_rest.delete_folder(path, cascade=cascade)
+        catalog_rest.delete_folder(
+            path, cascade=cascade, delete_dataset=delete_dataset if cascade else None
+        )
     except EngineStartingError as exc:
         retry_state.record(
             idempotency_key, "deletefolder", path, str(exc), params={"path": path, "cascade": cascade}
