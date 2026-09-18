@@ -8,7 +8,7 @@ Idea note, not a plan — captures a discussion, nothing here is agreed or sched
 commit" and "Two sessions, not one" below; `%catalog`/`%ingest`
 (`src/eea_datalakehouse/notebook/magics.py`) implement "Two magics, two
 sessions" and "Loading the magics without typing a magic to do it" over them;
-relative-path context (a leading `.`, auto-inferred from usage, plus a Comm
+relative-path context (a leading `.`, set explicitly via `use`, plus a Comm
 channel for an integration to push it invisibly) implements "Pre-filling
 catalog context" — see `docs/notebooks/catalog_session_example.ipynb` and
 `docs/notebooks/ingest_session_example.ipynb` for worked examples. Still just
@@ -23,14 +23,11 @@ behaviour described below is unchanged; there's just no longer a separate
 still queues/commits as described throughout this doc. Context has also
 grown past what's described below: `use(path)` (also via `%%catalog
 use(path)`, the cell-magic form) sets it deliberately — making a live
-check that the resolved path exists in the catalog first, unlike
-everything else here, and always storing the full resolved path, never a
-raw `.`/`..`-prefixed fragment — `get_context()` reads it back, and a
-leading `../` (or a bare `..`) on any relative path, not just inside
-`use`, walks up that many levels of the context first. `copy`/`move` were
-later renamed `datacopy`/`datamove`, matching `Catalog`'s own names instead
-of inventing friendlier ones, then renamed again to `data_copy`/`data_move`
-for consistency with the rest of the facade's underscored verbs (`Catalog`'s
+check that `path` exists in the catalog first, unlike everything else
+here — and `get_context()` reads it back. `copy`/`move` were later renamed
+`datacopy`/`datamove`, matching `Catalog`'s own names instead of inventing
+friendlier ones, then renamed again to `data_copy`/`data_move` for
+consistency with the rest of the facade's underscored verbs (`Catalog`'s
 own `datacopy`/`datamove` are unchanged — only the `CatalogSession`/
 `%catalog` wrapper got the underscore); six more verbs were added — read-only
 `get_wiki`, `get_tags`, `list`, `schema` (answered immediately, like
@@ -42,10 +39,120 @@ for consistency with `delete_folder`/`delete_wiki`). `tag`/`untag` were
 similarly renamed `set_tags`/`delete_tags` (matching `set_wiki`/
 `delete_wiki`'s pattern), and `set_meta` was removed — the raw
 `Catalog.setmeta2wiki`/`getmetafromwiki` are still there for a folder's
-wiki Meta Data section, just not wrapped by `CatalogSession` any more. See
-`src/eea_datalakehouse/notebook/magics.py`'s module docstring and
+wiki Meta Data section, just not wrapped by `CatalogSession` any more.
+
+Relative-path resolution grew, then partly retreated, then grew again.
+It first grew past a leading `.`: a leading `../` (or a bare `..`) on any
+relative path walked up that many levels of the context first, and —
+since requiring a dot everywhere turned out to be a real papercut in
+practice (a custodian's first instinct after `use(...)` was to type a
+bare short name regardless of which verb came next) — every single-path
+verb started accepting a bare path with no leading `.` at all too, once a
+context existed, the same as `use` already did (`data_copy`/`data_move`/
+`create_view` were a deliberate exception at first: since they resolve
+`source_path`/`target_path` independently against the *same* starting
+context and routinely pair a relative one with a genuinely unrelated
+absolute one in the same call, a bare path there stayed absolute always,
+context or not — see below for why that exception didn't last). `use`
+itself then reverted the other way: it now only ever accepts a whole,
+absolute `path` — never resolved against whatever context already exists,
+and never a leading `.`/`../` fragment — so pointing context somewhere
+always means saying exactly where, with the same live existence check as
+before. `list`'s own `path` became optional on top of that — omitted (or
+`""`), it lists the current context itself, raising `CatalogSessionError`
+if none is set, rather than making a custodian who's already `use()`d
+somewhere repeat that same path right back to `list()`.
+
+The dot-optional rule then grew one more exception of its own: a bare path
+that already starts with `catalog` (`_ROOT_SOURCE` in `session.py` — this
+deployment's one real top-level source) is always taken literally as
+absolute, context or not, rather than getting appended to whatever
+context happens to be set. Before this, passing a full `catalog....` path
+alongside an already-set context — mixing an absolute path with ordinary
+relative use in the same session — silently produced a nonsense
+double-nested path (`f"{context}.catalog...."`) unless a custodian
+remembered to clear context first; `_ROOT_SOURCE` makes that case
+unambiguous instead. `data_copy`/`data_move`/`create_view` didn't get this
+treatment at first — the reasoning above still seemed to hold, that a
+`_ROOT_SOURCE` check couldn't tell a deliberately relative bare path
+(still meant to be appended there) apart from one that just happened not
+to start with `_ROOT_SOURCE` — until it became clear that reasoning was
+wrong: since a *genuinely* absolute path in this single-source deployment
+always starts with `_ROOT_SOURCE` by definition, the "unrelated absolute
+target" case these three verbs exist to support is already exactly the
+case `_ROOT_SOURCE` disambiguates. There was no real ambiguity left to protect against — only a papercut,
+the same one every other verb already had fixed, still hitting
+`data_copy`/`data_move`/`create_view` calls that tried a bare relative
+path and got a confusing failure instead (worse than a papercut for
+`data_copy`/`data_move`, in fact: a bare single-segment path like
+`"raw_2026"` isn't valid as a literal absolute path at all — no schema to
+split it on — so the failure surfaced as a raw `ValueError` from deep in
+`operations.py`, not even a clean `CatalogOperationError`). Dropped the
+`dot_required` parameter entirely (`_resolve_path` no longer needs two
+modes) and `data_copy`/`data_move`/`create_view` now resolve exactly like
+every other verb.
+
+Finally, context stopped being a side effect at all: every queueing verb
+used to update it from whatever path it just touched (the target's parent
+for `data_copy`/`data_move`/`create_view`, the touched path itself for
+`create_folder`) — this is what "ordinary use already keeps context
+current on its own" meant throughout the rest of this doc. That auto-update
+is gone; `use`/`set_context` are now the *only* two ways context ever
+changes. Every verb still *reads* context to resolve its own relative
+`path` (unchanged, see above), it just never writes it back — a custodian
+found a call that plainly wasn't about navigation (`create_folder`, most
+concretely) silently moving context out from under them more surprising
+than the convenience of not having to call `use` again was worth. `_resolve`
+(the internal helper that used to do the resolve-then-update-context pair)
+is gone along with it — every verb now calls `_resolve_path` directly.
+
+`use`'s own output followed from that: since it never queues anything,
+`%catalog`'s auto-commit (`_dispatch` in `magics.py`) used to hand back an
+empty `CommitReport` — accurate, but useless to look at, and not what a
+custodian typing `use(path)` actually wants to see. It now prints
+`context set to <path>` instead whenever a commit had nothing to report,
+covering `use`/`set_context` today and any future verb with the same
+"chains back to `self`, queues nothing" shape (a plain `print()`, not a
+returned value IPython would auto-display, matching every other status
+line this module prints — see its own module docstring). `%%catalog`'s
+own line loop needed a small fix alongside this: it used to treat a bare
+`None` result as "an error was already printed", which broke the moment
+`use(None)` (clearing context) started legitimately returning `None` too
+— see `_DISPATCH_FAILED` in `magics.py`.
+
+Two more `_resolve_path` gaps surfaced once `use`'s own live existence
+check made it obvious a custodian would reach for `"."`/`"./"` to mean
+"the context, unchanged" (the same way `cd .` does): neither was handled
+before, so both silently appended themselves as a literal trailing
+`.`/`./` onto the context instead — `_resolve_path(".")` returned
+`f"{context}."`, not `context`. Both now resolve to the context exactly
+as `get_context()` would show it; `"./name"` also now means the same
+thing as `".name"` rather than embedding a stray `/` in the resolved
+path. The `%catalog help` note describing all of this was rewritten into
+an explicit, itemised list (absolute / `.`-or-`./` / `../` / bare-or-dot
+relative) rather than one dense paragraph, once it became the obvious
+place a custodian would actually go looking for exactly this.
+
+A freshly built `CatalogSession` no longer starts with an empty context
+either: `__init__` now sets it to `_ROOT_SOURCE` ("catalog", the catalog
+root) rather than `None`, so a custodian's very first relative call — one
+made before ever calling `use()` — already has something to resolve
+against instead of raising "no context is set". Every other invariant
+above is unchanged (only `use`/`set_context` ever touch context). `use`'s
+own `None`/`""` handling changed to match: rather than clearing context
+to `None` (a state a fresh session no longer starts in either), it now
+resets to `_ROOT_SOURCE` — the same place a custodian already lands on
+before ever calling `use()`, so "clear the context" and "go back to
+where I started" become the same action. `set_context` — the lower-level
+primitive `use` wraps, documented as not something a custodian should
+normally reach for directly — kept its old `None` behaviour (clears to no
+context at all), since it's still needed as an explicit "unset" for the
+JupyterLab-Comm integration path and internal use. `%catalog help`'s note
+and `get_context`'s/`use`'s own entries were updated to say so.
+
+See `src/eea_datalakehouse/notebook/magics.py`'s module docstring and
 `src/eea_datalakehouse/catalog/session.py`'s `use`/`get_context`/
-`_resolve_path` for the current, authoritative behaviour.
+`_resolve_path`/`list` for the current, authoritative behaviour.
 
 ## The facade's surface, end to end
 
@@ -309,25 +416,30 @@ they're in, not a per-call decision. This is the same idea "Session context
 lives in the Python process" above already raised (`a "current" catalog
 path/context ... so repeated calls can take a relative path`), sharpened with
 a concrete trigger: a catalog-tree UI in the JupyterLab extension, where
-selecting a leaf pre-fills that context automatically, rather than only
-updating lazily from whatever path a call last touched.
+selecting a leaf pre-fills that context automatically, rather than the
+custodian having to call `use` themselves first.
 
 This splits into two sides that live in two different repositories.
 
 **The receiving side, here — implemented and encapsulated on both routes in:**
-`CatalogSession.set_context(path)`/`_resolve` (`catalog/session.py`) resolve the
-open question below with an explicit marker (a leading `.`, e.g.
+`CatalogSession.set_context(path)`/`_resolve_path` (`catalog/session.py`) resolve
+the open question below with an explicit marker (a leading `.`, e.g.
 `session.set_tags(".water_temperature", ...)`), and — critically — `set_context`
 itself is not something a data custodian is expected to call directly
-(`use`, added later, is the custodian-facing entry point built on the same
-mechanism — see "What it exposes" above):
+(`use`, added later, is the custodian-facing entry point for setting
+context deliberately — see "What it exposes" above — though it takes only
+a whole, absolute path, plus a live existence check `set_context` itself
+doesn't make):
 
-- **Ordinary use already keeps it current on its own.** Every queueing verb
-  updates the context from whatever path it just touched (the target's
-  parent for `data_copy`/`data_move`; the touched path itself for a
-  folder-scoped verb like `create_folder`), so a script that never once
-  calls `set_context` still gets working relative paths after its first
-  absolute one.
+- **`use`/`set_context` are the only two ways context ever changes.** No
+  queueing verb updates it as a side effect of running, even one whose own
+  `path` fully resolved to something that could sensibly become the new
+  context (an earlier draft of this design had exactly that — every verb
+  updating context from whatever it just touched, the target's parent for
+  `data_copy`/`data_move`, the touched path itself for `create_folder` —
+  but a custodian finding context moved out from under them by a call that
+  never looked like it should touch it turned out to be a bigger surprise
+  than the convenience was worth; see `use`'s own docstring).
 - **The Comm channel below is the *other* caller**, not the custodian either.
 
 **The emitting side, in `eeadata/EEALakeHouse` — still not built:** the
