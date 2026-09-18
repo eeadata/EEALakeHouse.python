@@ -579,6 +579,109 @@ def datamove(
     )
 
 
+def createview(
+    executor: SqlExecutor,
+    source_path: str,
+    target_path: str,
+    *,
+    overwrite: bool = False,
+    create_target_folder: bool = False,
+    catalog_rest: CatalogRestClient | None = None,
+    idempotency_key: str,
+) -> SqlResult:
+    """Create a view at `target_path` over `source_path`:
+    ``CREATE VIEW ... AS SELECT * FROM source_path``.
+
+    Unlike `datacopy`/`datamove`, this creates no new data of its own — a
+    view is a saved query, re-evaluated against `source_path` on every
+    read — so it runs over Dremio's REST Jobs API like every other
+    metadata-only operation (see the module docstring), not Arrow Flight.
+    `source_path` itself is never touched — non-destructive, unlike
+    `datamove`.
+
+    Checks `source_path` actually exists (as a table or view) before doing
+    anything else, so a typo fails with a clear message instead of a
+    confusing CREATE VIEW error. If `target_path` is an existing folder
+    rather than a specific table/view path, the source's own name is
+    appended to it — `cp source dest/` semantics, landing the view inside
+    that folder under the same name (needs `catalog_rest`; skipped, using
+    `target_path` exactly as given, without one).
+
+    `overwrite=False` (the default) checks the (possibly folder-adjusted)
+    target explicitly and raises `CatalogOperationError` if it already
+    exists, rather than letting a bare CREATE VIEW fail with Dremio's own
+    less specific error. `overwrite=True` drops whatever is actually there
+    first — detecting its real kind, since it might be a table, not a
+    view. When `create_target_folder` is true, also ensures its containing
+    folder exists first, creating any missing levels — this requires
+    `catalog_rest`.
+    """
+    params: dict[str, Any] = {
+        "source_path": source_path,
+        "target_path": target_path,
+        "overwrite": overwrite,
+        "create_target_folder": create_target_folder,
+    }
+
+    def check_source_exists() -> None:
+        if not _entry_exists(executor, source_path, idempotency_key=idempotency_key):
+            raise CatalogOperationError(f"source {source_path!r} does not exist")
+
+    def resolve_target() -> None:
+        nonlocal target_path
+        target_path = _resolve_target_path(catalog_rest, target_path, source_path)
+        params["target_path"] = target_path
+
+    def ensure_target_folder() -> None:
+        if not create_target_folder:
+            return
+        parent = _parent_path(target_path)
+        if parent is None:
+            return
+        if catalog_rest is None:
+            raise CatalogOperationError(
+                "createview(create_target_folder=True) needs catalog_rest= "
+                "to check/create the target folder"
+            )
+        catalog_rest.ensure_folder_path(parent)
+
+    def check_or_drop_target() -> None:
+        if not _entry_exists(executor, target_path, idempotency_key=idempotency_key):
+            return  # nothing there — nothing to check or drop
+        if not overwrite:
+            raise CatalogOperationError(
+                f"target {target_path!r} already exists — pass overwrite=True to replace it"
+            )
+        # Drop whatever it actually is (it might be a table, not a view) —
+        # DROP VIEW on a table (or vice versa) fails outright, same class of
+        # bug datamove's entry_type problem guards against.
+        existing_kind = _entry_kind(executor, target_path, idempotency_key=idempotency_key)
+        executor.execute(
+            f"DROP {existing_kind} IF EXISTS {_quote_path(target_path)}",
+            idempotency_key=idempotency_key,
+        )
+
+    def create_view() -> SqlResult:
+        return executor.execute(
+            f"CREATE VIEW {_quote_path(target_path)} AS SELECT * FROM {_quote_path(source_path)}",
+            idempotency_key=idempotency_key,
+        )
+
+    return _run_actions(
+        [
+            check_source_exists,
+            resolve_target,
+            ensure_target_folder,
+            check_or_drop_target,
+            create_view,
+        ],
+        operation="createview",
+        target=target_path,
+        idempotency_key=idempotency_key,
+        params=params,
+    )
+
+
 def deleteview(
     executor: SqlExecutor,
     view_path: str,
@@ -600,6 +703,30 @@ def deleteview(
         target=view_path,
         idempotency_key=idempotency_key,
         params={"view_path": view_path},
+    )
+
+
+def deletetable(
+    executor: SqlExecutor,
+    table_path: str,
+    *,
+    idempotency_key: str,
+) -> SqlResult:
+    """Delete the table at `table_path`.
+
+    ``DROP TABLE IF EXISTS`` — idempotent, safe to retry or re-run even if
+    the table is already gone. If `table_path` is actually a view rather
+    than a table, this fails loudly rather than silently doing nothing or
+    dropping the wrong kind of entry — the mirror image of `deleteview`.
+    """
+    statements = [f"DROP TABLE IF EXISTS {_quote_path(table_path)}"]
+    return _run_steps(
+        executor,
+        statements,
+        operation="deletetable",
+        target=table_path,
+        idempotency_key=idempotency_key,
+        params={"table_path": table_path},
     )
 
 
@@ -1148,7 +1275,9 @@ _OPERATIONS = {
     "publishversion": publishversion,
     "datacopy": datacopy,
     "datamove": datamove,
+    "createview": createview,
     "deleteview": deleteview,
+    "deletetable": deletetable,
     "gettablesfrom": gettablesfrom,
     "gettableitemsfrom": gettableitemsfrom,
     "getwikifrom": getwikifrom,

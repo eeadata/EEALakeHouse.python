@@ -468,6 +468,105 @@ def test_datamove_appends_source_name_when_target_is_an_existing_folder() -> Non
     ]
 
 
+def test_createview_creates_when_target_does_not_exist() -> None:
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], []])
+
+    operations.createview(fake, "a.src", "a.dst", idempotency_key="k")
+
+    assert fake.statements == [
+        _SOURCE_LOOKUP,
+        _TARGET_LOOKUP,
+        'CREATE VIEW "a"."dst" AS SELECT * FROM "a"."src"',
+    ]
+
+
+def test_createview_raises_when_target_already_exists_and_not_overwriting() -> None:
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], [{"TABLE_NAME": "dst"}]])
+
+    with pytest.raises(CatalogOperationError, match="already exists"):
+        operations.createview(fake, "a.src", "a.dst", idempotency_key="k")
+
+    # Fails fast — never gets to CREATE VIEW.
+    assert fake.statements == [_SOURCE_LOOKUP, _TARGET_LOOKUP]
+
+
+def test_createview_overwrite_drops_existing_target_first() -> None:
+    # Target's own kind is detected (it might be a table, not a view, from
+    # an earlier different operation) rather than assumed.
+    fake = FakeExecutor(
+        rows_sequence=[
+            [{"TABLE_NAME": "src"}],
+            [{"TABLE_NAME": "dst"}],
+            [{"TABLE_TYPE": "TABLE"}],
+        ]
+    )
+
+    operations.createview(fake, "a.src", "a.dst", overwrite=True, idempotency_key="k")
+
+    assert fake.statements == [
+        _SOURCE_LOOKUP,
+        _TARGET_LOOKUP,
+        _TARGET_KIND_LOOKUP,
+        'DROP TABLE IF EXISTS "a"."dst"',
+        'CREATE VIEW "a"."dst" AS SELECT * FROM "a"."src"',
+    ]
+
+
+def test_createview_raises_when_source_does_not_exist() -> None:
+    fake = FakeExecutor(rows=[])
+
+    with pytest.raises(CatalogOperationError, match="does not exist"):
+        operations.createview(fake, "a.src", "a.dst", idempotency_key="k")
+
+    # Fails fast — never gets to the target check or CREATE VIEW.
+    assert fake.statements == [_SOURCE_LOOKUP]
+
+
+def test_createview_creates_missing_target_folder() -> None:
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], []])
+    catalog_rest = FakeCatalogRest(existing={"bwd"})  # "bwd.consumer" not yet there
+
+    operations.createview(
+        fake,
+        "bwd.src",
+        "bwd.consumer.dst",
+        create_target_folder=True,
+        catalog_rest=catalog_rest,
+        idempotency_key="k",
+    )
+
+    assert catalog_rest.created == ["bwd.consumer"]
+
+
+def test_createview_raises_when_folder_check_needed_but_no_catalog_rest_given() -> None:
+    fake = FakeExecutor(rows=[{"TABLE_NAME": "src"}])
+
+    with pytest.raises(CatalogOperationError, match="catalog_rest"):
+        operations.createview(
+            fake, "bwd.src", "bwd.consumer.dst", create_target_folder=True, idempotency_key="k"
+        )
+
+
+def test_createview_appends_source_name_when_target_is_an_existing_folder() -> None:
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], []])
+    catalog_rest = FakeCatalogRest(existing={"bwd", "bwd.folder"}, folders={"bwd.folder"})
+
+    operations.createview(
+        fake, "bwd.src", "bwd.folder", catalog_rest=catalog_rest, idempotency_key="k"
+    )
+
+    assert fake.statements[-1] == 'CREATE VIEW "bwd"."folder"."src" AS SELECT * FROM "bwd"."src"'
+
+
+def test_createview_does_not_touch_the_source() -> None:
+    # The distinguishing feature vs datamove: no DROP statement anywhere.
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], []])
+
+    operations.createview(fake, "a.src", "a.dst", idempotency_key="k")
+
+    assert not any(stmt.startswith("DROP") for stmt in fake.statements)
+
+
 def test_deleteview_drops_if_exists(executor) -> None:
     operations.deleteview(executor, "a.view", idempotency_key="k")
 
@@ -480,6 +579,22 @@ def test_deleteview_is_registered_for_retry(executor) -> None:
     operations.retry_pending(executor, "k")
 
     assert executor.statements == ['DROP VIEW IF EXISTS "a"."view"']
+
+
+def test_deletetable_drops_if_exists(executor) -> None:
+    operations.deletetable(executor, "a.table", idempotency_key="k")
+
+    assert executor.statements == ['DROP TABLE IF EXISTS "a"."table"']
+
+
+def test_deletetable_is_registered_for_retry(executor) -> None:
+    retry_state.record(
+        "k", "deletetable", "a.table", "earlier failure", params={"table_path": "a.table"}
+    )
+
+    operations.retry_pending(executor, "k")
+
+    assert executor.statements == ['DROP TABLE IF EXISTS "a"."table"']
 
 
 def test_engine_starting_error_propagates_and_is_remembered(stalling_executor) -> None:

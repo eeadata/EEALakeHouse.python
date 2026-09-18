@@ -27,6 +27,16 @@ def test_injected_executor_is_used_directly() -> None:
     assert fake.statements == ['DROP VIEW IF EXISTS "a"."view"']
 
 
+def test_deletetable_delegates_correctly() -> None:
+    # deletetable, like deleteview, goes over the REST executor.
+    fake = FakeExecutor()
+    catalog = Catalog(BASE_URL, "pat", executor=fake)
+
+    catalog.deletetable("a.table", idempotency_key="k")
+
+    assert fake.statements == ['DROP TABLE IF EXISTS "a"."table"']
+
+
 def test_without_injected_executor_builds_a_real_rest_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -143,6 +153,23 @@ def test_datamove_delegates_correctly() -> None:
     ]
 
 
+def test_createview_delegates_correctly() -> None:
+    # createview goes over the REST executor, not Flight — it creates no
+    # new data, just a saved query (same reasoning as table2view).
+    fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], []])
+    catalog = Catalog(BASE_URL, "pat", executor=fake, catalog_rest=FakeCatalogRest())
+
+    catalog.createview("a.src", "a.dst", idempotency_key="k")
+
+    assert fake.statements == [
+        'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
+        "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'src'",
+        'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
+        "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'dst'",
+        'CREATE VIEW "a"."dst" AS SELECT * FROM "a"."src"',
+    ]
+
+
 def test_gettablesfrom_delegates_and_returns_full_paths() -> None:
     fake = FakeExecutor(rows=[{"TABLE_SCHEMA": "bwd.versions", "TABLE_NAME": "assessments"}])
     catalog = Catalog(BASE_URL, "pat", executor=fake)
@@ -221,6 +248,41 @@ def test_retry_pending_routes_datamove_back_through_the_flight_executor() -> Non
         "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'dst'",
     ]
     assert rest_fake.statements == []
+
+
+def test_retry_pending_routes_createview_back_through_the_rest_executor() -> None:
+    rest_fake = FakeExecutor(rows_sequence=[[{"TABLE_NAME": "src"}], []])
+    flight_fake = FakeExecutor()  # must stay untouched — createview never uses Flight
+    catalog = Catalog(
+        BASE_URL,
+        "pat",
+        executor=rest_fake,
+        flight_executor=flight_fake,
+        catalog_rest=FakeCatalogRest(),
+    )
+    retry_state.record(
+        "k",
+        "createview",
+        "a.dst",
+        "earlier failure",
+        params={
+            "source_path": "a.src",
+            "target_path": "a.dst",
+            "overwrite": False,
+            "create_target_folder": False,
+        },
+    )
+
+    catalog.retry_pending("k")
+
+    assert rest_fake.statements == [
+        'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
+        "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'src'",
+        'SELECT "TABLE_NAME" FROM INFORMATION_SCHEMA."TABLES" '
+        "WHERE \"TABLE_SCHEMA\" = 'a' AND \"TABLE_NAME\" = 'dst'",
+        'CREATE VIEW "a"."dst" AS SELECT * FROM "a"."src"',
+    ]
+    assert flight_fake.statements == []
 
 
 def test_retry_pending_raises_when_nothing_is_pending() -> None:
