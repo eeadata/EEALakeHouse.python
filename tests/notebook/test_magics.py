@@ -17,31 +17,53 @@ from eea_datalakehouse.notebook import magics as magics_module
 from eea_datalakehouse.notebook.magics import EEALakehouseMagics
 
 
+class _FakeCommitReport:
+    """Mirrors the real `CommitReport`'s one field `_dispatch` inspects."""
+
+    def __init__(self, succeeded: list[str]) -> None:
+        self.succeeded = succeeded
+
+
 class _FakeCatalogSession:
     """Stands in for a real `CatalogSession` — records calls, never touches
-    a real Catalog."""
+    a real Catalog. `use()` doesn't queue anything (matching the real
+    class), so `commit()`'s report only ever reflects `data_copy`/
+    `set_tags`/... calls made since the last commit."""
 
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.committed = False
         self.commit_kwargs: dict[str, Any] | None = None
+        self._pending: list[str] = []
+        self._context: str | None = None
 
     def data_copy(self, *args: Any, **kwargs: Any) -> _FakeCatalogSession:
-        self.calls.append(f"data_copy{args!r}{kwargs!r}")
+        call = f"data_copy{args!r}{kwargs!r}"
+        self.calls.append(call)
+        self._pending.append(call)
         return self
 
-    def use(self, path: str) -> _FakeCatalogSession:
+    def use(self, path: str | None) -> _FakeCatalogSession:
         self.calls.append(f"use({path!r})")
+        # Matches the real CatalogSession: None/"" reset to the catalog
+        # root rather than clearing to no context at all.
+        self._context = "catalog" if path is None or path == "" else path
         return self
+
+    def get_context(self) -> str | None:
+        return self._context
 
     def set_tags(self, *args: Any, **kwargs: Any) -> _FakeCatalogSession:
-        self.calls.append(f"set_tags{args!r}{kwargs!r}")
+        call = f"set_tags{args!r}{kwargs!r}"
+        self.calls.append(call)
+        self._pending.append(call)
         return self
 
-    def commit(self, **kwargs: Any) -> str:
+    def commit(self, **kwargs: Any) -> _FakeCommitReport:
         self.committed = True
         self.commit_kwargs = kwargs
-        return "committed"
+        succeeded, self._pending = self._pending, []
+        return _FakeCommitReport(succeeded)
 
     def raise_commit_error(self) -> None:
         raise CatalogCommitError(
@@ -85,6 +107,33 @@ def test_catalog_magic_executes_and_commits_immediately(
     assert fake.calls == ["data_copy('a.b', 'c.d'){'overwrite': True}"]
     assert fake.committed is True
     assert fake.commit_kwargs == {"retry": True}
+
+
+def test_use_prints_the_resulting_context_not_an_empty_commit_report(
+    ip: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # use() chains back to `self` like every queueing verb, but queues
+    # nothing — commit() then has nothing to report, so the context it
+    # just set is printed instead of an uninformative empty CommitReport.
+    fake = _FakeCatalogSession()
+    monkeypatch.setattr(magics_module, "_build_catalog_session", lambda: fake)
+
+    result = ip.run_line_magic("catalog", 'use("bwd.reference")')
+
+    assert result is None
+    assert capsys.readouterr().out == "context set to 'bwd.reference'\n"
+    assert fake.committed is True  # still committed — a harmless no-op, nothing was queued
+
+
+def test_use_none_prints_context_set_to_the_catalog_root(
+    ip: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _FakeCatalogSession()
+    monkeypatch.setattr(magics_module, "_build_catalog_session", lambda: fake)
+
+    ip.run_line_magic("catalog", "use(None)")
+
+    assert capsys.readouterr().out == "context set to 'catalog'\n"
 
 
 def test_catalog_magic_builds_the_session_once_and_reuses_it(
@@ -180,6 +229,21 @@ def test_catalog_cell_magic_stops_at_the_first_failing_line(
     assert fake.calls == []  # the second line never ran
 
 
+def test_catalog_cell_magic_does_not_stop_after_use_none(
+    ip: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # use(None) legitimately dispatches to a `None` result (it prints its
+    # own status instead of an empty commit report) — the cell loop must
+    # not mistake that for "an error was printed" and bail out before
+    # running the rest of the cell.
+    fake = _FakeCatalogSession()
+    monkeypatch.setattr(magics_module, "_build_catalog_session", lambda: fake)
+
+    ip.run_cell_magic("catalog", "use(None)", 'set_tags("a.b", ["reviewed"])')
+
+    assert fake.calls == ["use(None)", "set_tags('a.b', ['reviewed']){}"]
+
+
 def test_catalog_cell_magic_missing_credentials_prints_a_friendly_message(
     ip: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -230,15 +294,16 @@ def test_catalog_help_lists_methods_without_needing_credentials(
     out = capsys.readouterr().out
     assert "%catalog methods" in out
     assert "DREMIO_BASE_URL" not in out  # never tried to build a session
-    # General note about leading-'.'/'../' relative paths — printed once,
-    # not per-row, since it applies across every path/source_path/target_path.
-    assert "resolves against the current context" in out
+    # General note about absolute/relative paths — printed once, not per-row,
+    # since it applies across every path/source_path/target_path.
+    assert "is either absolute or" in out
     assert "except use's own" in out  # use is the one path that's always literal/absolute
     assert "walks up that many" in out  # ../ support, mentioned generally
-    # A path already starting with 'catalog' (the one real root source) is never
+    assert "the context itself, exactly as get_context() shows it" in out  # '.'/'./' alone
+    # A path already starting with 'catalog.' (the one real root source) is never
     # appended to an existing context, even without a leading dot.
-    assert "starts with 'catalog'" in out
-    assert "taken literally as absolute" in out
+    assert "starts with 'catalog.'" in out
+    assert "the dot is optional sugar, not what makes it relative" in out
 
     assert len(displayed) == 1
     table_html = displayed[0].data

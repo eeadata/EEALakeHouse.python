@@ -329,7 +329,7 @@ def test_deletewiki_delegates_to_operations() -> None:
 
 
 def test_setwikito_with_tags_delegates_to_operations() -> None:
-    fake_rest = FakeCatalogRest(existing={"a.b"})
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"})
     catalog = Catalog(BASE_URL, "pat", executor=FakeExecutor(), catalog_rest=fake_rest)
     tags = [{"tag_name": "owner", "tag_value": "bwd-team", "tag_title": "Owner"}]
 

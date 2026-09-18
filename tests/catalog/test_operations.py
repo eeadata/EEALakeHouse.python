@@ -852,7 +852,9 @@ def test_setwikito_engine_starting_is_remembered_and_retryable(executor) -> None
 
 
 def test_setwikito_appends_metadata_section_when_tags_given() -> None:
-    fake_rest = FakeCatalogRest(existing={"a.b"})
+    # Folder — tags on a table/view are ignored instead (see the dedicated
+    # test below), since those already have native tags/labels.
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"})
     tags = [
         {"tag_name": "owner", "tag_value": "bwd-team", "tag_title": "Owner"},
         {"tag_name": "status", "tag_value": "published", "tag_title": "Status"},
@@ -880,8 +882,21 @@ def test_setwikito_without_tags_leaves_text_untouched() -> None:
     assert fake_rest._wikis["a.b"] == "# Docs"
 
 
-def test_setwikito_raises_when_a_tag_is_missing_a_key() -> None:
+def test_setwikito_ignores_tags_on_a_table_or_view() -> None:
+    # "a.b" is a table/view here (in existing, not in folders) — those
+    # already have native tags/labels (settagsto/gettagsfrom), so the wiki
+    # Meta Data convention doesn't apply and tags is silently dropped
+    # rather than embedded or raised on.
     fake_rest = FakeCatalogRest(existing={"a.b"})
+    tags = [{"tag_name": "owner", "tag_value": "bwd-team"}]  # missing tag_title, but never checked
+
+    operations.setwikito(fake_rest, "a.b", "# Docs", tags=tags, idempotency_key="k")
+
+    assert fake_rest._wikis["a.b"] == "# Docs"
+
+
+def test_setwikito_raises_when_a_tag_is_missing_a_key() -> None:
+    fake_rest = FakeCatalogRest(existing={"a.b"}, folders={"a.b"})
     tags = [{"tag_name": "owner", "tag_value": "bwd-team"}]  # no tag_title
 
     with pytest.raises(CatalogOperationError, match="tag_title"):
@@ -893,7 +908,9 @@ def test_setwikito_raises_when_a_tag_is_missing_a_key() -> None:
 
 def test_setwikito_retry_resends_the_already_rendered_metadata(executor) -> None:
     fake_rest = FakeCatalogRest(
-        existing={"a.b"}, raise_on_set_wiki=EngineStartingError("stalled", idempotency_key="k")
+        existing={"a.b"},
+        folders={"a.b"},
+        raise_on_set_wiki=EngineStartingError("stalled", idempotency_key="k"),
     )
     tags = [{"tag_name": "owner", "tag_value": "bwd-team", "tag_title": "Owner"}]
 
@@ -1329,51 +1346,77 @@ def test_createfolder_engine_starting_is_remembered_and_retryable(executor) -> N
     assert fake_rest.created == ["a.b.c"]
 
 
-def test_deletefolder_deletes_an_empty_folder() -> None:
+def test_deletefolder_deletes_an_empty_folder(executor) -> None:
     fake_rest = FakeCatalogRest(existing={"a", "a.b"}, folders={"a.b"})
 
-    operations.deletefolder(fake_rest, "a.b", idempotency_key="k")
+    operations.deletefolder(executor, fake_rest, "a.b", idempotency_key="k")
 
     assert fake_rest.deleted == ["a.b"]
     assert "a.b" not in fake_rest.existing
 
 
-def test_deletefolder_is_idempotent_when_already_gone() -> None:
+def test_deletefolder_is_idempotent_when_already_gone(executor) -> None:
     fake_rest = FakeCatalogRest(existing={"a"})
 
-    operations.deletefolder(fake_rest, "a.missing", idempotency_key="k")
+    operations.deletefolder(executor, fake_rest, "a.missing", idempotency_key="k")
 
     assert fake_rest.deleted == []
 
 
-def test_deletefolder_raises_when_not_empty_and_not_cascading() -> None:
+def test_deletefolder_raises_when_not_empty_and_not_cascading(executor) -> None:
     fake_rest = FakeCatalogRest(
         existing={"a", "a.b", "a.b.c"}, folders={"a.b", "a.b.c"}
     )
 
     with pytest.raises(CatalogOperationError, match="not empty"):
-        operations.deletefolder(fake_rest, "a.b", idempotency_key="k")
+        operations.deletefolder(executor, fake_rest, "a.b", idempotency_key="k")
 
     assert fake_rest.deleted == []
 
 
-def test_deletefolder_cascade_deletes_contents_and_subfolders() -> None:
+def test_deletefolder_cascade_recurses_into_subfolders() -> None:
+    # Only one dataset in the whole tree, under a nested subfolder — proves
+    # both that subfolders recurse (via fake_rest, no SQL) and that the
+    # dataset at the bottom still gets a real SQL drop (see the two
+    # single-dataset tests below for TABLE vs VIEW specifically).
     fake_rest = FakeCatalogRest(
-        existing={"a", "a.b", "a.b.c", "a.b.view1", "a.b.c.table1"},
+        existing={"a", "a.b", "a.b.c", "a.b.c.table1"},
         folders={"a.b", "a.b.c"},
     )
+    executor = FakeExecutor(rows=[{"TABLE_TYPE": "TABLE"}])
 
-    operations.deletefolder(fake_rest, "a.b", cascade=True, idempotency_key="k")
+    operations.deletefolder(executor, fake_rest, "a.b", cascade=True, idempotency_key="k")
 
-    assert set(fake_rest.deleted) == {"a.b", "a.b.c", "a.b.view1", "a.b.c.table1"}
+    assert set(fake_rest.deleted) == {"a.b", "a.b.c"}  # folders only — dataset went via SQL
+    assert 'DROP TABLE IF EXISTS "a"."b"."c"."table1"' in executor.statements
     assert "a.b" not in fake_rest.existing
 
 
-def test_deletefolder_raises_when_path_is_not_a_folder() -> None:
+def test_deletefolder_cascade_drops_a_view_child_via_sql_drop_view() -> None:
+    fake_rest = FakeCatalogRest(existing={"a", "a.b", "a.b.view1"}, folders={"a.b"})
+    executor = FakeExecutor(rows=[{"TABLE_TYPE": "VIEW"}])
+
+    operations.deletefolder(executor, fake_rest, "a.b", cascade=True, idempotency_key="k")
+
+    assert fake_rest.deleted == ["a.b"]  # the view never went through fake_rest's own delete
+    assert 'DROP VIEW IF EXISTS "a"."b"."view1"' in executor.statements
+
+
+def test_deletefolder_cascade_drops_a_table_child_via_sql_drop_table() -> None:
+    fake_rest = FakeCatalogRest(existing={"a", "a.b", "a.b.table1"}, folders={"a.b"})
+    executor = FakeExecutor(rows=[{"TABLE_TYPE": "TABLE"}])
+
+    operations.deletefolder(executor, fake_rest, "a.b", cascade=True, idempotency_key="k")
+
+    assert fake_rest.deleted == ["a.b"]  # the table never went through fake_rest's own delete
+    assert 'DROP TABLE IF EXISTS "a"."b"."table1"' in executor.statements
+
+
+def test_deletefolder_raises_when_path_is_not_a_folder(executor) -> None:
     fake_rest = FakeCatalogRest(existing={"a", "a.b"})  # "a.b" not in folders
 
     with pytest.raises(CatalogOperationError, match="not a folder"):
-        operations.deletefolder(fake_rest, "a.b", idempotency_key="k")
+        operations.deletefolder(executor, fake_rest, "a.b", idempotency_key="k")
 
 
 def test_deletefolder_engine_starting_is_remembered_and_retryable(executor) -> None:
@@ -1384,7 +1427,7 @@ def test_deletefolder_engine_starting_is_remembered_and_retryable(executor) -> N
     )
 
     with pytest.raises(EngineStartingError):
-        operations.deletefolder(fake_rest, "a.b", idempotency_key="k")
+        operations.deletefolder(executor, fake_rest, "a.b", idempotency_key="k")
 
     pending = retry_state.get("k")
     assert pending is not None

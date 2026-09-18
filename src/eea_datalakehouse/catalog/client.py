@@ -344,7 +344,11 @@ class Catalog:
 
     def deletefolder(self, path: str, *, cascade: bool = False, idempotency_key: str) -> None:
         return operations.deletefolder(
-            self._catalog_rest, path, cascade=cascade, idempotency_key=idempotency_key
+            self._executor,
+            self._catalog_rest,
+            path,
+            cascade=cascade,
+            idempotency_key=idempotency_key,
         )
 
     def retry_pending(self, idempotency_key: str) -> SqlResult | list[Any]:

@@ -33,9 +33,20 @@ def _catalog(rest: FakeCatalogRest, executor: FakeExecutor | None = None) -> Cat
     return Catalog(BASE_URL, "pat", executor=executor, flight_executor=executor, catalog_rest=rest)
 
 
+def _session(rest: FakeCatalogRest, executor: FakeExecutor | None = None) -> CatalogSession:
+    """A `CatalogSession` with context cleared. This file's fixture paths
+    are short absolute stand-ins (e.g. `"bwd.table1"`) that predate
+    `CatalogSession`'s own default context (the catalog root, per
+    `_ROOT_SOURCE`) — clearing it keeps them absolute rather than
+    silently getting `"catalog."` prepended."""
+    session = CatalogSession(_catalog(rest, executor))
+    session.set_context(None)
+    return session
+
+
 def test_nothing_runs_until_commit() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     session.create_folder("bwd.new")
 
@@ -45,11 +56,9 @@ def test_nothing_runs_until_commit() -> None:
 
 def test_commit_runs_queued_steps_in_order_and_clears_the_queue() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.table1"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
-    # set_context(None) keeps 'bwd.table1' below literal — create_folder's own
-    # context-tracking would otherwise treat a following bare path as relative.
-    session.create_folder("bwd.newfolder").set_context(None).set_tags("bwd.table1", ["reviewed"])
+    session.create_folder("bwd.newfolder").set_tags("bwd.table1", ["reviewed"])
     report = session.commit()
 
     assert report.succeeded == [
@@ -64,7 +73,7 @@ def test_commit_runs_queued_steps_in_order_and_clears_the_queue() -> None:
 def test_commit_rolls_back_a_cleanly_reversible_batch_on_failure() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.table1"})
     executor = FakeExecutor(rows=[{"TABLE_NAME": "table1", "TABLE_TYPE": "TABLE"}])
-    session = CatalogSession(_catalog(rest, executor))
+    session = _session(rest, executor)
 
     # step 1 succeeds and is reversible; step 2 fails because the target
     # already exists and overwrite defaults to False.
@@ -98,10 +107,9 @@ def test_data_move_rollback_moves_the_table_back() -> None:
             [{"TABLE_NAME": "table1"}],
         ]
     )
-    session = CatalogSession(_catalog(rest, executor))
+    session = _session(rest, executor)
 
     session.data_move("bwd.table1", "bwd.table2")  # reversible
-    session.set_context(None)  # keep 'bwd.missing' below literal, not relative to data_move
     session.set_tags("bwd.missing", ["x"])  # fails: path does not exist
 
     with pytest.raises(CatalogCommitError) as exc_info:
@@ -123,10 +131,9 @@ def test_create_view_rollback_drops_the_view() -> None:
         rows_sequence=[[{"TABLE_NAME": "table1"}], []],  # source-exists, target-empty
         rows=[{"TABLE_TYPE": "VIEW"}],  # answers the undo's kind-detection lookup
     )
-    session = CatalogSession(_catalog(rest, executor))
+    session = _session(rest, executor)
 
     session.create_view("bwd.table1", "bwd.view1")  # reversible — source is untouched either way
-    session.set_context(None)  # keep 'bwd.missing' below literal, not relative to create_view
     session.set_tags("bwd.missing", ["x"])  # fails: path does not exist
 
     with pytest.raises(CatalogCommitError) as exc_info:
@@ -142,7 +149,7 @@ def test_create_view_rollback_drops_the_view() -> None:
 def test_commit_reports_what_it_could_not_undo() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.table1"})
     executor = FakeExecutor(rows=[{"TABLE_NAME": "table1", "TABLE_TYPE": "TABLE"}])
-    session = CatalogSession(_catalog(rest, executor))
+    session = _session(rest, executor)
 
     session.create_folder("bwd.newfolder")  # reversible
     session.data_copy("bwd.table1", "bwd.table1", overwrite=True)  # succeeds, but NOT reversible
@@ -172,7 +179,7 @@ def test_retry_reruns_the_same_step_after_engine_starting_error() -> None:
             return super().create_folder(path)
 
     rest = _FlakyRest(existing={"a", "bwd"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     session.create_folder("bwd.new")
     report = session.commit(retry=True, retry_delay=0)
@@ -188,7 +195,7 @@ def test_engine_starting_error_without_retry_rolls_back_immediately() -> None:
             raise EngineStartingError("engine starting", idempotency_key="k")
 
     rest = _AlwaysStartingRest(existing={"a", "bwd"})
-    session = CatalogSession(_catalog(rest))
+    session = _session(rest)
 
     session.create_folder("bwd.new")
 

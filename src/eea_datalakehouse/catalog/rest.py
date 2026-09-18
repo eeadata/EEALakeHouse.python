@@ -1,7 +1,10 @@
 """Dremio's own REST Catalog API (v3) — used for folder existence/creation/
 deletion and for reading an entity's wiki/tags, none of which have a SQL or
 Flight equivalent (this is the one place in `catalog` that isn't
-transport-agnostic through SqlExecutor).
+transport-agnostic through SqlExecutor) — except `delete_folder`'s cascade,
+which accepts an optional SQL-backed callback for its dataset children (see
+that method, and `operations.deletefolder`, which supplies one) rather than
+trusting this API's own generic delete to drop a *physical* table's data.
 
 Unverified against a real Dremio deployment: the v3 catalog API's by-path
 lookup, folder-creation, wiki/tag-collaboration, and folder-deletion
@@ -14,6 +17,7 @@ assumes a container child's JSON carries ``type="CONTAINER"`` /
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -70,8 +74,21 @@ class CatalogRestClient:
         return resp.json()
 
     def exists(self, path: str) -> bool:
-        """Whether `path` (dot-separated) is any entity in the catalog."""
-        return self._lookup_by_path(path) is not None
+        """Whether `path` (dot-separated) is any entity in the catalog.
+
+        Best-effort, same reasoning as `is_folder`/`is_table_or_view`: some
+        Dremio source types reject a by-path lookup into a nested item that
+        doesn't exist outright (a 400, not a 404) rather than answering
+        "not found", so any lookup failure here is treated the same as
+        "not found", never raised — most visibly, this is what lets
+        `CatalogSession.create_folder` check whether a not-yet-created
+        folder is already there without that check itself blowing up the
+        creation it's only meant to make undoable.
+        """
+        try:
+            return self._lookup_by_path(path) is not None
+        except CatalogOperationError:
+            return False
 
     def is_folder(self, path: str) -> bool:
         """Whether `path` names an existing folder — not a table/view/space/source.
@@ -337,17 +354,33 @@ class CatalogRestClient:
                 f"could not delete {what} ({resp.status_code}): {resp.text[:300]}"
             )
 
-    def delete_folder(self, path: str, *, cascade: bool = False) -> None:
+    def delete_folder(
+        self,
+        path: str,
+        *,
+        cascade: bool = False,
+        delete_dataset: Callable[[str], None] | None = None,
+    ) -> None:
         """Delete the folder at `path`. Idempotent — a folder that's
         already gone is not an error, same as `deleteview`'s
         ``DROP VIEW IF EXISTS``.
 
         `cascade=False` (the default) raises `CatalogOperationError` if the
         folder still has contents — `rmdir` vs `rm -r`. `cascade=True`
-        deletes every table/view and subfolder inside first, depth-first
-        (each straight through this same catalog API — Dremio supports
-        deleting a dataset by id here too, not just via SQL DROP), then the
-        folder itself.
+        deletes every table/view and subfolder inside first, depth-first,
+        then the folder itself. A subfolder child always recurses through
+        this same catalog API (folder deletion has no SQL equivalent); a
+        dataset child (table or view) goes through `delete_dataset(
+        child_path)` if given — `operations.deletefolder` passes one that
+        runs the same SQL `DROP TABLE`/`DROP VIEW` `deletetable`/
+        `deleteview` themselves use, since this project has never confirmed
+        that deleting a dataset by id through this catalog API actually
+        drops a *physical* table's underlying data, rather than just
+        forgetting its catalog entry (the same reason `deletetable`/
+        `deleteview` don't use this API for that either). With no
+        `delete_dataset` — a caller using this client directly, with no SQL
+        executor available — falls back to that same generic catalog
+        delete.
         """
         entity = self._lookup_by_path(path)
         if entity is None:
@@ -367,7 +400,9 @@ class CatalogRestClient:
                 if not child_path:
                     continue
                 if self._child_is_folder(child):
-                    self.delete_folder(child_path, cascade=True)
+                    self.delete_folder(child_path, cascade=True, delete_dataset=delete_dataset)
+                elif delete_dataset is not None:
+                    delete_dataset(child_path)
                 else:
                     self._delete_entity(child["id"], what=f"{child_path!r}")
 

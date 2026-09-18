@@ -50,16 +50,16 @@ itself.
 
 `CatalogSession`'s "current path" context (a path resolves against it once
 it's set, with or without a leading `.` — see that class' `set_context`/
-`_resolve_path`) is already kept up to date automatically just from
-ordinary `%catalog` use, so no data custodian ever needs to set it
-themselves for that. `use(path)` sets it deliberately instead — unlike
-every other verb's own `path`/`source_path`/`target_path`, `use`'s `path`
-is always a whole, absolute path (never resolved against whatever context
-already exists), and it makes a live check that it actually exists in the
-catalog first. Most often reached through `%%catalog`, the cell-magic
-form: it runs `use(...)` on its magic line, then every other line of the
-cell in order, so the whole cell shares one context without repeating a
-path on each line::
+`_resolve_path`) is set only by `use(path)` — no other verb changes it as
+a side effect of running, even one whose own `path`/`source_path`/
+`target_path` fully resolved to something that could sensibly become the
+new context. Unlike every other verb's own `path`/`source_path`/
+`target_path`, `use`'s `path` is always a whole, absolute path (never
+resolved against whatever context already exists), and it makes a live
+check that it actually exists in the catalog first. Most often reached
+through `%%catalog`, the cell-magic form: it runs `use(...)` on its magic
+line, then every other line of the cell in order, so the whole cell
+shares one context without repeating a path on each line::
 
     %%catalog use("bwd.reference")
     set_tags(".water_temperature", ["reviewed"])
@@ -132,12 +132,15 @@ _CATALOG_HELP = [
         "use",
         "Set the current path for every call after this one; path must be a whole, "
         "absolute path — never relative to the current context, unlike every other "
-        "verb's path/source_path/target_path. None clears it. Raises if path doesn't "
-        "exist in the catalog. See %%catalog to set it once at the top of a cell.",
+        "verb's path/source_path/target_path. None or '' resets it to 'catalog' (the "
+        "root). Raises if path doesn't exist in the catalog. See %%catalog to set it "
+        "once at the top of a cell.",
     ),
     (
         "get_context",
-        "Show the current path (None if nothing has been set yet).",
+        "Show the current path. A new session starts at 'catalog' (the root); "
+        "use(None)/use('') reset back to it too — None only after an explicit "
+        "set_context(None).",
     ),
     # -- data ---------------------------------------------------------------
     (
@@ -187,7 +190,8 @@ _CATALOG_HELP = [
     (
         "set_wiki",
         "Set a path's wiki text. tags: a list of {tag_name, tag_value, tag_title} dicts, "
-        "e.g. " + _META_TAGS_EXAMPLE + ".",
+        "e.g. " + _META_TAGS_EXAMPLE + ". Ignored if path is a table/view (they have "
+        "set_tags/get_tags for that instead).",
     ),
     ("delete_wiki", "Delete a path's wiki text."),
     (
@@ -274,12 +278,20 @@ _HELP_TABLE_CODE_STYLE = _HELP_TABLE_CELL_STYLE + " font-family:monospace; white
 # since it applies across every path/source_path/target_path. %ingest help
 # has no equivalent note.
 _CATALOG_HELP_NOTE = (
-    "Every path/source_path/target_path (except use's own) resolves against the current "
-    "context once one is set — with or without a leading '.' — unless it already starts "
-    "with 'catalog' (this deployment's one real root source), which is always taken "
-    "literally as absolute instead of being appended to the context. One or more leading "
-    "'../' (or a bare '..') walks up that many levels first. Ordinary use already keeps "
-    "context current on its own."
+    "A new session's context starts at 'catalog' (the root source), not empty — "
+    "use(None)/use('') reset back to it too; only set_context(None) clears it to no "
+    "context at all.\n"
+    "Every path/source_path/target_path (except use's own) is either absolute or "
+    "relative to the current context, once one is set:\n"
+    "  - starts with 'catalog.' (this deployment's one real root source) -> always "
+    "absolute, used exactly as given, never appended to the context\n"
+    "  - '.' or './' alone -> the context itself, exactly as get_context() shows it\n"
+    "  - '../' (or a bare '..'), optionally chained ('../../') -> walks up that many "
+    "levels of the context first, then appends whatever's left, if anything\n"
+    "  - '.name', or a bare 'name' with no leading '.' at all -> both mean relative to "
+    "the context; the dot is optional sugar, not what makes it relative\n"
+    "Only use() ever changes the context — no other call does, even one that fully "
+    "resolved an absolute path."
 )
 
 
@@ -324,6 +336,16 @@ def _print_help_table(
     display(HTML(_help_table_html(rows)))
 
 
+_DISPATCH_FAILED = object()
+# Sentinel `_dispatch` returns when it printed a friendly error — distinct
+# from a legitimate `None` result (e.g. `use(...)` printing its own status
+# instead of an empty commit report, or `get_context()` with nothing set
+# yet). `%%catalog`'s own loop needs to tell those apart to know whether to
+# keep running the rest of the cell;
+# every caller converts this back to a plain `None` before it reaches
+# IPython, so it's never actually displayed.
+
+
 def _dispatch(
     session: Any,
     line: str,
@@ -346,10 +368,18 @@ def _dispatch(
             # A queueing verb just chained back to `self` — commit it right
             # away instead of waiting for a separate commit() call (see the
             # module docstring: %catalog executes immediately).
-            result = session.commit(retry=True)
+            report = session.commit(retry=True)
+            if report.succeeded:
+                result = report
+            else:
+                # use()/set_context() also chain back to `self`, but queue
+                # nothing — commit() then has nothing to report, so print
+                # the context they just set instead of an empty CommitReport.
+                print(f"context set to {session.get_context()!r}")
+                result = None
     except error_type as exc:
         print(f"{label} error: {exc}")
-        return None
+        return _DISPATCH_FAILED
     return result
 
 
@@ -436,7 +466,7 @@ class EEALakehouseMagics(Magics):
             return None
         if not self._ensure_catalog_session():
             return None
-        return _dispatch(
+        result = _dispatch(
             self._catalog_session,
             line,
             self.shell.user_ns,
@@ -444,6 +474,7 @@ class EEALakehouseMagics(Magics):
             CatalogSessionError,
             auto_commit=True,
         )
+        return None if result is _DISPATCH_FAILED else result
 
     @cell_magic("catalog")
     def catalog_cell(self, line: str, cell: str) -> Any:
@@ -476,8 +507,8 @@ class EEALakehouseMagics(Magics):
                 CatalogSessionError,
                 auto_commit=True,
             )
-            if result is None:
-                break  # a friendly error was already printed by _dispatch
+            if result is _DISPATCH_FAILED:
+                return None  # a friendly error was already printed by _dispatch
         return result
 
     @line_magic
@@ -487,9 +518,10 @@ class EEALakehouseMagics(Magics):
             return None
         if self._ingest_session is None:
             self._ingest_session = IngestSession()
-        return _dispatch(
+        result = _dispatch(
             self._ingest_session, line, self.shell.user_ns, "ingest", IngestSessionError
         )
+        return None if result is _DISPATCH_FAILED else result
 
 
 def load_ipython_extension(ipython: Any) -> None:
