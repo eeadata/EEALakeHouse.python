@@ -18,7 +18,11 @@ from eea_datalakehouse.catalog import retry_state
 from eea_datalakehouse.catalog.client import Catalog
 from eea_datalakehouse.catalog.errors import CatalogOperationError
 from eea_datalakehouse.catalog.operations import TableInfo
-from eea_datalakehouse.catalog.session import CatalogCommitError, CatalogSession
+from eea_datalakehouse.catalog.session import (
+    CatalogCommitError,
+    CatalogSession,
+    CatalogSessionError,
+)
 
 from .conftest import FakeCatalogRest, FakeExecutor
 
@@ -121,6 +125,61 @@ def test_list_resolves_a_relative_path() -> None:
     session.list(".reference")  # must not raise — "bwd.reference" exists
 
     assert executor.statements  # the gettablesfrom query actually ran
+
+
+def test_list_resolves_a_bare_relative_path_too() -> None:
+    # list() (and every other single-path verb) treats a bare path with no
+    # leading '.' as relative once a context exists — the dot is optional
+    # sugar there, not the marker for relative vs absolute (use() is the
+    # one exception — see test_session_context.py).
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference"})
+    executor = FakeExecutor(rows=[])
+    session = CatalogSession(_catalog(rest, executor))
+    session.use("bwd")
+
+    session.list("reference")  # bare, no dot — still resolves to "bwd.reference"
+
+    assert executor.statements  # the gettablesfrom query actually ran
+
+
+def test_list_with_no_path_lists_the_context_itself() -> None:
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference"})
+    executor = FakeExecutor(
+        rows=[{"TABLE_SCHEMA": "bwd.reference", "TABLE_NAME": "water_temperature"}]
+    )
+    session = CatalogSession(_catalog(rest, executor))
+    session.use("bwd.reference")
+
+    assert session.list() == ["bwd.reference.water_temperature"]
+
+
+def test_list_with_empty_path_lists_the_context_itself() -> None:
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference"})
+    executor = FakeExecutor(rows=[])
+    session = CatalogSession(_catalog(rest, executor))
+    session.use("bwd.reference")
+
+    session.list("")  # explicit empty string — same as omitting path
+
+    assert executor.statements  # the gettablesfrom query actually ran
+
+
+def test_list_with_no_path_and_no_context_raises() -> None:
+    rest = FakeCatalogRest(existing={"a", "bwd"})
+    session = CatalogSession(_catalog(rest))
+
+    with pytest.raises(CatalogSessionError, match="no context is set"):
+        session.list()
+
+
+def test_list_absolute_path_still_works_with_no_context() -> None:
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference"})
+    executor = FakeExecutor(
+        rows=[{"TABLE_SCHEMA": "bwd.reference", "TABLE_NAME": "water_temperature"}]
+    )
+    session = CatalogSession(_catalog(rest, executor))
+
+    assert session.list("bwd.reference") == ["bwd.reference.water_temperature"]
 
 
 def test_list_raises_when_path_does_not_exist() -> None:

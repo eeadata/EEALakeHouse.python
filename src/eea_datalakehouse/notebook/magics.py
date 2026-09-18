@@ -48,18 +48,21 @@ Credentials/connection details come from the kernel environment, the same
 construction already use — this module never asks for or stores a token
 itself.
 
-`CatalogSession`'s "current path" context (a leading `.` on a path resolves
-against it — see that class' `set_context`/`_resolve`) is already kept
-up to date automatically just from ordinary `%catalog` use, so no data
-custodian ever needs to set it themselves for that. `use(path)` sets it
-deliberately instead — unlike `set_context`, `path` itself may be relative
-too, resolved against whatever context already exists. Most often reached
-through `%%catalog`, the cell-magic form: it runs `use(...)` on its magic
-line, then every other line of the cell in order, so the whole cell shares
-one context without repeating a path on each line::
+`CatalogSession`'s "current path" context (a path resolves against it once
+it's set, with or without a leading `.` — see that class' `set_context`/
+`_resolve_path`) is already kept up to date automatically just from
+ordinary `%catalog` use, so no data custodian ever needs to set it
+themselves for that. `use(path)` sets it deliberately instead — unlike
+every other verb's own `path`/`source_path`/`target_path`, `use`'s `path`
+is always a whole, absolute path (never resolved against whatever context
+already exists), and it makes a live check that it actually exists in the
+catalog first. Most often reached through `%%catalog`, the cell-magic
+form: it runs `use(...)` on its magic line, then every other line of the
+cell in order, so the whole cell shares one context without repeating a
+path on each line::
 
     %%catalog use("bwd.reference")
-    tag(".water_temperature", ["reviewed"])
+    set_tags(".water_temperature", ["reviewed"])
     create_folder(".2027")
 
 This module also registers a Jupyter Comm target (see
@@ -127,11 +130,10 @@ _CREATE_TARGET_FOLDER_NOTE = (
 _CATALOG_HELP = [
     (
         "use",
-        "Set the current path for every call after this one; path may be a whole path, "
-        "or relative to the current context (with or without a leading '.') once one "
-        "exists — '../name' or a bare '..' walks up one level first, chainable "
-        "('../../name'). None clears it. Raises if the resolved path doesn't exist in "
-        "the catalog. See %%catalog to set it once at the top of a cell.",
+        "Set the current path for every call after this one; path must be a whole, "
+        "absolute path — never relative to the current context, unlike every other "
+        "verb's path/source_path/target_path. None clears it. Raises if path doesn't "
+        "exist in the catalog. See %%catalog to set it once at the top of a cell.",
     ),
     (
         "get_context",
@@ -154,7 +156,9 @@ _CATALOG_HELP = [
     (
         "list",
         "Show every table/view under path, at any depth, as full dot-separated paths. "
-        "Raises CatalogOperationError if path doesn't exist.",
+        "path may be omitted to list the current context itself — raises "
+        "CatalogSessionError if none is set. Raises CatalogOperationError if path "
+        "doesn't exist.",
     ),
     (
         "schema",
@@ -270,9 +274,12 @@ _HELP_TABLE_CODE_STYLE = _HELP_TABLE_CELL_STYLE + " font-family:monospace; white
 # since it applies across every path/source_path/target_path. %ingest help
 # has no equivalent note.
 _CATALOG_HELP_NOTE = (
-    "A path/source_path/target_path starting with '.' resolves against the current "
-    "context (see use); one or more leading '../' (or a bare '..') walks up that many "
-    "levels first. Ordinary use already keeps context current on its own."
+    "Every path/source_path/target_path (except use's own) resolves against the current "
+    "context once one is set — with or without a leading '.' — unless it already starts "
+    "with 'catalog' (this deployment's one real root source), which is always taken "
+    "literally as absolute instead of being appended to the context. One or more leading "
+    "'../' (or a bare '..') walks up that many levels first. Ordinary use already keeps "
+    "context current on its own."
 )
 
 

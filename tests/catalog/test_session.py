@@ -47,7 +47,9 @@ def test_commit_runs_queued_steps_in_order_and_clears_the_queue() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.table1"})
     session = CatalogSession(_catalog(rest))
 
-    session.create_folder("bwd.newfolder").set_tags("bwd.table1", ["reviewed"])
+    # set_context(None) keeps 'bwd.table1' below literal — create_folder's own
+    # context-tracking would otherwise treat a following bare path as relative.
+    session.create_folder("bwd.newfolder").set_context(None).set_tags("bwd.table1", ["reviewed"])
     report = session.commit()
 
     assert report.succeeded == [
@@ -99,6 +101,7 @@ def test_data_move_rollback_moves_the_table_back() -> None:
     session = CatalogSession(_catalog(rest, executor))
 
     session.data_move("bwd.table1", "bwd.table2")  # reversible
+    session.set_context(None)  # keep 'bwd.missing' below literal, not relative to data_move
     session.set_tags("bwd.missing", ["x"])  # fails: path does not exist
 
     with pytest.raises(CatalogCommitError) as exc_info:
@@ -123,6 +126,7 @@ def test_create_view_rollback_drops_the_view() -> None:
     session = CatalogSession(_catalog(rest, executor))
 
     session.create_view("bwd.table1", "bwd.view1")  # reversible — source is untouched either way
+    session.set_context(None)  # keep 'bwd.missing' below literal, not relative to create_view
     session.set_tags("bwd.missing", ["x"])  # fails: path does not exist
 
     with pytest.raises(CatalogCommitError) as exc_info:

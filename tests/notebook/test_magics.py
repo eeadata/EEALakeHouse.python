@@ -233,8 +233,12 @@ def test_catalog_help_lists_methods_without_needing_credentials(
     # General note about leading-'.'/'../' relative paths — printed once,
     # not per-row, since it applies across every path/source_path/target_path.
     assert "resolves against the current context" in out
-    assert "see use" in out
+    assert "except use's own" in out  # use is the one path that's always literal/absolute
     assert "walks up that many" in out  # ../ support, mentioned generally
+    # A path already starting with 'catalog' (the one real root source) is never
+    # appended to an existing context, even without a leading dot.
+    assert "starts with 'catalog'" in out
+    assert "taken literally as absolute" in out
 
     assert len(displayed) == 1
     table_html = displayed[0].data
@@ -268,10 +272,10 @@ def test_catalog_help_lists_methods_without_needing_credentials(
     # set_tags/delete_tags call out the specific error they can raise.
     assert "Tables/views only — raises CatalogOperationError otherwise." in table_html
     # use/get_context are listed; set_context is deliberately not (use covers it).
-    assert "with or without a leading" in table_html  # use's dot-optional relative paths
-    assert "walks up one level" in table_html  # use's ../ support
+    assert "must be a whole" in table_html  # use takes path literally, never relative
+    assert "never relative to the current context" in table_html
     # use's live existence check (apostrophe in "doesn't" comes back escaped).
-    assert "Raises if the resolved path" in table_html
+    assert "Raises if path" in table_html
     assert "exist in the catalog" in table_html
     assert "get_context" in table_html
     assert "Show the current path" in table_html
@@ -295,6 +299,11 @@ def test_catalog_help_lists_methods_without_needing_credentials(
     assert "deleteview" not in table_html and "deletetable" not in table_html  # renamed
     assert ">list<" in table_html and ">schema<" in table_html
     assert "must be a table or view" in table_html  # schema's type requirement
+    # list's path is now optional — defaults to listing the current context
+    # (the empty-string default's quotes come back html-escaped as &#x27;).
+    assert "path=&#x27;&#x27;" in table_html
+    assert "path may be omitted to list the current context itself" in table_html
+    assert "raises CatalogSessionError if none is set" in table_html
     # list/delete_view/delete_table each spell out the existence error the
     # same way (apostrophe in "doesn't" comes back html-escaped, hence
     # stopping before it).

@@ -103,6 +103,13 @@ def _read_wiki_or_none(catalog: Catalog, path: str, *, idempotency_key: str) -> 
         return None
 
 
+_ROOT_SOURCE = "catalog"
+# This deployment's one real top-level source/space (see e.g. the "catalog." prefix
+# on every real path in debugger/test_catalog_magic.ipynb's TEST_ROOT) — a bare path
+# starting with it is therefore unambiguously absolute, context or not; see
+# `_resolve_path`.
+
+
 def _drop_entry(catalog: Catalog, path: str, *, idempotency_key: str) -> None:
     """Drop whatever entity (table or view) now sits at `path`.
 
@@ -155,10 +162,8 @@ class CatalogSession:
         """Set the "current" catalog path — a later relative path (a leading
         `.`, e.g. `.water_temperature`) resolves against this. `None` clears it.
         `path` here is always taken literally, even if it itself starts with
-        `.` — see `use` for a version that resolves a leading `.` against
-        whatever context already exists, which is what a data custodian
-        deliberately narrowing the context (e.g. `%%catalog use(".2027")`)
-        actually wants.
+        `.` — same as `use`, which differs only in also making a live
+        existence check (see `use`'s own docstring).
 
         Not something a data custodian should normally call directly:
         ordinary use already keeps this up to date on its own (see
@@ -174,20 +179,14 @@ class CatalogSession:
 
     def use(self, path: str | None) -> CatalogSession:
         """Set the current path for every call after this one — same as
-        `set_context`, but `path` may also be relative rather than only a
-        whole path, and `None` clears it exactly like `set_context(None)`.
-        A relative `path` may lead with a `.` (`".2027"`) or not
-        (`"2027"`) — both resolve against whatever context already exists
-        the same way; the dot is optional sugar here, unlike everywhere
-        else in this class (every other verb's `path`/`source_path`/
-        `target_path` still requires it to mean relative, so an absolute
-        path can always be passed even with a context already set — see
-        `_resolve_path`). Once a context exists, `use` therefore has no way
-        to jump straight to an unrelated absolute path without a leading
-        dot; clear it first (`use(None)`) if that's what's needed. `path`
-        may also lead with one or more `../` (or be a bare `..`) to walk
-        up that many levels of the context first — `use("../stations")`
-        moves to a sibling of the context, `use("..")` to its parent.
+        `set_context`, plus a live existence check (below); `None` clears
+        it exactly like `set_context(None)`. Unlike every other verb's
+        `path`/`source_path`/`target_path`, `path` here is always taken
+        literally as a whole, absolute path — never resolved against
+        whatever context already exists, and never accepts a leading `.`
+        or `../` fragment (pass `get_context()`'s own return value, or
+        build the full path yourself, to move somewhere relative to where
+        you already are).
 
         This is the one custodian-facing way to set context deliberately
         (see `%%catalog use(path)` — the cell magic sets it once at the
@@ -197,37 +196,31 @@ class CatalogSession:
         queued step hasn't already touched.
 
         Unlike everything else in this class, this makes a live call
-        against Dremio: the resolved path must already exist as some
-        catalog entity (folder, table, or view) — raises
-        `CatalogSessionError` otherwise, so context never silently points
-        somewhere real work would fail against later. Always stores the
-        fully resolved path — never a `.`/`..`-prefixed fragment — so
-        `get_context()` reads back exactly what `use` just checked.
+        against Dremio: `path` must already exist as some catalog entity
+        (folder, table, or view) — raises `CatalogSessionError` otherwise,
+        so context never silently points somewhere real work would fail
+        against later.
         """
         if path is None:
             self._context = None
             return self
-        if self._context is not None and not path.startswith("."):
-            path = f".{path}"
-        resolved = self._resolve_path(path)
         try:
-            found = self._catalog._catalog_rest.exists(resolved)  # noqa: SLF001 — see module docstring
+            found = self._catalog._catalog_rest.exists(path)  # noqa: SLF001 — see module docstring
         except (CatalogOperationError, EngineStartingError) as exc:
-            raise CatalogSessionError(
-                f"could not check whether {resolved!r} exists: {exc}"
-            ) from exc
+            raise CatalogSessionError(f"could not check whether {path!r} exists: {exc}") from exc
         if not found:
-            raise CatalogSessionError(f"{resolved!r} does not exist in the catalog")
-        self._context = resolved
+            raise CatalogSessionError(f"{path!r} does not exist in the catalog")
+        self._context = path
         return self
 
     def get_context(self) -> str | None:
         """The current path, always the full resolved path — never a
-        `.`/`..`-prefixed fragment, even right after a relative `use` —
-        see `use`/`set_context`. `None` if nothing has been set yet."""
+        `.`/`..`-prefixed fragment, even though most verbs' own relative
+        paths can be — see `set_context`/`_resolve`. `None` if nothing has
+        been set yet."""
         return self._context
 
-    def _resolve_path(self, path: str) -> str:
+    def _resolve_path(self, path: str, *, dot_required: bool = False) -> str:
         """Just the relative -> absolute resolution — does NOT update the
         context; see `_resolve` for the verbs where the touched path also
         becomes the new context. Always returns a full, already-resolved
@@ -236,16 +229,40 @@ class CatalogSession:
         (see `get_context`).
 
         A leading `.` resolves against the current context
-        (`".water_temperature"` -> `f"{context}.water_temperature"`). One
-        or more leading `../` segments (or a bare `..`) instead walk up
-        that many levels of the context *first* — `"../stations"` is a
+        (`".water_temperature"` -> `f"{context}.water_temperature"`); once a
+        context exists, a bare path with no leading `.` at all resolves the
+        same way too (`"water_temperature"` -> `f"{context}.water_temperature"`,
+        same as `".water_temperature"`) — the dot is optional sugar there,
+        not a marker that distinguishes relative from absolute. A bare path
+        starting with `_ROOT_SOURCE` (e.g. `"catalog.other_root.table"`) is
+        the one unambiguous exception: real absolute paths in this
+        deployment always start there, so it's taken literally as absolute
+        even with a context already set, rather than getting appended to
+        it — no need to clear context first just to pass one alongside a
+        relative path. `dot_required=True` goes further: a bare path is
+        then *always* taken literally as absolute, context or not,
+        regardless of whether it starts with `_ROOT_SOURCE`.
+        `data_copy`/`data_move`/`create_view` pass `dot_required=True` for
+        both of their paths — they resolve `source_path`/`target_path`
+        independently against the *same* starting context (see `_resolve`),
+        and a `_ROOT_SOURCE` check alone can't tell a deliberately relative
+        bare path (which they still want appended) apart from one that
+        merely doesn't happen to start with `_ROOT_SOURCE` but was meant
+        literally anyway. Everywhere else, a bare path is only ever taken
+        literally as absolute when no context has been set yet, or it
+        starts with `_ROOT_SOURCE`. One or more leading `../` segments (or
+        a bare `..`) instead walk up that many levels of the context
+        *first*, regardless of `dot_required` — `"../stations"` is a
         sibling of the context, `"../../stations"` a level further up, and
         so on; `".."` alone (no name after it) resolves to the context's
         parent itself."""
         if path == ".." or path.startswith("../"):
             return self._resolve_parent_path(path)
         if not path.startswith("."):
-            return path
+            is_root_absolute = path == _ROOT_SOURCE or path.startswith(f"{_ROOT_SOURCE}.")
+            if dot_required or self._context is None or is_root_absolute:
+                return path
+            path = f".{path}"
         if self._context is None:
             raise CatalogSessionError(
                 f"{path!r} is relative (starts with '.') but no context is set yet — "
@@ -307,11 +324,13 @@ class CatalogSession:
         `target_path` is gone the moment this step runs; there is nothing to
         restore, so this step cannot be undone (see `CatalogCommitError`).
 
-        Either path may be relative (a leading `.`) to the session's current
-        context — see `set_context`; `target_path` becomes the new context
+        Either path may be relative to the session's current context — see `set_context` —
+        but here (unlike every other verb) a leading `.` is required to mean relative;
+        a bare path is always taken literally as absolute, context or not (see
+        `_resolve_path`'s `dot_required`). `target_path` becomes the new context
         afterwards."""
-        source_path = self._resolve_path(source_path)
-        target_path = self._resolve_path(target_path)
+        source_path = self._resolve_path(source_path, dot_required=True)
+        target_path = self._resolve_path(target_path, dot_required=True)
         self._context = operations._parent_path(target_path) or self._context  # noqa: SLF001
 
         def run(catalog: Catalog, key: str) -> _Undo | None:
@@ -347,11 +366,13 @@ class CatalogSession:
         `target_path` to `source_path`. Same `overwrite=True` limitation as
         `data_copy`.
 
-        Either path may be relative (a leading `.`) to the session's current
-        context — see `set_context`; `target_path` becomes the new context
+        Either path may be relative to the session's current context — see `set_context` —
+        but here (unlike every other verb) a leading `.` is required to mean relative;
+        a bare path is always taken literally as absolute, context or not (see
+        `_resolve_path`'s `dot_required`). `target_path` becomes the new context
         afterwards."""
-        source_path = self._resolve_path(source_path)
-        target_path = self._resolve_path(target_path)
+        source_path = self._resolve_path(source_path, dot_required=True)
+        target_path = self._resolve_path(target_path, dot_required=True)
         self._context = operations._parent_path(target_path) or self._context  # noqa: SLF001
 
         def run(catalog: Catalog, key: str) -> _Undo | None:
@@ -396,11 +417,13 @@ class CatalogSession:
         the moment this step runs; there is nothing to restore, so this
         step cannot be undone (see `CatalogCommitError`).
 
-        Either path may be relative (a leading `.`) to the session's current
-        context — see `set_context`; `target_path` becomes the new context
+        Either path may be relative to the session's current context — see `set_context` —
+        but here (unlike every other verb) a leading `.` is required to mean relative;
+        a bare path is always taken literally as absolute, context or not (see
+        `_resolve_path`'s `dot_required`). `target_path` becomes the new context
         afterwards."""
-        source_path = self._resolve_path(source_path)
-        target_path = self._resolve_path(target_path)
+        source_path = self._resolve_path(source_path, dot_required=True)
+        target_path = self._resolve_path(target_path, dot_required=True)
         self._context = operations._parent_path(target_path) or self._context  # noqa: SLF001
 
         def run(catalog: Catalog, key: str) -> _Undo | None:
@@ -426,7 +449,7 @@ class CatalogSession:
         """Queue `settagsto` (replaces the tag set). Undo restores whatever
         tags were on `path` immediately before this step ran.
 
-        `path` may be relative (a leading `.`) to the session's current
+        `path` may be relative — with or without a leading `.` — to the session's current
         context — see `set_context`; it becomes the new context afterwards."""
         path = self._resolve(path)
 
@@ -446,7 +469,7 @@ class CatalogSession:
         """Queue `deletetags`. Undo restores the full tag set `path` had
         immediately before this step ran.
 
-        `path` may be relative (a leading `.`) to the session's current
+        `path` may be relative — with or without a leading `.` — to the session's current
         context — see `set_context`; it becomes the new context afterwards."""
         path = self._resolve(path)
 
@@ -468,7 +491,7 @@ class CatalogSession:
         """Queue `setwikito`. Undo restores the previous wiki text verbatim,
         or deletes it if `path` had none.
 
-        `path` may be relative (a leading `.`) to the session's current
+        `path` may be relative — with or without a leading `.` — to the session's current
         context — see `set_context`; it becomes the new context afterwards."""
         path = self._resolve(path)
 
@@ -492,7 +515,7 @@ class CatalogSession:
         """Queue `deletewiki`. Undo restores the previous wiki text, if there
         was one — a no-op if `path` had no wiki to begin with.
 
-        `path` may be relative (a leading `.`) to the session's current
+        `path` may be relative — with or without a leading `.` — to the session's current
         context — see `set_context`; it becomes the new context afterwards."""
         path = self._resolve(path)
 
@@ -515,7 +538,7 @@ class CatalogSession:
         actually created it; `createfolder` is idempotent, so a `path`
         that already existed is left alone on rollback too.
 
-        `path` may be relative (a leading `.`) to the session's current
+        `path` may be relative — with or without a leading `.` — to the session's current
         context — see `set_context` — and becomes the new context *itself*
         afterwards (a folder's contents, not its parent, is where a
         following short name most likely points)."""
@@ -541,7 +564,7 @@ class CatalogSession:
         contents cannot be recreated, so this always leaves the commit
         unable to claim a clean rollback if a later step fails.
 
-        `path` may be relative (a leading `.`) to the session's current
+        `path` may be relative — with or without a leading `.` — to the session's current
         context — see `set_context`. Does not change the context itself —
         there's nothing meaningful to navigate into once it's deleted."""
         path = self._resolve_path(path)
@@ -561,7 +584,7 @@ class CatalogSession:
         `CatalogOperationError` if `path` doesn't exist at all, so a typo
         fails clearly instead of silently doing nothing.
 
-        `path` may be relative (a leading `.`) to the session's current
+        `path` may be relative — with or without a leading `.` — to the session's current
         context — see `set_context`. Does not change the context itself —
         there's nothing meaningful to navigate into once it's deleted."""
         path = self._resolve_path(path)
@@ -583,7 +606,7 @@ class CatalogSession:
         `CatalogOperationError` if `path` doesn't exist at all, so a typo
         fails clearly instead of silently doing nothing.
 
-        `path` may be relative (a leading `.`) to the session's current
+        `path` may be relative — with or without a leading `.` — to the session's current
         context — see `set_context`. Does not change the context itself —
         there's nothing meaningful to navigate into once it's deleted."""
         path = self._resolve_path(path)
@@ -605,7 +628,7 @@ class CatalogSession:
         `CatalogOperationError` if `path` doesn't exist, or exists but has
         no wiki at all.
 
-        `path` may be relative (a leading `.`) to the session's current
+        `path` may be relative — with or without a leading `.` — to the session's current
         context — see `set_context`."""
         path = self._resolve_path(path)
         return self._catalog.getwikifrom(path, idempotency_key=self._key())
@@ -617,12 +640,12 @@ class CatalogSession:
         isn't a table/view (folders have Dremio's own wiki Meta Data
         section for this instead — see `Catalog.setmeta2wiki`).
 
-        `path` may be relative (a leading `.`) to the session's current
+        `path` may be relative — with or without a leading `.` — to the session's current
         context — see `set_context`."""
         path = self._resolve_path(path)
         return self._catalog.gettagsfrom(path, idempotency_key=self._key())
 
-    def list(self, path: str) -> list[str]:
+    def list(self, path: str = "") -> list[str]:
         """Full paths of every table and view under `path`, at any depth
         (see `gettablesfrom`). Answered immediately — not queued, since
         there's nothing to commit or undo. Raises `CatalogOperationError`
@@ -630,9 +653,19 @@ class CatalogSession:
         (an empty result and "nothing there" look the same to it), so this
         checks first rather than returning `[]` for a typo'd path.
 
-        `path` may be relative (a leading `.`) to the session's current
-        context — see `set_context`."""
-        path = self._resolve_path(path)
+        `path` may be a whole, absolute path, or relative — with or
+        without a leading `.` — to the session's current context (see
+        `set_context`). Omitted (or `""`), it lists the content of the
+        current context itself — raises `CatalogSessionError` if no
+        context is set yet."""
+        if not path:
+            if self._context is None:
+                raise CatalogSessionError(
+                    "path was omitted but no context is set yet — pass a path, or call use() first"
+                )
+            path = self._context
+        else:
+            path = self._resolve_path(path)
         if not self._catalog._catalog_rest.exists(path):  # noqa: SLF001 — see module docstring
             raise CatalogOperationError(f"{path!r} does not exist")
         return self._catalog.gettablesfrom(path, idempotency_key=self._key())
@@ -645,7 +678,7 @@ class CatalogSession:
         otherwise (a folder has no schema of its own), or if `path` doesn't
         exist at all.
 
-        `path` may be relative (a leading `.`) to the session's current
+        `path` may be relative — with or without a leading `.` — to the session's current
         context — see `set_context`."""
         path = self._resolve_path(path)
         operations._require_table_or_view(  # noqa: SLF001 — see module docstring

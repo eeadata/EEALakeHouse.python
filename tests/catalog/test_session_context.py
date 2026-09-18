@@ -57,6 +57,42 @@ def test_touching_a_leaf_infers_context_for_a_later_relative_call() -> None:
     assert rest.get_tags("bwd.reference.stations") == ["reviewed"]
 
 
+def test_bare_path_starting_with_root_source_stays_absolute_even_with_context_set() -> None:
+    # "catalog" is this deployment's one real top-level source (_ROOT_SOURCE) — a
+    # bare path starting with it is unambiguous, so it's never appended to an
+    # existing context the way an ordinary bare name ("stations" above) is.
+    rest = FakeCatalogRest(
+        existing={
+            "a",
+            "bwd",
+            "bwd.reference",
+            "catalog",
+            "catalog.other_root",
+            "catalog.other_root.table1",
+        }
+    )
+    session = CatalogSession(_catalog(rest))
+
+    session.set_context("bwd.reference")
+    session.set_tags("catalog.other_root.table1", ["reviewed"])
+
+    report = session.commit()
+
+    assert report.succeeded == ["set tags ['reviewed'] on 'catalog.other_root.table1'"]
+
+
+def test_bare_path_equal_to_root_source_stays_absolute_even_with_context_set() -> None:
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference", "catalog"})
+    session = CatalogSession(_catalog(rest))
+
+    session.set_context("bwd.reference")
+    session.set_tags("catalog", ["reviewed"])
+
+    report = session.commit()
+
+    assert report.succeeded == ["set tags ['reviewed'] on 'catalog'"]
+
+
 def test_set_context_seeds_it_explicitly_before_any_path_is_used() -> None:
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference.water_temperature"})
     session = CatalogSession(_catalog(rest))
@@ -83,68 +119,33 @@ def test_use_with_a_whole_path_sets_context_like_set_context() -> None:
     assert report.succeeded == ["set tags ['reviewed'] on 'bwd.reference.water_temperature'"]
 
 
-def test_use_with_a_relative_path_resolves_against_the_existing_context() -> None:
+def test_use_never_resolves_a_leading_dot_relatively() -> None:
+    # use() takes path literally as a whole, absolute path — unlike every
+    # other verb, a leading '.' means nothing special here; it's just part
+    # of a literal string that (in this case) doesn't exist in the catalog.
     rest = FakeCatalogRest(
-        existing={
-            "a",
-            "bwd",
-            "bwd.reference",
-            "bwd.reference.2027",
-            "bwd.reference.2027.water_temperature",
-        }
+        existing={"a", "bwd", "bwd.reference", "bwd.reference.2027"},
     )
     session = CatalogSession(_catalog(rest))
 
     session.use("bwd.reference")
-    session.use(".2027")  # narrows bwd.reference -> bwd.reference.2027
-    session.set_tags(".water_temperature", ["reviewed"])
+    with pytest.raises(CatalogSessionError, match="does not exist in the catalog"):
+        session.use(".2027")  # NOT resolved against 'bwd.reference' — taken literally
 
-    report = session.commit()
-
-    assert report.succeeded == ["set tags ['reviewed'] on 'bwd.reference.2027.water_temperature'"]
+    assert session.get_context() == "bwd.reference"  # unchanged after the failed check
 
 
-def test_use_with_a_relative_path_and_no_context_yet_raises() -> None:
-    rest = FakeCatalogRest(existing={"a", "bwd"})
-    session = CatalogSession(_catalog(rest))
-
-    with pytest.raises(CatalogSessionError, match="no context is set"):
-        session.use(".reference")
-
-
-def test_use_bare_path_resolves_relative_once_context_exists() -> None:
-    # No leading '.' needed once inside a context — "2027" and ".2027" mean
-    # the same thing here (unlike every other verb's path arguments, which
-    # always require the dot to mean relative).
-    rest = FakeCatalogRest(
-        existing={
-            "a",
-            "bwd",
-            "bwd.reference",
-            "bwd.reference.2027",
-            "bwd.reference.2027.water_temperature",
-        }
-    )
-    session = CatalogSession(_catalog(rest))
-
-    session.use("bwd.reference")
-    session.use("2027")  # bare, no dot — still narrows to bwd.reference.2027
-    session.set_tags(".water_temperature", ["reviewed"])
-
-    report = session.commit()
-
-    assert report.succeeded == ["set tags ['reviewed'] on 'bwd.reference.2027.water_temperature'"]
-
-
-def test_use_bare_path_with_no_context_yet_is_absolute() -> None:
-    # The very first use() has nothing to be relative to, so a bare path is
-    # unambiguous: it must be the whole path.
-    rest = FakeCatalogRest(existing={"a", "bwd"})
+def test_use_always_takes_a_bare_path_literally() -> None:
+    # Whether or not a context already exists, a bare path passed to use()
+    # is always the whole, absolute path — never relative to it.
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference", "bwd.other"})
     session = CatalogSession(_catalog(rest))
 
     session.use("bwd")
-
     assert session.get_context() == "bwd"
+
+    session.use("bwd.other")  # NOT relative to 'bwd' — still a literal, whole path
+    assert session.get_context() == "bwd.other"
 
 
 def test_use_none_clears_context_like_set_context() -> None:
@@ -155,8 +156,7 @@ def test_use_none_clears_context_like_set_context() -> None:
     session.use(None)
 
     assert session.get_context() is None
-    # Cleared, so a bare path is absolute again rather than relative to
-    # whatever used to be there.
+
     session.use("bwd.other")
     assert session.get_context() == "bwd.other"
 
@@ -212,6 +212,31 @@ def test_data_copy_resolves_both_paths_against_the_same_starting_context() -> No
     ]
 
 
+def test_data_copy_bare_target_path_stays_absolute_even_with_context_set() -> None:
+    # data_copy/data_move/create_view are the deliberate exception to the
+    # dot-optional rule: they resolve source_path/target_path independently
+    # against the same starting context, so a bare path must stay absolute
+    # even with a context set — otherwise pairing a relative source with a
+    # genuinely unrelated absolute target would be inexpressible.
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.draft.raw_2026", "other.reference"})
+    executor = FakeExecutor(
+        rows_sequence=[
+            [{"TABLE_NAME": "raw_2026"}],  # source exists
+            [],  # target does not exist yet
+        ]
+    )
+    session = CatalogSession(_catalog(rest, executor))
+
+    session.set_context("bwd.draft")
+    session.data_copy(".raw_2026", "other.reference.water_temperature")  # bare, unrelated root
+
+    report = session.commit()
+
+    assert report.succeeded == [
+        "data_copy 'bwd.draft.raw_2026' -> 'other.reference.water_temperature'",
+    ]
+
+
 def test_data_move_resolves_both_paths_against_the_same_starting_context() -> None:
     rest = FakeCatalogRest(
         existing={"a", "bwd", "bwd.draft.raw_2026", "bwd.reference", "bwd.reference.stations"}
@@ -262,11 +287,14 @@ def test_create_view_resolves_both_paths_against_the_same_starting_context() -> 
 
 
 def test_bare_dotdot_resolves_to_the_parent_of_the_context() -> None:
+    # use() no longer accepts '..' at all (see test_use_never_resolves_a_
+    # leading_dot_relatively) — create_folder exercises the same
+    # _resolve_path/_resolve_parent_path machinery every other verb shares.
     rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference", "bwd.reference.2027"})
     session = CatalogSession(_catalog(rest))
 
     session.use("bwd.reference.2027")
-    session.use("..")
+    session.create_folder("..")
 
     assert session.get_context() == "bwd.reference"
 
@@ -278,7 +306,7 @@ def test_dotdot_slash_name_resolves_to_a_sibling_of_the_context() -> None:
     session = CatalogSession(_catalog(rest))
 
     session.use("bwd.reference.2027.stations")
-    session.use("../water_temp")  # sibling of the current context
+    session.create_folder("../water_temp")  # sibling of the current context
 
     assert session.get_context() == "bwd.reference.2027.water_temp"
 
@@ -290,15 +318,12 @@ def test_chained_dotdot_walks_up_multiple_levels() -> None:
     session = CatalogSession(_catalog(rest))
 
     session.use("bwd.reference.2027.stations")
-    session.use("../../../archive")  # up three levels, then into "archive"
+    session.create_folder("../../../archive")  # up three levels, then into "archive"
 
     assert session.get_context() == "bwd.archive"
 
-    # A bare absolute path is only absolute again once the context is
-    # cleared — see use()'s own docstring on this tradeoff.
-    session.use(None)
-    session.use("bwd.reference.2027.stations")
-    session.use("../..")  # up two levels, no name after it
+    session.set_context("bwd.reference.2027.stations")  # re-seed for the second half
+    session.create_folder("../..")  # up two levels, no name after it
 
     assert session.get_context() == "bwd.reference"
 
@@ -310,7 +335,7 @@ def test_dotdot_past_the_top_of_the_context_raises() -> None:
     session.use("bwd")
 
     with pytest.raises(CatalogSessionError, match="goes above the top"):
-        session.use("..")
+        session.create_folder("..")
 
 
 def test_dotdot_with_no_context_yet_raises() -> None:
@@ -318,12 +343,12 @@ def test_dotdot_with_no_context_yet_raises() -> None:
     session = CatalogSession(_catalog(rest))
 
     with pytest.raises(CatalogSessionError, match="no context is set"):
-        session.use("../reference")
+        session.create_folder("../reference")
 
 
-def test_dotdot_works_for_verbs_other_than_use_too() -> None:
-    # ../ is a general path-resolution feature (_resolve_path), not
-    # something special-cased inside use() alone.
+def test_dotdot_works_for_ordinary_verbs() -> None:
+    # ../ is a general path-resolution feature (_resolve_path), available
+    # to every verb except use(), which only takes whole, absolute paths.
     rest = FakeCatalogRest(
         existing={
             "a",
@@ -348,7 +373,7 @@ def test_get_context_after_dotdot_is_the_full_resolved_path() -> None:
     session = CatalogSession(_catalog(rest))
 
     session.use("bwd.reference.2027")
-    session.use("..")
+    session.create_folder("..")
 
     context = session.get_context()
     assert context == "bwd.reference"
@@ -369,7 +394,7 @@ def test_use_leaves_context_unchanged_after_a_failed_check() -> None:
 
     session.use("bwd.reference")
     with pytest.raises(CatalogSessionError, match="does not exist"):
-        session.use(".nonexistent")
+        session.use("bwd.nonexistent")
 
     assert session.get_context() == "bwd.reference"  # still the last good value
 
