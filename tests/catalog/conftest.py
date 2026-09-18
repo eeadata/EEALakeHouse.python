@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -190,7 +191,13 @@ class FakeCatalogRest:
         depth = path.count(".") + 1
         return [p for p in self.existing if p.startswith(prefix) and p.count(".") == depth]
 
-    def delete_folder(self, path: str, *, cascade: bool = False) -> None:
+    def delete_folder(
+        self,
+        path: str,
+        *,
+        cascade: bool = False,
+        delete_dataset: Callable[[str], None] | None = None,
+    ) -> None:
         from eea_datalakehouse.catalog.errors import CatalogOperationError
 
         if self._raise_on_delete_folder is not None:
@@ -208,7 +215,9 @@ class FakeCatalogRest:
         if cascade:
             for child in children:
                 if child in self.folders:
-                    self.delete_folder(child, cascade=True)
+                    self.delete_folder(child, cascade=True, delete_dataset=delete_dataset)
+                elif delete_dataset is not None:
+                    delete_dataset(child)
                 else:
                     self.existing.discard(child)
                     self.deleted.append(child)
