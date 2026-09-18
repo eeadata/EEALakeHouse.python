@@ -203,25 +203,36 @@ custodian, not necessarily a developer. `%ingest help` does the same for `Ingest
 
 `%%catalog` (the cell-magic form) sets the context once, with `use(path)` on its magic line,
 then runs every other line of the cell in order under that context, without repeating the full
-path on each line. A leading `.` resolves any `path`/`source_path`/`target_path` against the
-context (so `data_copy`/`set_tags`/`create_folder`/... all understand it); `use` alone also accepts a bare
-path with no dot, once a context exists — `"2027"` and `".2027"` narrow it the same way there.
-One or more leading `../` (or a bare `..`) instead walks up that many levels of the context
-first, everywhere a relative path is understood, not just in `use` — `"../water_temperature"` is
-a sibling of the context, `"../../water_temperature"` a level further up. `use` also makes a live
-check that the resolved path actually exists in the catalog, raising if it doesn't, rather than
-silently pointing context somewhere later calls would fail against anyway; `use(None)` clears the
-context. `get_context()` shows what it currently is — always the full resolved path:
+path on each line. `use`'s own `path` must always be a whole, absolute path — unlike every
+other verb, it's never resolved against whatever context already exists, and never accepts a
+leading `.`/`../`. It does make a live check that `path` actually exists in the catalog first,
+raising if it doesn't, rather than silently pointing context somewhere later calls would fail
+against anyway; `use(None)` clears the context. Every other verb's own `path`/`source_path`/
+`target_path` still resolves against the current context once one is set — with or without a
+leading `.` (`"2027"` and `".2027"` mean the same thing) — unless it already starts with
+`catalog` (this deployment's one real root source), in which case it's always taken literally
+as absolute rather than appended to the context, dot or not. `data_copy`/`data_move`/
+`create_view`'s two paths are a further exception: they resolve `source_path`/`target_path`
+independently against that same context, so routinely pair a relative one with a genuinely
+unrelated absolute one, and still require the dot to mean relative (a bare path there is
+always absolute, context or not, `catalog`-prefixed or not). One or more leading `../` (or a
+bare `..`) instead walks up that many levels of the context first, everywhere a relative path
+is understood except inside `use` itself — `"../water_temperature"` is a sibling of the
+context, `"../../water_temperature"` a level further up. `get_context()` shows what the
+context currently is — always the full resolved path:
 
 ```python
 %%catalog use("bwd.reference")
-set_tags(".water_temperature", ["reviewed"])
-create_folder(".2027")    # create_folder still needs the dot — only use() makes it optional
+set_tags("water_temperature", ["reviewed"])  # bare, no dot — same as ".water_temperature"
+create_folder(".2027")
 
-%catalog use("bwd.reference")   # back to a path that already exists
-%catalog use("2027")            # bare, no dot — same as use(".2027"); already created above
-%catalog get_context()          # -> 'bwd.reference.2027'
-%catalog set_tags("../water_temperature", ["archived"])  # ../ works for any verb, not just use()
+%catalog use("bwd.reference.2027")   # use() always takes the whole, absolute path
+%catalog get_context()               # -> 'bwd.reference.2027'
+%catalog set_tags("../water_temperature", ["archived"])  # ../ works for any verb except use()
+%catalog get_tags("catalog.other_root.assessments")  # starts with 'catalog' — absolute, not appended
+%catalog data_copy(".water_temperature", "other_root.archive.water_temperature_2027")
+#                                          ^ bare, but data_copy/data_move/create_view always
+#                                            take a bare target_path/source_path literally
 ```
 
 `get_wiki(path)`, `get_tags(path)`, `list(path)` (every table/view under `path`, at any depth)
@@ -230,12 +241,15 @@ to commit or undo. `delete_view(path)`/`delete_table(path)` queue like every oth
 unlike the idempotent `DROP ... IF EXISTS` `Catalog.deleteview`/`deletetable` wrap — require
 `path` to already exist, and (like `delete_folder`) can never be undone. Every one of these
 raises `CatalogOperationError` if `path` doesn't exist; `schema` also requires it to be a table
-or view, not a folder:
+or view, not a folder. `list`'s `path` may also be omitted (or `""`) to list the current
+context itself — raises `CatalogSessionError` if none is set yet:
 
 ```python
 %catalog get_wiki("bwd.reference.water_temperature")
 %catalog get_tags("bwd.reference.water_temperature")
 %catalog list("bwd.reference")      # -> ['bwd.reference.water_temperature', ...]
+%catalog use("bwd.reference")
+%catalog list()                     # same result — path omitted, lists the context itself
 %catalog schema("bwd.reference.water_temperature")   # -> TableInfo(schema={...}, row_count=...)
 %catalog delete_view("bwd.reference.old_view")
 ```

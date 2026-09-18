@@ -23,14 +23,11 @@ behaviour described below is unchanged; there's just no longer a separate
 still queues/commits as described throughout this doc. Context has also
 grown past what's described below: `use(path)` (also via `%%catalog
 use(path)`, the cell-magic form) sets it deliberately — making a live
-check that the resolved path exists in the catalog first, unlike
-everything else here, and always storing the full resolved path, never a
-raw `.`/`..`-prefixed fragment — `get_context()` reads it back, and a
-leading `../` (or a bare `..`) on any relative path, not just inside
-`use`, walks up that many levels of the context first. `copy`/`move` were
-later renamed `datacopy`/`datamove`, matching `Catalog`'s own names instead
-of inventing friendlier ones, then renamed again to `data_copy`/`data_move`
-for consistency with the rest of the facade's underscored verbs (`Catalog`'s
+check that `path` exists in the catalog first, unlike everything else
+here — and `get_context()` reads it back. `copy`/`move` were later renamed
+`datacopy`/`datamove`, matching `Catalog`'s own names instead of inventing
+friendlier ones, then renamed again to `data_copy`/`data_move` for
+consistency with the rest of the facade's underscored verbs (`Catalog`'s
 own `datacopy`/`datamove` are unchanged — only the `CatalogSession`/
 `%catalog` wrapper got the underscore); six more verbs were added — read-only
 `get_wiki`, `get_tags`, `list`, `schema` (answered immediately, like
@@ -42,10 +39,46 @@ for consistency with `delete_folder`/`delete_wiki`). `tag`/`untag` were
 similarly renamed `set_tags`/`delete_tags` (matching `set_wiki`/
 `delete_wiki`'s pattern), and `set_meta` was removed — the raw
 `Catalog.setmeta2wiki`/`getmetafromwiki` are still there for a folder's
-wiki Meta Data section, just not wrapped by `CatalogSession` any more. See
-`src/eea_datalakehouse/notebook/magics.py`'s module docstring and
+wiki Meta Data section, just not wrapped by `CatalogSession` any more.
+
+Relative-path resolution grew, then partly retreated. It first grew past
+a leading `.`: a leading `../` (or a bare `..`) on any relative path
+walked up that many levels of the context first, and — since requiring a
+dot everywhere turned out to be a real papercut in practice (a custodian's
+first instinct after `use(...)` was to type a bare short name regardless
+of which verb came next) — every single-path verb started accepting a
+bare path with no leading `.` at all too, once a context existed, the same
+as `use` already did (`data_copy`/`data_move`/`create_view` are the
+deliberate exception: they resolve `source_path`/`target_path`
+independently against the *same* starting context and routinely pair a
+relative one with a genuinely unrelated absolute one in the same call, so
+a bare path there still always means absolute, context or not). `use`
+itself then reverted the other way: it now only ever accepts a whole,
+absolute `path` — never resolved against whatever context already exists,
+and never a leading `.`/`../` fragment — so pointing context somewhere
+always means saying exactly where, with the same live existence check as
+before. Every other verb's own relative-path behaviour (dot-optional,
+`../`-aware) is unchanged. `list`'s own `path` became optional on top of
+that — omitted (or `""`), it lists the current context itself, raising
+`CatalogSessionError` if none is set, rather than making a custodian who's
+already `use()`d somewhere repeat that same path right back to `list()`.
+
+The dot-optional rule then grew one more exception of its own: a bare path
+that already starts with `catalog` (`_ROOT_SOURCE` in `session.py` — this
+deployment's one real top-level source) is always taken literally as
+absolute, context or not, rather than getting appended to whatever
+context happens to be set. Before this, passing a full `catalog....` path
+alongside an already-set context — mixing an absolute path with ordinary
+relative use in the same session — silently produced a nonsense
+double-nested path (`f"{context}.catalog...."`) unless a custodian
+remembered to clear context first; `_ROOT_SOURCE` makes that case
+unambiguous instead. `data_copy`/`data_move`/`create_view` don't get this
+treatment — a `_ROOT_SOURCE` check can't tell a deliberately relative bare
+path (still meant to be appended there) apart from one that just happens
+not to start with `_ROOT_SOURCE`, so they keep requiring the dot outright.
+See `src/eea_datalakehouse/notebook/magics.py`'s module docstring and
 `src/eea_datalakehouse/catalog/session.py`'s `use`/`get_context`/
-`_resolve_path` for the current, authoritative behaviour.
+`_resolve_path`/`list` for the current, authoritative behaviour.
 
 ## The facade's surface, end to end
 
@@ -319,8 +352,10 @@ This splits into two sides that live in two different repositories.
 open question below with an explicit marker (a leading `.`, e.g.
 `session.set_tags(".water_temperature", ...)`), and — critically — `set_context`
 itself is not something a data custodian is expected to call directly
-(`use`, added later, is the custodian-facing entry point built on the same
-mechanism — see "What it exposes" above):
+(`use`, added later, is the custodian-facing entry point for setting
+context deliberately — see "What it exposes" above — though it takes only
+a whole, absolute path, plus a live existence check `set_context` itself
+doesn't make):
 
 - **Ordinary use already keeps it current on its own.** Every queueing verb
   updates the context from whatever path it just touched (the target's
