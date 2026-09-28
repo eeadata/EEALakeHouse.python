@@ -36,7 +36,7 @@ pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@staging"    
 ```
 
 # staging's latest release (early access) — pin to the tag the "staging" badge above shows
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.17-staging"
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.18-staging"
 ```
 
 ## Usage
@@ -295,6 +295,25 @@ pip install -e ".[dev]"
 pytest
 ```
 
+### Redmine (taskman) notes
+
+A commit whose message references an issue as `refs #1234` or `fixes #1234`
+(not a bare `#1234`) is posted as a note on that issue when you push, under
+your own Redmine account. This only adds a note; it never changes the issue's
+status. It runs from git hooks on your machine using your own API key, so the
+key never goes to GitHub. One-time setup per clone:
+
+```bash
+git config core.hooksPath .githooks   # VS Code's "Install git hooks" task does this on folder open
+echo "REDMINE_API_KEY=<your key>" >> debugger/.env   # taskman > My account > API access key
+```
+
+CI ("Redmine hook check") fails for any commit that references an issue but
+was made without the hooks or without a key. To fix one, set up the hooks as
+above, then run
+`git rebase --exec 'git commit --amend --no-edit' <base-branch>` and
+force-push.
+
 ## Releasing a new version
 
 1. Update `version` in `pyproject.toml` (e.g. `0.2.0`).
@@ -344,7 +363,7 @@ To pin to one specific release instead, use the exact tag the live badges under
 %pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.17"
 
 # staging's latest release (early access)
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.17-staging"
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.18-staging"
 ```
 
 Use the `%pip` magic rather than `!pip` — it installs into the kernel the
