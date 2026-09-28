@@ -1,0 +1,60 @@
+name: Redmine Notify
+
+# Posts each pushed commit's message as a note on any Redmine (taskman)
+# issue it references, on every push to every branch — see
+# .github/scripts/redmine_notify.py for the actual logic and the exact
+# "refs #1234" / "fixes #1234" reference convention it looks for (chosen
+# deliberately over a bare "#1234": this repo's own merge-commit messages
+# already contain GitHub PR numbers as "#123", which would otherwise
+# misfire as Redmine updates). This only posts a note — it never changes
+# the issue's status, tracker, assignee, etc.
+#
+# Requires one repository secret, and supports an optional second one for
+# per-author attribution (each commit posts under ITS author's own Redmine
+# identity instead of one shared account) — see this repo's Settings >
+# Secrets and variables > Actions > New repository secret:
+#
+#   REDMINE_API_KEY (required) — a Redmine user's own API key (that user's
+#                     "My account" page in Redmine has a "Show" link for it
+#                     once API access is enabled for the account/instance).
+#                     Used for any commit whose author isn't in the map
+#                     below — so this alone is enough for the workflow to
+#                     work, just under one shared identity.
+#
+#   REDMINE_API_KEYS_JSON (optional) — a JSON object mapping each
+#                     contributor's git author email (lowercase) to THEIR
+#                     OWN Redmine API key, e.g.:
+#                       {"alice@example.org": "abc123...", "bob@example.org": "def456..."}
+#                     A commit whose author email isn't a key in this map
+#                     falls back to REDMINE_API_KEY above. Add people to this
+#                     one secret as they get their own Redmine key — no
+#                     workflow-file change needed per person.
+
+on:
+  push:
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+
+env:
+  REDMINE_URL: https://taskman.eionet.europa.eu
+
+jobs:
+  notify-redmine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            .github/scripts/redmine_notify.py
+          sparse-checkout-cone-mode: false
+
+      - name: Post commit notes to referenced Redmine issues
+        env:
+          REDMINE_API_KEY: ${{ secrets.REDMINE_API_KEY }}
+          REDMINE_API_KEYS_JSON: ${{ secrets.REDMINE_API_KEYS_JSON }}
+          REPO_FULL_NAME: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: python3 .github/scripts/redmine_notify.py
