@@ -1,0 +1,35 @@
+name: Redmine Notify
+
+# Redmine (taskman) notes are posted from each developer's own machine by the
+# git hooks in .githooks/, with that developer's own API key from their local
+# .env — so no Redmine key is stored in GitHub at all. See
+# .githooks/redmine.py for the logic and the "refs #1234" / "fixes #1234"
+# reference convention it looks for.
+#
+# This workflow only checks that the hooks were in use: any commit that
+# references an issue must carry the "Redmine-Hook: v1" trailer the
+# commit-msg hook adds (only when a key is configured). Make "Redmine hook
+# check" a required status check in branch protection for main/staging to
+# stop such commits from being merged unposted.
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Redmine hook check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # pull_request mode walks base..head with git log.
+          fetch-depth: 0
+
+      - name: Check commits referencing Redmine issues were made with the hooks
+        run: python3 .githooks/redmine.py check
