@@ -53,6 +53,7 @@ ZERO_SHA = "0" * 40
 # Commits GitHub itself creates (web-UI edits, squash/rebase merges) can't
 # have run anyone's local hooks, so the CI check doesn't hold them to it.
 GITHUB_COMMITTER_EMAIL = "noreply@github.com"
+# Nor does it hold commits from before the hooks were added (predates_hooks).
 
 # Redmine's own default reference keywords (Settings > Repositories, both the
 # non-closing "refs"/"references" and the closing "fixes"/"closes"/"resolves"
@@ -255,12 +256,21 @@ def ci_commits() -> list[dict]:
     ]
 
 
+def predates_hooks(sha: str) -> bool:
+    """A commit whose own tree has no .githooks/redmine.py was made before
+    the hooks existed in this repo, so it can't be expected to carry the
+    trailer."""
+    result = subprocess.run(["git", "cat-file", "-e", f"{sha}:.githooks/redmine.py"], capture_output=True)
+    return result.returncode != 0
+
+
 def cmd_check() -> int:
     missing = [
         c for c in ci_commits()
         if extract_issue_ids(c["message"])
         and not TRAILER_RE.search(c["message"])
         and c["committer_email"].lower() != GITHUB_COMMITTER_EMAIL
+        and not predates_hooks(c["id"])
     ]
     for c in missing:
         print(f"::error::Commit {c['id'][:12]} references a Redmine issue but was not made with "
