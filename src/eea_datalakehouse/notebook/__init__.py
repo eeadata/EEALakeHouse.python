@@ -1,10 +1,10 @@
-"""The notebook-facing surface — `%catalog`/`%ingest` magics over
-`CatalogSession`/`IngestSession` (see `docs/notebook-facade-for-data-
+"""The notebook-facing surface — `%catalog`/`%ingest`/`%sdi` magics over
+`CatalogSession`/`IngestSession`/`SdiSession` (see `docs/notebook-facade-for-data-
 scientists.md`). Requires IPython, which the rest of this package does not
 — install the `notebook` extra (`pip install "EEADataLakehouse[notebook]"`)
 to get it.
 
-Importing this package inside a running IPython shell registers both magics
+Importing this package inside a running IPython shell registers all three magics
 as a side effect — a custodian only ever needs::
 
     import eea_datalakehouse.notebook
