@@ -40,7 +40,9 @@ import requests
 from pathlib import Path
 from xmlrpc.client import Boolean
 from eea_datalakehouse.catalog import Catalog
+from eea_datalakehouse.dds_documents import DocumentsClient
 from eea_datalakehouse.dds_ingestion import DremioCreds, FolderIngest, IngestClient
+from eea_datalakehouse.sdi import SdiCatalogue, SdiController, metadata_path
 from eea_datalakehouse.dds_ingestion.common.dremio_identity import (endpoint, dds_credentials,
                                     resolve as _resolve_identity)
 
@@ -420,6 +422,24 @@ def run_catalog_bulk_close() -> None:
     print(f"catalog_bulk_close  after   a.closed={a._closed}  b.closed={b._closed}")
 
 
+def run_sdi_extract() -> None:
+    """Download the release's ISO 19115-3 XML from SDI and push it to DDS's
+    metadata folder. Extraction runs for real even in DRY_RUN (it is a public,
+    read-only SDI call); only the DDS upload is skipped."""
+    uuid = CONFIG["sdi"]["latest_record_uuid"]
+    documents = DocumentsClient(DDS_BASE_URL, dds_credentials(DREMIO_USERNAME, DREMIO_TOKEN))
+    with SdiController(SdiCatalogue.from_env(), documents) as sdi, documents:
+        metadata = sdi.get_xml(uuid)
+        print(f"sdi_extract  {metadata}")
+        print(f"  revised   {metadata.record.date_stamp}")
+        if DRY_RUN:
+            print("DRY RUN — not uploading to DDS. Set DRY_RUN = False to run this for real.")
+            print(f"  would put {metadata_path(SDI_DDS_PATH, uuid)}")
+            return
+        result = sdi.push_to_dds(metadata, SDI_DDS_PATH)
+    print(f"sdi_extract  {result.action}  {result.dds_path}")
+
+
 
 # --------------------------------------------------------------------------
 # Step 1 — get an Entra ID JWT
@@ -599,6 +619,12 @@ if __name__ == "__main__":
     )
     TABLE2VIEW_IDEMPOTENCY_KEY = "debug-table2view-testview"
 
+    # --- sdi_extract ------------------------------------------------------------
+    # Where the dataset lives in DDS; push_to_dds adds /metadata/{uuid}.xml.
+    # Provisional until the DDS document path is agreed (docs/sdi-integration-plan.md).
+    _t = CONFIG["target"]
+    SDI_DDS_PATH = f"catalog/{_t['domain']}/{_t['subdomain']}/{_t['dataflow']}"
+
     # --- services --------------------------------------------------------------
     # Resolved most-authoritative-first by endpoint():
     #   1. the JupyterLab "Dremio Catalog" settings panel — ddsServerUrl / dremioUrl.
@@ -656,6 +682,8 @@ if __name__ == "__main__":
 
     #run_createfolder()
     #run_deletefolder()
+
+    #run_sdi_extract()
 
 
 
