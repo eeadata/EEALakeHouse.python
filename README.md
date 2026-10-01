@@ -193,7 +193,8 @@ with SdiController.from_env() as sdi:
 
 - `get_xml(uuid)` checks the response is `mdb:MD_Metadata` and identifies `uuid`
   (`NotIso19115_3`, `UuidMismatch`; `SdiNotFound` / `SdiAuthError` for 404 / 401-403).
-- `push_to_dds(metadata, dds_path, folder="metadata", force=False)` takes `dds_path` in catalog
+- `push_to_dds(metadata, dds_path, target_name=None, folder="metadata", force=False)` names the
+  file `{uuid}.xml` unless `target_name` is given (`.xml` is added if missing), and takes `dds_path` in catalog
   format (`a.b.c`, sent to DDS as `a/b/c`; quoted names like `"v1.0"` lose their quotes and stay
   one segment) or storage format (`a/b/c`). It first checks `dds_path` exists in the Dremio
   catalog when the controller has a catalog client (`CatalogPathNotFound` otherwise), then

@@ -231,19 +231,26 @@ class MetadataSession:
     def push_to_dds(
         self,
         dds_path: str,
+        target_name: str | None = None,
         metadata: SdiMetadata | None = None,
         folder: str = DEFAULT_FOLDER,
         force: bool = False,
         check_catalog: bool = True,
     ) -> PushResult:
         """Upload `metadata` (default: the last `%sdi get_xml` result) to
-        `{dds_path}/{folder}/{uuid}.xml` in DDS, after checking `dds_path`
-        exists in the Dremio catalog (skip with `check_catalog=False`)."""
+        `{dds_path}/{folder}/{target_name}` in DDS — `{uuid}.xml` unless
+        `target_name` is given — after checking `dds_path` exists in the
+        Dremio catalog (skip with `check_catalog=False`)."""
         metadata = metadata or self._last()
         if metadata is None:
             raise MetadataSessionError("nothing to push yet — run %sdi get_xml(uuid) first")
         return self._push_controller(with_catalog=check_catalog).push_to_dds(
-            metadata, dds_path, folder=folder, force=force, check_catalog=check_catalog
+            metadata,
+            dds_path,
+            folder=folder,
+            force=force,
+            check_catalog=check_catalog,
+            target_name=target_name,
         )
 
     @_friendly(MetadataSessionError)

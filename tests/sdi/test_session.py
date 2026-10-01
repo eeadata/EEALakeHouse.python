@@ -265,3 +265,20 @@ def test_dremio_url_comes_from_dotenv_first(tmp_path: Path) -> None:
     assert _metadata_session(dotenv_path=dotenv).dremio_base_url() == (
         f"https://dremio.from-dotenv.test  (from {dotenv})"
     )
+
+
+@respx.mock
+def test_push_target_name_renames_the_file() -> None:
+    renamed = "water/metadata/bwd_2025.xml"
+    respx.get(record_url()).mock(return_value=httpx.Response(200, content=iso_xml()))
+    respx.get(dds_file_url(renamed)).mock(return_value=not_found())
+    put = respx.put(dds_file_url(renamed)).mock(return_value=httpx.Response(201))
+    sdi = SdiSession(env=ENV)
+    sdi.get_xml(UUID)
+
+    result = _metadata_session(sdi, env={**ENV, **IDENTITY}).push_to_dds(
+        "water", "bwd_2025", check_catalog=False  # target_name is the second parameter
+    )
+
+    assert result.dds_path == renamed
+    assert put.called

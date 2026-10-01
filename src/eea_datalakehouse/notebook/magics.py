@@ -272,7 +272,9 @@ _METADATA_HELP = [
     (
         "push_to_dds",
         "Upload metadata (default: the last %sdi get_xml result) to "
-        "dds_path/folder/<uuid>.xml in DDS — a document upload, never an ingest. dds_path "
+        "dds_path/folder/<uuid>.xml in DDS — a document upload, never an ingest. "
+        "target_name renames the file (e.g. target_name=\"bwd_2025.xml\"; .xml is added if "
+        "missing). dds_path "
         "must already exist in the Dremio catalog (check_catalog=False skips that check). "
         "Same bytes already there: unchanged; an older copy: replaced; a copy edited in DDS: "
         "refused unless force=True.",

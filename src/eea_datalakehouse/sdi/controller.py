@@ -168,17 +168,20 @@ class SdiController:
         self,
         metadata: SdiMetadata,
         dds_path: str,
+        target_name: str | None = None,
         *,
         folder: str = DEFAULT_FOLDER,
         force: bool = False,
         check_catalog: bool = True,
     ) -> PushResult:
-        """Upload ``metadata`` to DDS as ``{dds_path}/{folder}/{uuid}.xml``.
+        """Upload ``metadata`` to DDS as ``{dds_path}/{folder}/{target_name}``.
 
         ``dds_path`` is the dataset's DDS location, in catalog format
         (``a.b.c``, converted to ``a/b/c``) or storage format (``a/b/c``);
         ``folder`` is the last path segment, ``metadata`` by default, always
-        lowercase.
+        lowercase. ``target_name`` is the file name, ``{uuid}.xml`` by default
+        (``.xml`` is added if missing). The UUID check always reads the XML
+        itself, so a renamed file still holds the record it claims to.
 
         If the controller was given a Dremio ``catalog`` client (and
         ``check_catalog`` is left on), ``dds_path`` (without the ``folder``)
@@ -197,7 +200,7 @@ class SdiController:
         cannot put one record under another's UUID.
         """
         iso.check(metadata.xml, metadata.uuid)
-        target = metadata_path(dds_path, metadata.uuid, folder=folder)
+        target = metadata_path(dds_path, metadata.uuid, folder=folder, target_name=target_name)
         if check_catalog and self._catalog is not None:
             self.check_catalog_path(dds_path)
         documents = self._documents_client()
@@ -340,11 +343,19 @@ def to_catalog_path(path: str) -> str:
     )
 
 
-def metadata_path(dds_path: str, uuid: str, *, folder: str = DEFAULT_FOLDER) -> str:
-    """``{dds_path}/{folder}/{uuid}.xml``, with slashes normalised.
+def metadata_path(
+    dds_path: str,
+    uuid: str,
+    *,
+    folder: str = DEFAULT_FOLDER,
+    target_name: str | None = None,
+) -> str:
+    """``{dds_path}/{folder}/{target_name}``, with slashes normalised.
 
     ``dds_path`` may be in catalog format (``a.b.c``) or storage format
-    (``a/b/c``); see :func:`to_storage_path`.
+    (``a/b/c``); see :func:`to_storage_path`. ``target_name`` is the file
+    name, ``{uuid}.xml`` by default; ``.xml`` is added if it has no such
+    extension.
     """
     parent = to_storage_path(dds_path).strip("/")
     sub = folder.strip().strip("/").lower()
@@ -352,7 +363,21 @@ def metadata_path(dds_path: str, uuid: str, *, folder: str = DEFAULT_FOLDER) -> 
         raise ValueError("dds_path must not be empty")
     if not sub:
         raise ValueError("folder must not be empty")
-    return f"{parent}/{sub}/{_require_uuid(uuid)}.xml"
+    uuid = _require_uuid(uuid)
+    name = f"{uuid}.xml" if target_name is None else _require_target_name(target_name)
+    return f"{parent}/{sub}/{name}"
+
+
+def _require_target_name(target_name: str) -> str:
+    """``target_name`` as a single file name ending in ``.xml``."""
+    name = target_name.strip()
+    if not name:
+        raise ValueError("target_name must not be empty")
+    if "/" in name or "\\" in name or name in (".", ".."):
+        raise ValueError(f"target_name must be a file name, not a path: {target_name!r}")
+    if not name.lower().endswith(".xml"):
+        name += ".xml"
+    return name
 
 
 def _require_uuid(uuid: str) -> str:
