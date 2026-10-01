@@ -17,8 +17,9 @@ assumes a container child's JSON carries ``type="CONTAINER"`` /
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -58,7 +59,24 @@ class CatalogRestClient:
 
     def _lookup_by_path(self, path: str) -> dict[str, Any] | None:
         """The catalog entity's own JSON (id, type, ...) at `path`, or None if absent."""
-        encoded = "/".join(path.split("."))
+        return self._lookup_encoded("/".join(path.split(".")), path)
+
+    def get_entity(self, segments: Sequence[str]) -> dict[str, Any] | None:
+        """The catalog entity's JSON at the path made of `segments`, or None if absent.
+
+        One item per path level, each a name exactly as it appears in the
+        catalog — unlike the dot-separated `path` every other method takes, a
+        name here may itself contain dots, spaces or brackets (each segment is
+        URL-encoded on its own). Not best-effort: a lookup failure other than
+        404 raises `CatalogOperationError` (or `EngineStartingError` on a
+        timeout) rather than reading as "absent".
+        """
+        if not segments:
+            raise CatalogOperationError("cannot look up an empty catalog path")
+        encoded = "/".join(quote(segment, safe="") for segment in segments)
+        return self._lookup_encoded(encoded, ".".join(segments))
+
+    def _lookup_encoded(self, encoded: str, path: str) -> dict[str, Any] | None:
         try:
             resp = self._http.get(
                 f"{self._base_url}/api/v3/catalog/by-path/{encoded}", headers=self._headers

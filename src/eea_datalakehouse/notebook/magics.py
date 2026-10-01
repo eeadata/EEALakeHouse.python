@@ -110,8 +110,8 @@ _USAGE = {
     ),
     "sdi": '%sdi get_xml("<uuid>")  |  %sdi resolve_series("<series uuid>")',
     "metadata": (
-        '%metadata push_to_dds("a/b/c")  (uploads the last %sdi get_xml result)'
-        "  |  %metadata dds_base_url()"
+        '%metadata push_to_dds("a.b.c")  or  %metadata push_to_dds("a/b/c")'
+        "  (uploads the last %sdi get_xml result)"
     ),
 }
 
@@ -265,25 +265,35 @@ _SDI_HELP_NOTE = (
     "Environment: SDI_API_URL (empty means the public EEA catalogue; optional "
     "SDI_USERNAME/SDI_PASSWORD for non-public records). Pushing to DDS is %metadata's job."
 )
+# dds_base_url()/dremio_base_url() still work under %metadata; they are left
+# out of the help table on purpose, as troubleshooting helpers rather than
+# everyday commands.
 _METADATA_HELP = [
     (
         "push_to_dds",
         "Upload metadata (default: the last %sdi get_xml result) to "
-        "dds_path/folder/<uuid>.xml in DDS — a document upload, never an ingest. Same bytes "
-        "already there: unchanged; an older copy: replaced; a copy edited in DDS: refused "
-        "unless force=True.",
+        "dds_path/folder/<uuid>.xml in DDS — a document upload, never an ingest. dds_path "
+        "must already exist in the Dremio catalog (check_catalog=False skips that check). "
+        "Same bytes already there: unchanged; an older copy: replaced; a copy edited in DDS: "
+        "refused unless force=True.",
     ),
     (
-        "dds_base_url",
-        "Show the DDS URL push_to_dds uses and where it came from (a .env file or the kernel "
-        "environment).",
+        "check_catalog_path",
+        "Check dds_path exists in the Dremio catalog without pushing anything.",
     ),
 ]
 _METADATA_HELP_NOTE = (
-    "Environment: DDS_BASE_URL — read from the first .env found in the notebook's folder "
-    "or a parent when %metadata starts, else from the kernel environment — and a Dremio "
-    "identity: _DREMIO_USER/_DREMIO_PWD (as %ingest) or DREMIO_USERNAME/DREMIO_TOKEN "
-    "(as %catalog)."
+    "dds_path is the dataset's folder path, without the metadata folder. Its folders can be "
+    "separated with either '.' or '/', so these are the same path:\n"
+    "  catalog.water_management_resources.bathing_water.bwd\n"
+    "  catalog/water_management_resources/bathing_water/bwd\n"
+    "A name containing a '.' or a space is written in double quotes with '.' separators "
+    '(catalog."bathing water"."v1.0"), or as it is with \'/\' separators '
+    "(catalog/bathing water/v1.0).\n"
+    "Environment: DDS_BASE_URL and DREMIO_BASE_URL — read from the first .env found in the "
+    "notebook's folder or a parent when %metadata starts, else from the kernel environment "
+    "— and a Dremio identity: _DREMIO_USER/_DREMIO_PWD (as %ingest) or "
+    "DREMIO_USERNAME/DREMIO_TOKEN (as %catalog), used for both DDS and the catalog check."
 )
 
 

@@ -22,8 +22,12 @@ from .controller import (
     SdiController,
     SdiMetadata,
     metadata_path,
+    path_segments,
+    to_catalog_path,
+    to_storage_path,
 )
 from .errors import (
+    CatalogPathNotFound,
     DdsCopyConflict,
     NotCurrentError,
     NotIso19115_3,
@@ -38,6 +42,7 @@ from .iso import IsoRecord
 from .session import MetadataSession, MetadataSessionError, SdiSession, SdiSessionError
 
 __all__ = [
+    "CatalogPathNotFound",
     "DEFAULT_FOLDER",
     "DEFAULT_SDI_API_URL",
     "DdsCopyConflict",
@@ -60,4 +65,7 @@ __all__ = [
     "SeriesCandidate",
     "UuidMismatch",
     "metadata_path",
+    "path_segments",
+    "to_catalog_path",
+    "to_storage_path",
 ]
