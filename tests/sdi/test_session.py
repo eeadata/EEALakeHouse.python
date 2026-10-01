@@ -19,16 +19,19 @@ from eea_datalakehouse.sdi.session import find_dotenv, load_dds_creds, read_dote
 
 from .conftest import (
     DDS_URL,
+    DREMIO_URL,
     SDI_URL,
     UUID,
+    catalog_url,
     dds_file_url,
+    folder_entity,
     iso_xml,
     not_found,
     record_url,
 )
 
 TARGET = f"water/metadata/{UUID}.xml"
-ENV = {"SDI_API_URL": SDI_URL, "DDS_BASE_URL": DDS_URL}
+ENV = {"SDI_API_URL": SDI_URL, "DDS_BASE_URL": DDS_URL, "DREMIO_BASE_URL": DREMIO_URL}
 NO_DOTENV = Path("/nonexistent/.env")
 
 
@@ -76,6 +79,7 @@ def test_push_uploads_the_last_sdi_record_with_the_kernel_identity() -> None:
     respx.get(record_url()).mock(return_value=httpx.Response(200, content=iso_xml()))
     respx.get(dds_file_url(TARGET)).mock(return_value=not_found())
     put = respx.put(dds_file_url(TARGET)).mock(return_value=httpx.Response(201))
+    lookup = respx.get(catalog_url("water")).mock(return_value=folder_entity())
     sdi = SdiSession(env=ENV)
     metadata = _metadata_session(
         sdi, env={**ENV, "DREMIO_USERNAME": "carol", "DREMIO_TOKEN": "pat-c"}
@@ -86,6 +90,7 @@ def test_push_uploads_the_last_sdi_record_with_the_kernel_identity() -> None:
 
     assert (result.action, result.dds_path) == ("uploaded", TARGET)
     assert put.calls.last.request.headers["Authorization"] == "Bearer pat-c"
+    assert lookup.calls.last.request.headers["Authorization"] == "Bearer pat-c"
 
 
 @respx.mock
@@ -151,7 +156,7 @@ def test_push_goes_to_the_dotenv_url(tmp_path: Path) -> None:
         sdi,
         dotenv_path=tmp_path / ".env",
         env={**ENV, "_DREMIO_USER": "a", "_DREMIO_PWD": "p"},
-    ).push_to_dds("water")
+    ).push_to_dds("water", check_catalog=False)
 
     assert put.called
 
@@ -189,3 +194,74 @@ def test_read_dotenv_value_last_assignment_wins(tmp_path: Path) -> None:
 
     assert read_dotenv_value(dotenv, "DDS_BASE_URL") == "two"
     assert read_dotenv_value(dotenv, "MISSING") is None
+
+
+# -- Dremio catalog check ---------------------------------------------------
+
+IDENTITY = {"_DREMIO_USER": "a", "_DREMIO_PWD": "p"}
+
+
+@respx.mock
+def test_push_refuses_a_path_missing_from_the_catalog() -> None:
+    respx.get(record_url()).mock(return_value=httpx.Response(200, content=iso_xml()))
+    respx.get(catalog_url("catalog/water")).mock(return_value=httpx.Response(404))
+    dds = respx.route(host="dds.example.test")
+    sdi = SdiSession(env=ENV)
+    sdi.get_xml(UUID)
+
+    with pytest.raises(MetadataSessionError, match=r"catalog\.water does not exist"):
+        _metadata_session(sdi, env={**ENV, **IDENTITY}).push_to_dds("catalog/water")
+
+    assert not dds.called  # nothing reached DDS
+
+
+@respx.mock
+def test_check_catalog_path_converts_slashes_to_catalog_format() -> None:
+    lookup = respx.get(catalog_url("catalog/bathing%20water/v1.0")).mock(
+        return_value=folder_entity()
+    )
+    session = _metadata_session(env={**ENV, **IDENTITY})
+
+    assert session.check_catalog_path("catalog/bathing water/v1.0") == (
+        'catalog."bathing water"."v1.0" exists in the Dremio catalog'
+    )
+    assert lookup.called
+
+
+@respx.mock
+def test_catalog_source_400_for_a_missing_item_reads_as_absent() -> None:
+    # What the EEA Dremio answers for a missing folder under its `catalog` source.
+    message = (
+        "Can not get internal item from non-filesystem source [catalog] of type "
+        "[com.dremio.plugins.dremiocatalog.store.DremioCatalogLocalPlugin]"
+    )
+    respx.get(catalog_url("catalog/water/nope")).mock(
+        return_value=httpx.Response(400, json={"errorMessage": message, "moreInfo": ""})
+    )
+
+    with pytest.raises(MetadataSessionError, match=r"catalog\.water\.nope does not exist"):
+        _metadata_session(env={**ENV, **IDENTITY}).check_catalog_path("catalog/water/nope")
+
+
+@respx.mock
+def test_catalog_lookup_failure_is_an_error_not_absent() -> None:
+    respx.get(catalog_url("catalog/water")).mock(return_value=httpx.Response(400, text="bad"))
+
+    with pytest.raises(MetadataSessionError, match="could not check catalog.water"):
+        _metadata_session(env={**ENV, **IDENTITY}).check_catalog_path("catalog.water")
+
+
+def test_catalog_check_needs_a_dremio_url() -> None:
+    env = {"DDS_BASE_URL": DDS_URL, **IDENTITY}
+
+    with pytest.raises(MetadataSessionError, match="checking the Dremio catalog needs DREMIO_BASE"):
+        _metadata_session(env=env).check_catalog_path("catalog.water")
+
+
+def test_dremio_url_comes_from_dotenv_first(tmp_path: Path) -> None:
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("DREMIO_BASE_URL=https://dremio.from-dotenv.test/\n")
+
+    assert _metadata_session(dotenv_path=dotenv).dremio_base_url() == (
+        f"https://dremio.from-dotenv.test  (from {dotenv})"
+    )

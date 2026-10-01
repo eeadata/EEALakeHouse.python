@@ -36,7 +36,7 @@ pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@staging"    
 ```
 
 # staging's latest release (early access) — pin to the tag the "staging" badge above shows
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.20-staging"
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.21-staging"
 ```
 
 ## Usage
@@ -193,7 +193,11 @@ with SdiController.from_env() as sdi:
 
 - `get_xml(uuid)` checks the response is `mdb:MD_Metadata` and identifies `uuid`
   (`NotIso19115_3`, `UuidMismatch`; `SdiNotFound` / `SdiAuthError` for 404 / 401-403).
-- `push_to_dds(metadata, dds_path, folder="metadata", force=False)` compares with the copy
+- `push_to_dds(metadata, dds_path, folder="metadata", force=False)` takes `dds_path` in catalog
+  format (`a.b.c`, sent to DDS as `a/b/c`; quoted names like `"v1.0"` lose their quotes and stay
+  one segment) or storage format (`a/b/c`). It first checks `dds_path` exists in the Dremio
+  catalog when the controller has a catalog client (`CatalogPathNotFound` otherwise), then
+  compares with the copy
   already in DDS: same bytes is `unchanged`; an older copy is `replaced`; a copy that is newer or
   undated (someone edited it in DDS) raises `DdsCopyConflict` unless `force=True`.
 - `resolve_series(series_uuid)` returns the one release of a series that is not superseded, or
@@ -220,9 +224,13 @@ import eea_datalakehouse.notebook   # registers %catalog/%ingest/%sdi/%metadata
 %metadata push_to_dds("catalog/water_management_resources/bathing_water/bwd")
 ```
 
-For the push, `DDS_BASE_URL` is read from the first `.env` in the notebook's folder or a parent
-when `%metadata` builds its session (the kernel environment's value only applies if no `.env`
-sets it; `%metadata dds_base_url()` shows which is in use). The Dremio identity is `_DREMIO_USER` /
+For the push, `DDS_BASE_URL` and `DREMIO_BASE_URL` are read from the first `.env` in the
+notebook's folder or a parent when `%metadata` builds its session (the kernel environment's
+value only applies if that `.env` doesn't set one; `%metadata dds_base_url()` /
+`dremio_base_url()` show which is in use). `%metadata push_to_dds` first checks that `dds_path`
+exists in the Dremio catalog (a `/` path is converted to `a.b.c` for that) and uploads nothing
+if it doesn't; `%metadata check_catalog_path(path)` runs the check alone, and
+`check_catalog=False` skips it. The Dremio identity is `_DREMIO_USER` /
 `_DREMIO_PWD` (as `%ingest`), falling back to `DREMIO_USERNAME` / `DREMIO_TOKEN` (as `%catalog`).
 
 ## Notebook facade (`%catalog` / `%ingest`)
@@ -419,7 +427,7 @@ To pin to one specific release instead, use the exact tag the live badges under
 %pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.20"
 
 # staging's latest release (early access)
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.20-staging"
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.21-staging"
 ```
 
 Use the `%pip` magic rather than `!pip` — it installs into the kernel the

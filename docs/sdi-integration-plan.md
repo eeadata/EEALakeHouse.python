@@ -275,10 +275,17 @@ per kernel each, built on first use from the kernel environment:
   (looked up at push time) unless `metadata=` is given.
 - Every failure prints one `sdi error: …` / `metadata error: …` line instead
   of a traceback.
-- `DDS_BASE_URL` is read, when `%metadata` builds its session, from the first
-  `.env` in the notebook's folder or a parent; the kernel environment's value
-  applies only if no `.env` sets it. `%metadata dds_base_url()` shows which is
-  in use.
+- `DDS_BASE_URL` and `DREMIO_BASE_URL` are read, when `%metadata` builds its
+  session, from the first `.env` in the notebook's folder or a parent; the
+  kernel environment's value applies only if that `.env` doesn't set one.
+  `%metadata dds_base_url()` / `dremio_base_url()` show which is in use.
+- **`push_to_dds` checks the Dremio catalog first**: `dds_path` (without the
+  `metadata` folder) must exist there, looked up with Dremio's
+  `/api/v3/catalog/by-path` and the same PAT; otherwise nothing is uploaded
+  (`CatalogPathNotFound`). A path with `/` separators is converted to the
+  catalog path structure (`a.b.c`, quoting names that need it) for the check
+  and the messages. `%metadata check_catalog_path(path)` runs the check alone;
+  `check_catalog=False` skips it.
 - The DDS upload's Dremio identity is `_DREMIO_USER` / `_DREMIO_PWD` (as
   `%ingest`), falling back to `DREMIO_USERNAME` / `DREMIO_TOKEN` (as
   `%catalog`).

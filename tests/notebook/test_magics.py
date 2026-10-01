@@ -510,6 +510,8 @@ def test_metadata_help_lists_methods_without_building_a_session(
     assert "%metadata methods" in out
     assert "DDS_BASE_URL" in out
     table_html = displayed[0].data
-    assert ">push_to_dds<" in table_html and ">dds_base_url<" in table_html
+    assert ">push_to_dds<" in table_html and ">check_catalog_path<" in table_html
+    assert ">dds_base_url<" not in table_html and ">dremio_base_url<" not in table_html
+    assert "separated with either '.' or '/'" in out
     assert "dds_path, metadata=None, folder=&#x27;metadata&#x27;, force=False" in table_html
     assert _magics_instance(ip)._metadata_session is None
