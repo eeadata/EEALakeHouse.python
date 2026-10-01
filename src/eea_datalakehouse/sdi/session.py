@@ -24,12 +24,18 @@ Connection details come from the kernel environment, as `%catalog` /
   ``_DREMIO_USER`` / ``_DREMIO_PWD`` (what `%ingest` reads), falling back to
   ``DREMIO_USERNAME`` / ``DREMIO_TOKEN`` (what `%catalog` reads).
 
-**`DDS_BASE_URL` comes from a `.env` file first.** When a `MetadataSession` is
-built, it looks for `.env` in the notebook's working directory, then in each
-parent directory, and takes `DDS_BASE_URL` from the first one found. Only when
-no `.env` sets it does the kernel environment's ``DDS_BASE_URL`` apply.
-Nothing else is read from the file, and it never changes ``os.environ``.
-`dds_base_url()` shows which URL is in use and where it came from.
+**`DDS_BASE_URL` and `DREMIO_BASE_URL` come from a `.env` file first.** When a
+`MetadataSession` is built, it looks for `.env` in the notebook's working
+directory, then in each parent directory, and takes both from the first one
+found. Only when that `.env` doesn't set one does the kernel environment's value
+apply. Nothing else is read from the file, and it never changes ``os.environ``.
+`dds_base_url()` / `dremio_base_url()` show which URL is in use and where it
+came from.
+
+**`push_to_dds` checks the Dremio catalog first.** `dds_path` (without the
+`metadata` folder) must exist in the Dremio catalog, looked up through
+``DREMIO_BASE_URL``'s ``/api/v3/catalog`` with the same PAT as the upload;
+otherwise nothing is uploaded. `check_catalog=False` skips the check.
 """
 
 from __future__ import annotations
@@ -42,6 +48,7 @@ from typing import Any, TypeVar
 
 import httpx
 
+from ..catalog.rest import CatalogRestClient
 from ..dds_documents import DocumentsApiError, DocumentsClient
 from ..dds_ingestion.credentials import (
     ENV_BASE_URL,
@@ -49,7 +56,6 @@ from ..dds_ingestion.credentials import (
     ENV_USER,
     DremioCreds,
     MissingCredentialsError,
-    load_base_url,
 )
 from .catalogue import SdiCatalogue
 from .controller import DEFAULT_FOLDER, PushResult, SdiController, SdiMetadata
@@ -58,6 +64,7 @@ from .errors import SdiError
 # What `%catalog` reads (see notebook/magics.py's _build_catalog_session).
 ENV_CATALOG_USER = "DREMIO_USERNAME"
 ENV_CATALOG_TOKEN = "DREMIO_TOKEN"  # noqa: S105 — env var name, not a secret value
+ENV_DREMIO_BASE_URL = "DREMIO_BASE_URL"  # what `%catalog` reads
 DOTENV_NAME = ".env"
 
 _F = TypeVar("_F", bound=Callable[..., Any])
@@ -185,13 +192,15 @@ class SdiSession:
 
 
 class MetadataSession:
-    """`push_to_dds` / `dds_base_url` for a notebook — what `%metadata` dispatches onto.
+    """`push_to_dds` / `check_catalog_path` / `dds_base_url` / `dremio_base_url`
+    for a notebook — what `%metadata` dispatches onto.
 
     ``last`` returns the record to push by default — under the magics, the
     `%sdi` session's last `get_xml` result. ``controller`` is built from the
-    kernel environment on the first push if not given; ``dotenv_path`` names
-    the ``.env`` to read ``DDS_BASE_URL`` from (by default searched for from
-    the working directory upwards, once, when the session is built).
+    kernel environment on first use if not given. ``dotenv_path`` names the
+    ``.env`` to read ``DDS_BASE_URL`` / ``DREMIO_BASE_URL`` from (by default
+    searched for from the working directory upwards, once, when the session is
+    built).
     """
 
     def __init__(
@@ -204,13 +213,16 @@ class MetadataSession:
     ) -> None:
         self._last = last or (lambda: None)
         self._controller = controller
+        # A controller handed in is used as-is, catalog client (or not) and all.
+        self._has_catalog = controller is not None
         self._env = env
         self._dotenv_path = Path(dotenv_path) if dotenv_path is not None else find_dotenv()
-        self._dotenv_dds_url = (
-            read_dotenv_value(self._dotenv_path, ENV_BASE_URL)
+        self._dotenv = {
+            key: read_dotenv_value(self._dotenv_path, key)
             if self._dotenv_path is not None and self._dotenv_path.is_file()
             else None
-        )
+            for key in (ENV_BASE_URL, ENV_DREMIO_BASE_URL)
+        }
 
     def __repr__(self) -> str:
         return f"MetadataSession(dotenv={str(self._dotenv_path) if self._dotenv_path else None!r})"
@@ -222,45 +234,67 @@ class MetadataSession:
         metadata: SdiMetadata | None = None,
         folder: str = DEFAULT_FOLDER,
         force: bool = False,
+        check_catalog: bool = True,
     ) -> PushResult:
         """Upload `metadata` (default: the last `%sdi get_xml` result) to
-        `{dds_path}/{folder}/{uuid}.xml` in DDS."""
+        `{dds_path}/{folder}/{uuid}.xml` in DDS, after checking `dds_path`
+        exists in the Dremio catalog (skip with `check_catalog=False`)."""
         metadata = metadata or self._last()
         if metadata is None:
             raise MetadataSessionError("nothing to push yet — run %sdi get_xml(uuid) first")
-        return self._push_controller().push_to_dds(
-            metadata, dds_path, folder=folder, force=force
+        return self._push_controller(with_catalog=check_catalog).push_to_dds(
+            metadata, dds_path, folder=folder, force=force, check_catalog=check_catalog
         )
+
+    @_friendly(MetadataSessionError)
+    def check_catalog_path(self, dds_path: str) -> str:
+        """Check `dds_path` exists in the Dremio catalog; returns it as a catalog path."""
+        catalog_path = self._push_controller(with_catalog=True).check_catalog_path(dds_path)
+        return f"{catalog_path} exists in the Dremio catalog"
 
     @_friendly(MetadataSessionError)
     def dds_base_url(self) -> str:
         """The DDS URL `push_to_dds` uses, and where it came from."""
-        url, source = self._resolve_dds_base_url()
+        url, source = self._resolve_url(ENV_BASE_URL, "pushing to DDS")
+        return f"{url}  (from {source})"
+
+    @_friendly(MetadataSessionError)
+    def dremio_base_url(self) -> str:
+        """The Dremio URL the catalog check uses, and where it came from."""
+        url, source = self._resolve_url(ENV_DREMIO_BASE_URL, "checking the Dremio catalog")
         return f"{url}  (from {source})"
 
     # -- internals --------------------------------------------------------
 
-    def _push_controller(self) -> SdiController:
+    def _push_controller(self, *, with_catalog: bool) -> SdiController:
+        env = dict(os.environ if self._env is None else self._env)
         if self._controller is None:
-            env = dict(os.environ if self._env is None else self._env)
             # push_to_dds never calls SDI, so the catalogue is never used here.
             self._controller = SdiController(
-                documents=DocumentsClient(self._resolve_dds_base_url()[0], load_dds_creds(env))
+                documents=DocumentsClient(
+                    self._resolve_url(ENV_BASE_URL, "pushing to DDS")[0], load_dds_creds(env)
+                )
             )
+        if with_catalog and not self._has_catalog:
+            dremio_url = self._resolve_url(ENV_DREMIO_BASE_URL, "checking the Dremio catalog")[0]
+            # Same PAT as the DDS upload: Dremio and DDS take the same bearer token.
+            self._controller = SdiController(
+                self._controller.catalogue,
+                self._controller.documents,
+                CatalogRestClient(dremio_url, load_dds_creds(env).password),
+            )
+            self._has_catalog = True
         return self._controller
 
-    def _resolve_dds_base_url(self) -> tuple[str, str]:
-        """``(url, source)``: the ``.env`` file's ``DDS_BASE_URL``, else the kernel's."""
-        if self._dotenv_dds_url and self._dotenv_path is not None:
-            return self._dotenv_dds_url.rstrip("/"), str(self._dotenv_path)
-        env = dict(os.environ if self._env is None else self._env)
-        try:
-            return load_base_url(env), "the kernel environment"
-        except MissingCredentialsError:
-            where = (
-                f"{self._dotenv_path} has none and " if self._dotenv_path else "no .env found and "
-            )
-            raise MissingCredentialsError(
-                f"pushing to DDS needs {ENV_BASE_URL}: {where}it is not set in the kernel "
-                "environment"
-            ) from None
+    def _resolve_url(self, key: str, needed_for: str) -> tuple[str, str]:
+        """``(url, source)``: the ``.env`` file's ``key``, else the kernel environment's."""
+        from_dotenv = self._dotenv.get(key)
+        if from_dotenv and self._dotenv_path is not None:
+            return from_dotenv.rstrip("/"), str(self._dotenv_path)
+        env = os.environ if self._env is None else self._env
+        if env.get(key):
+            return env[key].rstrip("/"), "the kernel environment"
+        where = f"{self._dotenv_path} has none and " if self._dotenv_path else "no .env found and "
+        raise MissingCredentialsError(
+            f"{needed_for} needs {key}: {where}it is not set in the kernel environment"
+        )

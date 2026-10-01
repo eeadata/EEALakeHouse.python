@@ -38,6 +38,10 @@ class UuidMismatch(SdiError):
     """The XML's ``metadataIdentifier`` is not the UUID that was asked for."""
 
 
+class CatalogPathNotFound(SdiError):
+    """The dataset path to push metadata under does not exist in the Dremio catalog."""
+
+
 class DdsCopyConflict(SdiError):
     """The copy already in DDS differs and is not older than the SDI record.
 

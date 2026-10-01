@@ -16,18 +16,25 @@ ingest creates datasets in the catalog, this controller only moves metadata.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Literal
 
+from ..catalog.errors import CatalogOperationError, EngineStartingError
+from ..catalog.rest import CatalogRestClient
 from ..dds_documents import DocumentsClient
 from . import iso
 from .catalogue import SdiCatalogue
-from .errors import DdsCopyConflict, NotCurrentError, NotIso19115_3
+from .errors import CatalogPathNotFound, DdsCopyConflict, NotCurrentError, NotIso19115_3, SdiError
 from .iso import IsoRecord
 
 DEFAULT_FOLDER = "metadata"
 XML_CONTENT_TYPE = "application/xml"
+# What Dremio's own catalog source answers (a 400, not a 404) for a by-path
+# lookup of a nested item that doesn't exist — seen on the EEA instance, and
+# described in catalog/rest.py. An existing path answers 200 as usual.
+_MISSING_IN_CATALOG_SOURCE = "Can not get internal item from non-filesystem source"
 
 PushAction = Literal["uploaded", "unchanged", "replaced"]
 
@@ -90,10 +97,13 @@ class SdiController:
         self,
         catalogue: SdiCatalogue | None = None,
         documents: DocumentsClient | None = None,
+        catalog: CatalogRestClient | None = None,
     ) -> None:
         self._catalogue = catalogue or SdiCatalogue()
         self._documents = documents
         self._owns_documents = documents is None
+        # When given, push_to_dds first checks dds_path exists in the Dremio catalog.
+        self._catalog = catalog
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> SdiController:
@@ -111,6 +121,11 @@ class SdiController:
     def catalogue(self) -> SdiCatalogue:
         """The SDI client this controller reads from."""
         return self._catalogue
+
+    @property
+    def documents(self) -> DocumentsClient | None:
+        """The DDS client this controller pushes with, if one is set yet."""
+        return self._documents
 
     # -- lifecycle --------------------------------------------------------
 
@@ -156,11 +171,19 @@ class SdiController:
         *,
         folder: str = DEFAULT_FOLDER,
         force: bool = False,
+        check_catalog: bool = True,
     ) -> PushResult:
         """Upload ``metadata`` to DDS as ``{dds_path}/{folder}/{uuid}.xml``.
 
-        ``dds_path`` is the dataset's DDS location, ``/``-joined; ``folder`` is
-        the last path segment, ``metadata`` by default, always lowercase.
+        ``dds_path`` is the dataset's DDS location, in catalog format
+        (``a.b.c``, converted to ``a/b/c``) or storage format (``a/b/c``);
+        ``folder`` is the last path segment, ``metadata`` by default, always
+        lowercase.
+
+        If the controller was given a Dremio ``catalog`` client (and
+        ``check_catalog`` is left on), ``dds_path`` (without the ``folder``)
+        must first exist in the Dremio catalog, otherwise
+        :class:`CatalogPathNotFound` is raised and nothing is uploaded.
 
         Compared with what DDS already holds there:
 
@@ -175,6 +198,8 @@ class SdiController:
         """
         iso.check(metadata.xml, metadata.uuid)
         target = metadata_path(dds_path, metadata.uuid, folder=folder)
+        if check_catalog and self._catalog is not None:
+            self.check_catalog_path(dds_path)
         documents = self._documents_client()
 
         existing = documents.get(target)
@@ -187,6 +212,34 @@ class SdiController:
             _refuse_unless_older(existing, metadata, target)
         documents.put(target, metadata.xml, content_type=XML_CONTENT_TYPE, overwrite=True)
         return PushResult(target, "replaced", metadata.uuid)
+
+    def check_catalog_path(self, dds_path: str) -> str:
+        """Raise :class:`CatalogPathNotFound` unless ``dds_path`` exists in the Dremio catalog.
+
+        ``dds_path`` is converted to the catalog path structure first (``/``
+        separators become ``.``; see :func:`to_catalog_path`). Returns that
+        catalog path. A 404, or the 400 Dremio's own catalog source gives for a
+        missing nested item, means absent; any other failure (another 400, a
+        timeout) raises :class:`SdiError` rather than reading as "absent".
+        """
+        if self._catalog is None:
+            raise SdiError("no Dremio catalog client configured to check the path against")
+        catalog_path = to_catalog_path(dds_path)
+        try:
+            entity = self._catalog.get_entity(path_segments(dds_path))
+        except CatalogOperationError as exc:
+            if _MISSING_IN_CATALOG_SOURCE not in str(exc):
+                raise SdiError(
+                    f"could not check {catalog_path} in the Dremio catalog: {exc}"
+                ) from exc
+            entity = None
+        except EngineStartingError as exc:
+            raise SdiError(f"could not check {catalog_path} in the Dremio catalog: {exc}") from exc
+        if entity is None:
+            raise CatalogPathNotFound(
+                f"{catalog_path} does not exist in the Dremio catalog; nothing was uploaded"
+            )
+        return catalog_path
 
     def resolve_series(self, series_uuid: str) -> str:
         """The UUID of the one release of ``series_uuid`` that is not superseded.
@@ -210,9 +263,90 @@ class SdiController:
         return self._documents
 
 
+def path_segments(path: str) -> list[str]:
+    """The folder names in ``path``, given in catalog or storage format.
+
+    - A catalog path (``a.b.c``) is split on ``.``.
+    - A path with a ``/`` outside quotes is storage format: it is split on
+      ``/`` instead, so its dots are kept (``a/v1.0``).
+    - A segment in Dremio's double quotes (``"a.b"``, as SQL writes names with
+      dots, spaces or brackets) is one segment whatever it contains; the quotes
+      are removed and an escaped ``""`` becomes ``"``.
+
+    Raises ``ValueError`` on an unclosed quote.
+    """
+    text = path.strip()
+    separator = "/" if "/" in _unquoted(text) else "."
+    segments: list[str] = []
+    current: list[str] = []
+    quoted = False
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char == '"':
+            if quoted and text[i + 1 : i + 2] == '"':  # "" inside quotes is a literal "
+                current.append('"')
+                i += 2
+                continue
+            quoted = not quoted
+        elif char == separator and not quoted:
+            segments.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+        i += 1
+    if quoted:
+        raise ValueError(f"unclosed quote in path {path!r}")
+    segments.append("".join(current).strip())
+    return [segment for segment in segments if segment]
+
+
+def to_storage_path(path: str) -> str:
+    """``path`` in DDS's data storage format: folder names joined with ``/``.
+
+    ``catalog."bathing water"."v1.0"`` becomes ``catalog/bathing water/v1.0``,
+    the folders as they exist in the Dremio catalog; see :func:`path_segments`.
+    """
+    return "/".join(path_segments(path))
+
+
+def _unquoted(text: str) -> str:
+    """``text`` with every double-quoted part removed."""
+    out: list[str] = []
+    quoted = False
+    for char in text:
+        if char == '"':
+            quoted = not quoted  # an escaped "" toggles twice, which is a no-op here
+        elif not quoted:
+            out.append(char)
+    return "".join(out)
+
+
+_PLAIN_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def to_catalog_path(path: str) -> str:
+    """``path`` in the Dremio catalog path structure: folder names joined with ``.``.
+
+    ``catalog/water_management_resources/bwd`` becomes
+    ``catalog.water_management_resources.bwd``. A name that is not a plain
+    identifier (it has a dot, space, hyphen, bracket, ...) is double-quoted,
+    as Dremio SQL writes it: ``catalog/bathing water/v1.0`` becomes
+    ``catalog."bathing water"."v1.0"``.
+    """
+    return ".".join(
+        segment if _PLAIN_NAME.fullmatch(segment) else '"' + segment.replace('"', '""') + '"'
+        for segment in path_segments(path)
+    )
+
+
 def metadata_path(dds_path: str, uuid: str, *, folder: str = DEFAULT_FOLDER) -> str:
-    """``{dds_path}/{folder}/{uuid}.xml``, with slashes normalised."""
-    parent = dds_path.strip().strip("/")
+    """``{dds_path}/{folder}/{uuid}.xml``, with slashes normalised.
+
+    ``dds_path`` may be in catalog format (``a.b.c``) or storage format
+    (``a/b/c``); see :func:`to_storage_path`.
+    """
+    parent = to_storage_path(dds_path).strip("/")
     sub = folder.strip().strip("/").lower()
     if not parent:
         raise ValueError("dds_path must not be empty")
