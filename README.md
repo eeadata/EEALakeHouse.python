@@ -36,7 +36,7 @@ pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@staging"    
 ```
 
 # staging's latest release (early access) — pin to the tag the "staging" badge above shows
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.21-staging"
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.22-staging"
 ```
 
 ## Usage
@@ -193,7 +193,8 @@ with SdiController.from_env() as sdi:
 
 - `get_xml(uuid)` checks the response is `mdb:MD_Metadata` and identifies `uuid`
   (`NotIso19115_3`, `UuidMismatch`; `SdiNotFound` / `SdiAuthError` for 404 / 401-403).
-- `push_to_dds(metadata, dds_path, folder="metadata", force=False)` takes `dds_path` in catalog
+- `push_to_dds(metadata, dds_path, target_name=None, folder="metadata", force=False)` names the
+  file `{uuid}.xml` unless `target_name` is given (`.xml` is added if missing), and takes `dds_path` in catalog
   format (`a.b.c`, sent to DDS as `a/b/c`; quoted names like `"v1.0"` lose their quotes and stay
   one segment) or storage format (`a/b/c`). It first checks `dds_path` exists in the Dremio
   catalog when the controller has a catalog client (`CatalogPathNotFound` otherwise), then
@@ -427,7 +428,7 @@ To pin to one specific release instead, use the exact tag the live badges under
 %pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.21"
 
 # staging's latest release (early access)
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.21-staging"
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.22-staging"
 ```
 
 Use the `%pip` magic rather than `!pip` — it installs into the kernel the

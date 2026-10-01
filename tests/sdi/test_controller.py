@@ -138,6 +138,31 @@ def test_to_catalog_path(path: str, expected: str) -> None:
     assert to_storage_path(expected) == to_storage_path(path)  # round trip
 
 
+def test_metadata_path_target_name() -> None:
+    assert metadata_path("water", UUID, target_name="bwd_2025.xml") == "water/metadata/bwd_2025.xml"
+    assert metadata_path("water", UUID, target_name=" bwd_2025 ") == "water/metadata/bwd_2025.xml"
+    assert metadata_path("water", UUID, target_name="A.XML") == "water/metadata/A.XML"
+
+
+@pytest.mark.parametrize("bad", ["", "  ", "a/b.xml", "..", "a\\b.xml"])
+def test_metadata_path_rejects_bad_target_name(bad: str) -> None:
+    with pytest.raises(ValueError, match="target_name"):
+        metadata_path("water", UUID, target_name=bad)
+
+
+def test_push_with_target_name(sdi: SdiController) -> None:
+    metadata = extracted(sdi)
+    renamed = "water/bathing_water/metadata/bwd_2025_v1.0.xml"
+    with respx.mock:
+        respx.get(dds_file_url(renamed)).mock(return_value=not_found())
+        put = respx.put(dds_file_url(renamed)).mock(return_value=httpx.Response(201))
+
+        result = sdi.push_to_dds(metadata, "water.bathing_water", target_name="bwd_2025_v1.0")
+
+    assert (result.dds_path, result.action, result.uuid) == (renamed, "uploaded", UUID)
+    assert put.calls.last.request.content == iso_xml()
+
+
 def test_to_storage_path_rejects_an_unclosed_quote() -> None:
     with pytest.raises(ValueError, match="unclosed quote"):
         to_storage_path('catalog."water.bwd')
