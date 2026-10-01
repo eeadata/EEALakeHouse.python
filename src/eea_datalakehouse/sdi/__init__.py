@@ -35,13 +35,15 @@ from .errors import (
     UuidMismatch,
 )
 from .iso import IsoRecord
-from .session import SdiSession, SdiSessionError
+from .session import MetadataSession, MetadataSessionError, SdiSession, SdiSessionError
 
 __all__ = [
     "DEFAULT_FOLDER",
     "DEFAULT_SDI_API_URL",
     "DdsCopyConflict",
     "IsoRecord",
+    "MetadataSession",
+    "MetadataSessionError",
     "NotCurrentError",
     "NotIso19115_3",
     "PushResult",

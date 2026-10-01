@@ -253,22 +253,32 @@ current:
 
 ### Notebook surface
 
-`%sdi` (in `notebook/magics.py`, next to `%catalog` / `%ingest`) dispatches onto
-one `SdiSession` per kernel, built on first use from the kernel environment:
+Two magics in `notebook/magics.py`, next to `%catalog` / `%ingest`, one session
+per kernel each, built on first use from the kernel environment:
+
+- **`%sdi`** (`SdiSession`) reads SDI: `get_xml`, `resolve_series`.
+- **`%metadata`** (`MetadataSession`) pushes metadata files to DDS:
+  `push_to_dds`, `dds_base_url`.
 
 ```
 %sdi help
 %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
-%sdi push_to_dds("catalog/water_management_resources/bathing_water/bwd")
 %sdi resolve_series("c3858959-90da-4c1b-b9ca-492db0e514df")
+
+%metadata help
+%metadata dds_base_url()
+%metadata push_to_dds("catalog/water_management_resources/bathing_water/bwd")
 ```
 
 - Each call runs immediately, like `%catalog`; there is nothing to commit.
-- `push_to_dds` uploads the last `get_xml` result unless `metadata=` is given.
-- Every failure prints one `sdi error: …` line instead of a traceback.
-- `DDS_BASE_URL` is read, when the session is built, from the first `.env` in
-  the notebook's folder or a parent; the kernel environment's value applies
-  only if no `.env` sets it. `%sdi dds_base_url()` shows which is in use.
+- `%metadata push_to_dds` uploads the record `%sdi get_xml` fetched last
+  (looked up at push time) unless `metadata=` is given.
+- Every failure prints one `sdi error: …` / `metadata error: …` line instead
+  of a traceback.
+- `DDS_BASE_URL` is read, when `%metadata` builds its session, from the first
+  `.env` in the notebook's folder or a parent; the kernel environment's value
+  applies only if no `.env` sets it. `%metadata dds_base_url()` shows which is
+  in use.
 - The DDS upload's Dremio identity is `_DREMIO_USER` / `_DREMIO_PWD` (as
   `%ingest`), falling back to `DREMIO_USERNAME` / `DREMIO_TOKEN` (as
   `%catalog`).
@@ -300,9 +310,10 @@ Each step lands with its tests, mypy clean and ruff clean.
      release (extracts for real; uploads only with `DRY_RUN = False`).
 4. **Prove Extract against a DDS test instance.** Extract the bathing water
    release, and check the file appears in the dataset's `metadata/` folder.
-5. ✅ **`%sdi` magic** over `sdi/session.py`'s `SdiSession`: `get_xml`,
-   `push_to_dds` (defaults to the last record), `resolve_series`, `help`.
-   Built on first use from the kernel environment like `%catalog` / `%ingest`.
+5. ✅ **`%sdi` and `%metadata` magics** over `sdi/session.py`'s `SdiSession`
+   (`get_xml`, `resolve_series`) and `MetadataSession` (`push_to_dds`, which
+   defaults to the last `%sdi` record, and `dds_base_url`). Built on first use
+   from the kernel environment like `%catalog` / `%ingest`.
    Worked example: `debugger/sdi_session_example.ipynb`. The README
    section, Layout rows, docstrings and `.env.example` entries are done.
 6. **Dependencies.**

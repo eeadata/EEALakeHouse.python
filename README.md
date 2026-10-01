@@ -206,21 +206,23 @@ Environment: `SDI_API_URL` (empty means `https://sdi.eea.europa.eu/catalogue`), 
 `_DREMIO_USER` / `_DREMIO_PWD`, as for ingest. The DDS document endpoints
 (`dds_documents/client.py`) are still assumptions to confirm with the DDS team.
 
-In a notebook, `%sdi` does the same through `SdiSession`, built on first use from the kernel
-environment like `%catalog`'s and `%ingest`'s sessions. It remembers the last record, so the
-push needs only the path (worked example: `debugger/sdi_session_example.ipynb`):
+In a notebook, two magics split the work: `%sdi` (`SdiSession`) reads SDI, and `%metadata`
+(`MetadataSession`) pushes metadata files to DDS. Both are built on first use from the kernel
+environment like `%catalog`'s and `%ingest`'s sessions. `%metadata push_to_dds` uploads the
+record `%sdi get_xml` fetched last, so it needs only the path (worked example:
+`debugger/sdi_session_example.ipynb`):
 
 ```python
-import eea_datalakehouse.notebook   # registers %catalog/%ingest/%sdi
+import eea_datalakehouse.notebook   # registers %catalog/%ingest/%sdi/%metadata
 
 %sdi help
 %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
-%sdi push_to_dds("catalog/water_management_resources/bathing_water/bwd")
+%metadata push_to_dds("catalog/water_management_resources/bathing_water/bwd")
 ```
 
 For the push, `DDS_BASE_URL` is read from the first `.env` in the notebook's folder or a parent
-when the session is built (the kernel environment's value only applies if no `.env` sets it;
-`%sdi dds_base_url()` shows which is in use). The Dremio identity is `_DREMIO_USER` /
+when `%metadata` builds its session (the kernel environment's value only applies if no `.env`
+sets it; `%metadata dds_base_url()` shows which is in use). The Dremio identity is `_DREMIO_USER` /
 `_DREMIO_PWD` (as `%ingest`), falling back to `DREMIO_USERNAME` / `DREMIO_TOKEN` (as `%catalog`).
 
 ## Notebook facade (`%catalog` / `%ingest`)
@@ -333,7 +335,7 @@ context itself — raises `CatalogSessionError` if none is set yet:
 | `dds_documents/client.py` | `DocumentsClient` — put/get/list plain files in DDS folders (no ingest) |
 | `sdi/controller.py` | `SdiController` — `get_xml()`, `push_to_dds()`, `resolve_series()` |
 | `sdi/catalogue.py` | `SdiCatalogue` — read-only GeoNetwork REST client |
-| `sdi/session.py` | `SdiSession` — what `%sdi` dispatches onto; friendly errors, remembers the last record |
+| `sdi/session.py` | `SdiSession` / `MetadataSession` — what `%sdi` / `%metadata` dispatch onto |
 | `sdi/iso.py` | reads UUID, title, edition, dates and series children from ISO 19115-3 |
 | `catalog/client.py` | `Catalog` — two connections (REST + Flight), every operation as a method |
 | `catalog/operations.py` | the operations themselves (table2view, datacopy, createfolder, ...), as functions taking an executor and/or a `CatalogRestClient` |

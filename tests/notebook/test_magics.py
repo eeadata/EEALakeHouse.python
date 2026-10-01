@@ -86,6 +86,7 @@ def ip(shell: Any) -> Any:
     instance._catalog_session = None
     instance._ingest_session = None
     instance._sdi_session = None
+    instance._metadata_session = None
     return shell
 
 
@@ -427,9 +428,49 @@ def test_sdi_session_error_is_printed_not_raised(
 ) -> None:
     monkeypatch.setenv("SDI_API_URL", "https://sdi.example.test/catalogue")
 
-    assert ip.run_line_magic("sdi", 'push_to_dds("a/b")') is None
+    assert ip.run_line_magic("sdi", 'get_xml("")') is None
 
-    assert "sdi error: nothing to push yet" in capsys.readouterr().out
+    assert "sdi error: uuid must not be empty" in capsys.readouterr().out
+
+
+def test_metadata_push_before_sdi_get_xml_is_printed_not_raised(
+    ip: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert ip.run_line_magic("metadata", 'push_to_dds("a/b")') is None
+
+    assert "metadata error: nothing to push yet — run %sdi get_xml" in capsys.readouterr().out
+
+
+def test_metadata_pushes_the_record_sdi_fetched_last(
+    ip: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pushed: list[object] = []
+
+    class _FakeSdiSession:
+        last: object = None
+
+        def get_xml(self, uuid: str) -> str:
+            self.last = f"record {uuid}"
+            return self.last
+
+    class _FakeMetadataSession:
+        def __init__(self, last: Any) -> None:
+            self._last = last
+
+        def push_to_dds(self, dds_path: str) -> str:
+            pushed.append(self._last())
+            return f"pushed to {dds_path}"
+
+    monkeypatch.setattr(magics_module, "_build_sdi_session", _FakeSdiSession)
+    monkeypatch.setattr(magics_module, "_build_metadata_session", _FakeMetadataSession)
+
+    # %metadata built first: the record is still looked up at push time.
+    ip.run_line_magic("metadata", "help")
+    assert ip.run_line_magic("metadata", 'push_to_dds("a/b")') == "pushed to a/b"
+    ip.run_line_magic("sdi", 'get_xml("u-1")')
+    ip.run_line_magic("metadata", 'push_to_dds("a/b")')
+
+    assert pushed == [None, "record u-1"]
 
 
 def test_sdi_empty_line_prints_usage(ip: Any, capsys: pytest.CaptureFixture[str]) -> None:
@@ -451,7 +492,24 @@ def test_sdi_help_lists_methods_without_building_a_session(
     assert "%sdi methods" in out
     assert "SDI_API_URL" in out
     table_html = displayed[0].data
-    for name in (">get_xml<", ">push_to_dds<", ">resolve_series<"):
-        assert name in table_html
-    assert "dds_path, metadata=None, folder=&#x27;metadata&#x27;, force=False" in table_html
+    assert ">get_xml<" in table_html and ">resolve_series<" in table_html
+    assert ">push_to_dds<" not in table_html  # moved to %metadata
     assert _magics_instance(ip)._sdi_session is None
+
+
+@pytest.mark.parametrize("line", ["help", "help()"])
+def test_metadata_help_lists_methods_without_building_a_session(
+    ip: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], line: str
+) -> None:
+    displayed = []
+    monkeypatch.setattr(magics_module, "display", displayed.append)
+
+    ip.run_line_magic("metadata", line)
+
+    out = capsys.readouterr().out
+    assert "%metadata methods" in out
+    assert "DDS_BASE_URL" in out
+    table_html = displayed[0].data
+    assert ">push_to_dds<" in table_html and ">dds_base_url<" in table_html
+    assert "dds_path, metadata=None, folder=&#x27;metadata&#x27;, force=False" in table_html
+    assert _magics_instance(ip)._metadata_session is None
