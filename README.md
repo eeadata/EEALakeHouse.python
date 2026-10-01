@@ -36,7 +36,7 @@ pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@staging"    
 ```
 
 # staging's latest release (early access) — pin to the tag the "staging" badge above shows
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.19-staging"
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.20-staging"
 ```
 
 ## Usage
@@ -174,6 +174,57 @@ exact same arguments.
 - `catalog.close()` (or `with Catalog(...) as catalog:`) — disposes the REST/Flight session(s).
   Idempotent, and covered by a process-exit/SIGTERM fallback if you forget.
 
+## SDI metadata
+
+`eea_datalakehouse.sdi` copies a dataset's ISO 19115-3 metadata record from the EEA SDI
+catalogue (GeoNetwork) into the dataset's `metadata` folder in DDS. The XML is a **document
+upload**, not an ingest: nothing becomes a Dremio table. The calling code always passes the
+SDI UUID. See `docs/sdi-integration-plan.md`.
+
+```python
+from eea_datalakehouse.sdi import SdiController
+
+with SdiController.from_env() as sdi:
+    metadata = sdi.get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")   # SDI -> bytes
+    result = sdi.push_to_dds(metadata, "catalog/water_management_resources/bathing_water/bwd")
+    result.dds_path   # ".../bwd/metadata/070d9baa-448d-4168-8514-7dadb3ad876d.xml"
+    result.action     # "uploaded" | "unchanged" | "replaced"
+```
+
+- `get_xml(uuid)` checks the response is `mdb:MD_Metadata` and identifies `uuid`
+  (`NotIso19115_3`, `UuidMismatch`; `SdiNotFound` / `SdiAuthError` for 404 / 401-403).
+- `push_to_dds(metadata, dds_path, folder="metadata", force=False)` compares with the copy
+  already in DDS: same bytes is `unchanged`; an older copy is `replaced`; a copy that is newer or
+  undated (someone edited it in DDS) raises `DdsCopyConflict` unless `force=True`.
+- `resolve_series(series_uuid)` returns the one release of a series that is not superseded, or
+  raises `NotCurrentError` listing every release.
+- `metadata.provenance_tags()` gives `sdi_record_uuid` / `sdi_edition` / `sdi_date_stamp` in
+  `Catalog.setmeta2wiki`'s `tags=` shape, if you want them on the dataset's wiki.
+
+Environment: `SDI_API_URL` (empty means `https://sdi.eea.europa.eu/catalogue`), optional
+`SDI_USERNAME` / `SDI_PASSWORD` for non-public records, and for the upload `DDS_BASE_URL` plus
+`_DREMIO_USER` / `_DREMIO_PWD`, as for ingest. The DDS document endpoints
+(`dds_documents/client.py`) are still assumptions to confirm with the DDS team.
+
+In a notebook, two magics split the work: `%sdi` (`SdiSession`) reads SDI, and `%metadata`
+(`MetadataSession`) pushes metadata files to DDS. Both are built on first use from the kernel
+environment like `%catalog`'s and `%ingest`'s sessions. `%metadata push_to_dds` uploads the
+record `%sdi get_xml` fetched last, so it needs only the path (worked example:
+`debugger/sdi_session_example.ipynb`):
+
+```python
+import eea_datalakehouse.notebook   # registers %catalog/%ingest/%sdi/%metadata
+
+%sdi help
+%sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
+%metadata push_to_dds("catalog/water_management_resources/bathing_water/bwd")
+```
+
+For the push, `DDS_BASE_URL` is read from the first `.env` in the notebook's folder or a parent
+when `%metadata` builds its session (the kernel environment's value only applies if no `.env`
+sets it; `%metadata dds_base_url()` shows which is in use). The Dremio identity is `_DREMIO_USER` /
+`_DREMIO_PWD` (as `%ingest`), falling back to `DREMIO_USERNAME` / `DREMIO_TOKEN` (as `%catalog`).
+
 ## Notebook facade (`%catalog` / `%ingest`)
 
 For interactive use in JupyterLab, `eea_datalakehouse.notebook` registers two line magics
@@ -281,6 +332,11 @@ context itself — raises `CatalogSessionError` if none is set yet:
 | `dds_ingestion/client.py` | thin, unit-testable HTTP client (`IngestClient`) |
 | `dds_ingestion/progress.py` | tqdm progress bar with graceful fallback |
 | `dds_ingestion/folder.py` | `FolderIngest` orchestration (scan/parallel/resume) |
+| `dds_documents/client.py` | `DocumentsClient` — put/get/list plain files in DDS folders (no ingest) |
+| `sdi/controller.py` | `SdiController` — `get_xml()`, `push_to_dds()`, `resolve_series()` |
+| `sdi/catalogue.py` | `SdiCatalogue` — read-only GeoNetwork REST client |
+| `sdi/session.py` | `SdiSession` / `MetadataSession` — what `%sdi` / `%metadata` dispatch onto |
+| `sdi/iso.py` | reads UUID, title, edition, dates and series children from ISO 19115-3 |
 | `catalog/client.py` | `Catalog` — two connections (REST + Flight), every operation as a method |
 | `catalog/operations.py` | the operations themselves (table2view, datacopy, createfolder, ...), as functions taking an executor and/or a `CatalogRestClient` |
 | `catalog/sql.py` | `SqlExecutor` protocol + REST/Flight implementations, `resolve_executor()` (transport env var) |
@@ -363,7 +419,7 @@ To pin to one specific release instead, use the exact tag the live badges under
 %pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.19"
 
 # staging's latest release (early access)
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.19-staging"
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.20-staging"
 ```
 
 Use the `%pip` magic rather than `!pip` — it installs into the kernel the

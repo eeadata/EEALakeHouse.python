@@ -1,10 +1,10 @@
-"""`%catalog`/`%%catalog` and `%ingest` — thin syntactic sugar over
-`CatalogSession`/`IngestSession` (see
+"""`%catalog`/`%%catalog`, `%ingest`, `%sdi` and `%metadata` — thin syntactic
+sugar over `CatalogSession`/`IngestSession`/`SdiSession`/`MetadataSession` (see
 `docs/notebook-facade-for-data-scientists.md`, "Two magics, two sessions").
 
 Available the moment this package is imported inside IPython — `import
-eea_datalakehouse.notebook` (see that package's `__init__.py`) registers both
-magics as a side effect, so nothing needs loading explicitly. `%load_ext
+eea_datalakehouse.notebook` (see that package's `__init__.py`) registers every
+magic as a side effect, so nothing needs loading explicitly. `%load_ext
 eea_datalakehouse.notebook.magics` still works too (and is the only option
 outside IPython's auto-import path, e.g. a config that imports this module
 directly) — `load_ipython_extension` below is a no-op if the auto-import
@@ -19,6 +19,16 @@ In any cell, once loaded either way::
     %ingest ingest(folder="./bw_2026", target_catalog_path="bwd.reference",
                     data_format="parquet", table_name="water_temperature")
     %ingest commit(retry=True)
+
+    %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
+    %metadata push_to_dds("catalog/water_management_resources/bathing_water/bwd")
+
+`%sdi` (`eea_datalakehouse.sdi.session.SdiSession`) only reads the SDI
+catalogue; `%metadata` (`MetadataSession`, same module) pushes metadata files
+to DDS. Both run each call immediately, like `%catalog`, and are built on first
+use, like `%ingest`'s session, from the kernel environment (see that module's
+docstring for the variables). `%metadata push_to_dds` uploads the record
+`%sdi get_xml` fetched last, so it needs only the DDS path.
 
 `%catalog` executes each call immediately — there's no queue and no separate
 commit step to remember. A `CatalogSession` still sits underneath it (to keep
@@ -87,6 +97,7 @@ from IPython.display import HTML, display
 from ..catalog import Catalog
 from ..catalog.session import CatalogSession, CatalogSessionError
 from ..dds_ingestion.session import IngestSession, IngestSessionError
+from ..sdi.session import MetadataSession, MetadataSessionError, SdiSession, SdiSessionError
 
 _USAGE = {
     "catalog": (
@@ -96,6 +107,11 @@ _USAGE = {
     "ingest": (
         '%ingest ingest(folder="./data", target_catalog_path="a.b", data_format="parquet")'
         "  |  %ingest commit"
+    ),
+    "sdi": '%sdi get_xml("<uuid>")  |  %sdi resolve_series("<series uuid>")',
+    "metadata": (
+        '%metadata push_to_dds("a/b/c")  (uploads the last %sdi get_xml result)'
+        "  |  %metadata dds_base_url()"
     ),
 }
 
@@ -233,6 +249,42 @@ _INGEST_HELP = [
     ("ingest", "Queue one folder ingest (see FolderIngest for what each argument means)."),
     ("commit", "Run every queued ingest in order; stops at the first failure."),
 ]
+_SDI_HELP = [
+    (
+        "get_xml",
+        "Download the ISO 19115-3 XML of SDI record uuid, check it really is that record, "
+        "and remember it for %metadata push_to_dds. Runs immediately; needs no DDS settings.",
+    ),
+    (
+        "resolve_series",
+        "Return the UUID of the one release of series_uuid that is not superseded; raises, "
+        "listing every release, if there are zero or several.",
+    ),
+]
+_SDI_HELP_NOTE = (
+    "Environment: SDI_API_URL (empty means the public EEA catalogue; optional "
+    "SDI_USERNAME/SDI_PASSWORD for non-public records). Pushing to DDS is %metadata's job."
+)
+_METADATA_HELP = [
+    (
+        "push_to_dds",
+        "Upload metadata (default: the last %sdi get_xml result) to "
+        "dds_path/folder/<uuid>.xml in DDS — a document upload, never an ingest. Same bytes "
+        "already there: unchanged; an older copy: replaced; a copy edited in DDS: refused "
+        "unless force=True.",
+    ),
+    (
+        "dds_base_url",
+        "Show the DDS URL push_to_dds uses and where it came from (a .env file or the kernel "
+        "environment).",
+    ),
+]
+_METADATA_HELP_NOTE = (
+    "Environment: DDS_BASE_URL — read from the first .env found in the notebook's folder "
+    "or a parent when %metadata starts, else from the kernel environment — and a Dremio "
+    "identity: _DREMIO_USER/_DREMIO_PWD (as %ingest) or DREMIO_USERNAME/DREMIO_TOKEN "
+    "(as %catalog)."
+)
 
 
 def _build_catalog_session() -> CatalogSession:
@@ -244,6 +296,18 @@ def _build_catalog_session() -> CatalogSession:
             "%catalog needs DREMIO_BASE_URL and DREMIO_TOKEN set in the kernel environment"
         )
     return CatalogSession(Catalog(base_url, token, username=username))
+
+
+def _build_sdi_session() -> SdiSession:
+    # Nothing to check up front: SDI_API_URL defaults to the public catalogue.
+    return SdiSession()
+
+
+def _build_metadata_session(last: Any) -> MetadataSession:
+    # MetadataSession reads DDS_BASE_URL from the nearest .env right here, when
+    # it is built; a missing DDS setting or Dremio identity prints as a
+    # friendly "metadata error" on the first push_to_dds.
+    return MetadataSession(last=last)
 
 
 def _is_help(line: str) -> bool:
@@ -412,12 +476,14 @@ def _register_context_comm(shell: Any, magics: EEALakehouseMagics) -> None:
 
 @magics_class
 class EEALakehouseMagics(Magics):
-    """Registers `%catalog` and `%ingest` — see this module's docstring."""
+    """Registers `%catalog`, `%ingest`, `%sdi` and `%metadata` — see this module's docstring."""
 
     def __init__(self, shell: Any) -> None:
         super().__init__(shell)
         self._catalog_session: CatalogSession | None = None
         self._ingest_session: IngestSession | None = None
+        self._sdi_session: SdiSession | None = None
+        self._metadata_session: MetadataSession | None = None
         self._pending_context: str | None = None
         _register_context_comm(shell, self)
 
@@ -520,6 +586,46 @@ class EEALakehouseMagics(Magics):
             self._ingest_session = IngestSession()
         result = _dispatch(
             self._ingest_session, line, self.shell.user_ns, "ingest", IngestSessionError
+        )
+        return None if result is _DISPATCH_FAILED else result
+
+    @line_magic
+    def sdi(self, line: str) -> Any:
+        """`%sdi` — read ISO 19115-3 metadata from SDI, each call runs immediately::
+
+            %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
+            %sdi resolve_series("c3858959-90da-4c1b-b9ca-492db0e514df")
+        """
+        if _is_help(line):
+            _print_help_table(SdiSession, _SDI_HELP, "sdi", note=_SDI_HELP_NOTE)
+            return None
+        if self._sdi_session is None:
+            self._sdi_session = _build_sdi_session()
+        result = _dispatch(self._sdi_session, line, self.shell.user_ns, "sdi", SdiSessionError)
+        return None if result is _DISPATCH_FAILED else result
+
+    @line_magic
+    def metadata(self, line: str) -> Any:
+        """`%metadata` — push metadata files to DDS, each call runs immediately::
+
+            %metadata push_to_dds("catalog/water_management_resources/bathing_water/bwd")
+            %metadata dds_base_url()
+
+        `push_to_dds` uploads the record `%sdi get_xml` fetched last unless
+        `metadata=` is given.
+        """
+        if _is_help(line):
+            _print_help_table(
+                MetadataSession, _METADATA_HELP, "metadata", note=_METADATA_HELP_NOTE
+            )
+            return None
+        if self._metadata_session is None:
+            # Looked up at push time, so a get_xml run after %metadata started still counts.
+            self._metadata_session = _build_metadata_session(
+                lambda: self._sdi_session.last if self._sdi_session is not None else None
+            )
+        result = _dispatch(
+            self._metadata_session, line, self.shell.user_ns, "metadata", MetadataSessionError
         )
         return None if result is _DISPATCH_FAILED else result
 
