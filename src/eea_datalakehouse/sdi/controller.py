@@ -199,6 +199,15 @@ class SdiController:
         The XML is re-checked first, so a hand-built :class:`SdiMetadata`
         cannot put one record under another's UUID.
         """
+        check_arg_types(
+            "push_to_dds",
+            ("metadata", metadata, SdiMetadata, False),
+            ("dds_path", dds_path, str, False),
+            ("target_name", target_name, str, True),
+            ("folder", folder, str, False),
+            ("force", force, bool, False),
+            ("check_catalog", check_catalog, bool, False),
+        )
         iso.check(metadata.xml, metadata.uuid)
         target = metadata_path(dds_path, metadata.uuid, folder=folder, target_name=target_name)
         if check_catalog and self._catalog is not None:
@@ -345,7 +354,7 @@ def to_catalog_path(path: str) -> str:
 
 def metadata_path(
     dds_path: str,
-    uuid: str,
+    uuid: str | SdiMetadata,
     *,
     folder: str = DEFAULT_FOLDER,
     target_name: str | None = None,
@@ -355,8 +364,10 @@ def metadata_path(
     ``dds_path`` may be in catalog format (``a.b.c``) or storage format
     (``a/b/c``); see :func:`to_storage_path`. ``target_name`` is the file
     name, ``{uuid}.xml`` by default; ``.xml`` is added if it has no such
-    extension.
+    extension. ``uuid`` may also be the :class:`SdiMetadata` itself.
     """
+    if isinstance(uuid, SdiMetadata):
+        uuid = uuid.uuid
     parent = to_storage_path(dds_path).strip("/")
     sub = folder.strip().strip("/").lower()
     if not parent:
@@ -368,19 +379,75 @@ def metadata_path(
     return f"{parent}/{sub}/{name}"
 
 
+_INVALID_NAME_CHARS = set('<>:"|?*')
+
+
+def check_arg_types(
+    func: str, *specs: tuple[str, object, type | tuple[type, ...], bool]
+) -> None:
+    """Raise ``TypeError`` unless every argument has exactly its declared type.
+
+    ``specs`` are ``(name, value, expected, optional)`` in the function's
+    parameter order, so the message can name the position too — the argument
+    most likely to be wrong is one passed positionally into the wrong slot.
+    Strict: ``bool`` parameters take only ``True`` / ``False`` (not ``0`` /
+    ``1``), and a ``str`` parameter takes no other type. ``optional`` allows
+    ``None``.
+    """
+    for position, (name, value, expected, optional) in enumerate(specs, start=1):
+        if value is None and optional:
+            continue
+        kinds = expected if isinstance(expected, tuple) else (expected,)
+        # bool is a subclass of int: only a bool parameter may take a bool.
+        if any(
+            isinstance(value, kind) and (kind is bool or not isinstance(value, bool))
+            for kind in kinds
+        ):
+            continue
+        wanted = " or ".join(kind.__name__ for kind in kinds) + (" or None" if optional else "")
+        hint = (
+            " — pass the record as metadata=..."
+            if isinstance(value, SdiMetadata) and name != "metadata"
+            else ""
+        )
+        raise TypeError(
+            f"{func}: argument {position} ({name}) must be {wanted}, "
+            f"not {type(value).__name__}{hint}"
+        )
+
+
 def _require_target_name(target_name: str) -> str:
-    """``target_name`` as a single file name ending in ``.xml``."""
+    """``target_name`` as a valid single file name ending in ``.xml``.
+
+    Raises ``TypeError`` unless it is a ``str`` (an :class:`SdiMetadata`
+    passed here by mistake gets a hint to use ``metadata=``), and
+    ``ValueError`` if it is empty, a path (``/``, ``\\``, ``.``, ``..``), or
+    has a character no file system accepts in a name (``< > : " | ? *`` or a
+    control character).
+    """
+    if not isinstance(target_name, str):
+        raise TypeError(
+            f"target_name must be a file name (str), not {type(target_name).__name__}"
+            + (" — pass the record as metadata=..." if isinstance(target_name, SdiMetadata) else "")
+        )
     name = target_name.strip()
     if not name:
         raise ValueError("target_name must not be empty")
     if "/" in name or "\\" in name or name in (".", ".."):
         raise ValueError(f"target_name must be a file name, not a path: {target_name!r}")
+    bad = sorted({c for c in name if c in _INVALID_NAME_CHARS or ord(c) < 32 or ord(c) == 127})
+    if bad:
+        raise ValueError(
+            f"target_name {target_name!r} is not a valid file name: it contains {bad!r}"
+        )
     if not name.lower().endswith(".xml"):
         name += ".xml"
     return name
 
 
 def _require_uuid(uuid: str) -> str:
+    if not isinstance(uuid, str):
+        raise TypeError(f"uuid must be a str, not {type(uuid).__name__}")
     uuid = uuid.strip()
     if not uuid:
         raise ValueError("uuid must not be empty")

@@ -86,8 +86,10 @@ from a JupyterLab tree click".
 
 from __future__ import annotations
 
+import ast
 import inspect
 import os
+import re
 from html import escape as _escape
 from typing import Any
 
@@ -412,6 +414,106 @@ def _print_help_table(
     display(HTML(_help_table_html(rows)))
 
 
+_CALL = re.compile(r"\s*([A-Za-z_]\w*)\s*\((.*)\)\s*", re.DOTALL)
+_CALLEE = re.compile(r"\s*([A-Za-z_]\w*)\s*\(")
+_KEYWORD_ARG = re.compile(r"\s*([A-Za-z_]\w*)\s*=(?!=)")
+
+
+def _split_args(text: str) -> list[str] | None:
+    """The top-level, comma-separated arguments of a call, as written.
+
+    Commas inside brackets or string literals don't split. ``None`` if the
+    brackets or quotes don't balance — nothing useful can be said then.
+    """
+    args: list[str] = []
+    depth = 0
+    quote: str | None = None
+    start = 0
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if quote:
+            if char == "\\":
+                i += 1
+            elif char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif char == "," and depth == 0:
+            args.append(text[start:i].strip())
+            start = i + 1
+        i += 1
+    if quote or depth:
+        return None
+    last = text[start:].strip()
+    if last:
+        args.append(last)
+    return args
+
+
+def _fits(annotation: Any, value_text: str) -> bool:
+    """Whether the literal ``value_text`` could be a value for ``annotation``.
+
+    Anything that isn't a literal (a variable name, an expression) could be
+    anything, so it fits every parameter.
+    """
+    try:
+        value = ast.literal_eval(value_text)
+    except (ValueError, SyntaxError):
+        return True
+    if annotation is inspect.Parameter.empty:
+        return True
+    allowed = {part.strip() for part in str(annotation).split("|")}
+    return type(value).__name__ in allowed or (value is None and "None" in allowed)
+
+
+def _explain_syntax_error(session: Any, line: str, exc: SyntaxError) -> str:
+    """A magic line that isn't valid Python, explained against the method it calls.
+
+    For the commonest slip — an unnamed argument after a ``name=value`` one —
+    names the offending argument and suggests the parameters it could be;
+    always ends with the correct form of the call when the method is known.
+    """
+    callee = _CALLEE.match(line)
+    method = getattr(type(session), callee.group(1), None) if callee else None
+    if not callable(method):
+        return f"invalid syntax: {exc.msg}"
+    usage = f"usage: {method.__name__}({_plain_params(method)})"
+    match = _CALL.fullmatch(line)
+    args = _split_args(match.group(2)) if match else None
+    if args:
+        keywords = [_KEYWORD_ARG.match(arg) for arg in args]
+        first_keyword = next((i for i, kw in enumerate(keywords) if kw), None)
+        stray = next(
+            (i for i, kw in enumerate(keywords) if first_keyword is not None
+             and i > first_keyword and kw is None),
+            None,
+        )
+        if first_keyword is not None and stray is not None:
+            named = {kw.group(1) for kw in keywords if kw}
+            params = [
+                p for name, p in inspect.signature(method).parameters.items() if name != "self"
+            ]
+            candidates = [
+                f"{p.name}={args[stray]}"
+                for p in params[first_keyword:]
+                if p.name not in named and _fits(p.annotation, args[stray])
+            ]
+            hint = f" Did you mean {' or '.join(candidates)}?" if candidates else ""
+            return (
+                f"argument {stray + 1} ({args[stray]}) has no name, but comes after "
+                f"{args[first_keyword]} — once an argument is given by name, every argument "
+                f"after it needs a name too.{hint}\n{usage}"
+            )
+    return f"invalid syntax: {exc.msg}\n{usage}"
+
+
 _DISPATCH_FAILED = object()
 # Sentinel `_dispatch` returns when it printed a friendly error — distinct
 # from a legitimate `None` result (e.g. `use(...)` printing its own status
@@ -453,6 +555,10 @@ def _dispatch(
                 # the context they just set instead of an empty CommitReport.
                 print(f"context set to {session.get_context()!r}")
                 result = None
+    except SyntaxError as exc:
+        # The line itself isn't valid Python, so the call never happened.
+        print(f"{label} error: {_explain_syntax_error(session, line, exc)}")
+        return _DISPATCH_FAILED
     except error_type as exc:
         print(f"{label} error: {exc}")
         return _DISPATCH_FAILED

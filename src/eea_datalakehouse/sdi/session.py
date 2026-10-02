@@ -40,6 +40,7 @@ otherwise nothing is uploaded. `check_catalog=False` skips the check.
 
 from __future__ import annotations
 
+import inspect
 import os
 from collections.abc import Callable, Mapping
 from functools import wraps
@@ -58,7 +59,14 @@ from ..dds_ingestion.credentials import (
     MissingCredentialsError,
 )
 from .catalogue import SdiCatalogue
-from .controller import DEFAULT_FOLDER, PushResult, SdiController, SdiMetadata
+from .controller import (
+    DEFAULT_FOLDER,
+    PushResult,
+    SdiController,
+    SdiMetadata,
+    check_arg_types,
+    metadata_path,
+)
 from .errors import SdiError
 
 # What `%catalog` reads (see notebook/magics.py's _build_catalog_session).
@@ -70,7 +78,14 @@ DOTENV_NAME = ".env"
 _F = TypeVar("_F", bound=Callable[..., Any])
 
 # Failures a notebook user can act on; anything else is a bug and keeps its traceback.
-_EXPECTED = (SdiError, DocumentsApiError, MissingCredentialsError, ValueError, httpx.HTTPError)
+_EXPECTED = (
+    SdiError,
+    DocumentsApiError,
+    MissingCredentialsError,
+    ValueError,
+    TypeError,
+    httpx.HTTPError,
+)
 
 
 class SdiSessionError(RuntimeError):
@@ -81,12 +96,35 @@ class MetadataSessionError(RuntimeError):
     """Any failure of a `MetadataSession` call; the original error is ``__cause__``."""
 
 
+def call_usage(method: Callable[..., Any]) -> str:
+    """``name(a, b=None, ...)`` — how to call ``method``, without ``self`` or type hints."""
+    params = [
+        name if param.default is inspect.Parameter.empty else f"{name}={param.default!r}"
+        for name, param in inspect.signature(method).parameters.items()
+        if name != "self"
+    ]
+    return f"{method.__name__}({', '.join(params)})"
+
+
 def _friendly(error: type[RuntimeError]) -> Callable[[_F], _F]:
-    """Re-raise every expected failure of the decorated method as ``error``."""
+    """Re-raise every expected failure of the decorated method as ``error``.
+
+    A call that doesn't fit the method's signature (an unknown keyword, an
+    argument given twice, too many arguments) is reported the same way, with
+    the correct form of the call.
+    """
 
     def decorate(method: _F) -> _F:
+        signature = inspect.signature(method)
+
         @wraps(method)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                signature.bind(*args, **kwargs)
+            except TypeError as exc:
+                raise error(
+                    f"{method.__name__}: {exc}\nusage: {call_usage(method)}"
+                ) from None
             try:
                 return method(*args, **kwargs)
             except error:
@@ -241,9 +279,22 @@ class MetadataSession:
         `{dds_path}/{folder}/{target_name}` in DDS — `{uuid}.xml` unless
         `target_name` is given — after checking `dds_path` exists in the
         Dremio catalog (skip with `check_catalog=False`)."""
+        # Arguments first, strictly typed in this method's own parameter order:
+        # a bad argument is reported as such, before any DDS or Dremio settings
+        # are looked up.
+        check_arg_types(
+            "push_to_dds",
+            ("dds_path", dds_path, str, False),
+            ("target_name", target_name, str, True),
+            ("metadata", metadata, SdiMetadata, True),
+            ("folder", folder, str, False),
+            ("force", force, bool, False),
+            ("check_catalog", check_catalog, bool, False),
+        )
         metadata = metadata or self._last()
         if metadata is None:
             raise MetadataSessionError("nothing to push yet — run %sdi get_xml(uuid) first")
+        metadata_path(dds_path, metadata.uuid, folder=folder, target_name=target_name)
         return self._push_controller(with_catalog=check_catalog).push_to_dds(
             metadata,
             dds_path,
