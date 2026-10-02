@@ -138,13 +138,30 @@ def test_to_catalog_path(path: str, expected: str) -> None:
     assert to_storage_path(expected) == to_storage_path(path)  # round trip
 
 
+def test_metadata_path_accepts_the_record_for_uuid(sdi: SdiController) -> None:
+    assert metadata_path("water.bathing_water", extracted(sdi)) == TARGET
+
+
+def test_metadata_path_rejects_the_record_as_target_name(sdi: SdiController) -> None:
+    record = extracted(sdi)
+    with pytest.raises(TypeError, match="not SdiMetadata — pass the record as metadata="):
+        metadata_path("water", UUID, target_name=record)  # type: ignore[arg-type]
+
+
+def test_metadata_path_rejects_non_str_uuid() -> None:
+    with pytest.raises(TypeError, match="uuid must be a str"):
+        metadata_path("water", 42)  # type: ignore[arg-type]
+
+
 def test_metadata_path_target_name() -> None:
     assert metadata_path("water", UUID, target_name="bwd_2025.xml") == "water/metadata/bwd_2025.xml"
     assert metadata_path("water", UUID, target_name=" bwd_2025 ") == "water/metadata/bwd_2025.xml"
     assert metadata_path("water", UUID, target_name="A.XML") == "water/metadata/A.XML"
 
 
-@pytest.mark.parametrize("bad", ["", "  ", "a/b.xml", "..", "a\\b.xml"])
+@pytest.mark.parametrize(
+    "bad", ["", "  ", "a/b.xml", "..", "a\\b.xml", "a:b.xml", "what?.xml", 'a"b', "a\tb", "x*"]
+)
 def test_metadata_path_rejects_bad_target_name(bad: str) -> None:
     with pytest.raises(ValueError, match="target_name"):
         metadata_path("water", UUID, target_name=bad)

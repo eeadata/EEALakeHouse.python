@@ -282,3 +282,43 @@ def test_push_target_name_renames_the_file() -> None:
 
     assert result.dds_path == renamed
     assert put.called
+
+
+@respx.mock
+def test_push_refuses_the_record_as_target_name() -> None:
+    respx.get(record_url()).mock(return_value=httpx.Response(200, content=iso_xml()))
+    dds = respx.route(host="dds.example.test")
+    sdi = SdiSession(env=ENV)
+    record = sdi.get_xml(UUID)
+
+    with pytest.raises(
+        MetadataSessionError, match=r"not SdiMetadata — pass the record as metadata=\.\.\."
+    ):
+        _metadata_session(sdi, env={**ENV, **IDENTITY}).push_to_dds(
+            "water", record, check_catalog=False  # type: ignore[arg-type]
+        )
+    assert not dds.called
+
+
+@respx.mock
+def test_push_wrong_target_name_type_is_a_session_error() -> None:
+    respx.get(record_url()).mock(return_value=httpx.Response(200, content=iso_xml()))
+    sdi = SdiSession(env=ENV)
+    sdi.get_xml(UUID)
+
+    with pytest.raises(MetadataSessionError, match="target_name must be a file name"):
+        _metadata_session(sdi, env={**ENV, **IDENTITY}).push_to_dds(
+            "water", 42, check_catalog=False  # type: ignore[arg-type]
+        )
+
+
+@respx.mock
+@pytest.mark.parametrize("bad", ["bad:name.xml", "a/b.xml", ""])
+def test_bad_target_name_is_reported_before_any_settings(bad: str) -> None:
+    respx.get(record_url()).mock(return_value=httpx.Response(200, content=iso_xml()))
+    sdi = SdiSession(env=ENV)
+    sdi.get_xml(UUID)
+    no_settings = _metadata_session(sdi, env={})  # no DDS URL, no Dremio identity
+
+    with pytest.raises(MetadataSessionError, match="target_name"):
+        no_settings.push_to_dds("water", bad)

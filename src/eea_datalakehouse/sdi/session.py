@@ -58,7 +58,7 @@ from ..dds_ingestion.credentials import (
     MissingCredentialsError,
 )
 from .catalogue import SdiCatalogue
-from .controller import DEFAULT_FOLDER, PushResult, SdiController, SdiMetadata
+from .controller import DEFAULT_FOLDER, PushResult, SdiController, SdiMetadata, metadata_path
 from .errors import SdiError
 
 # What `%catalog` reads (see notebook/magics.py's _build_catalog_session).
@@ -70,7 +70,14 @@ DOTENV_NAME = ".env"
 _F = TypeVar("_F", bound=Callable[..., Any])
 
 # Failures a notebook user can act on; anything else is a bug and keeps its traceback.
-_EXPECTED = (SdiError, DocumentsApiError, MissingCredentialsError, ValueError, httpx.HTTPError)
+_EXPECTED = (
+    SdiError,
+    DocumentsApiError,
+    MissingCredentialsError,
+    ValueError,
+    TypeError,
+    httpx.HTTPError,
+)
 
 
 class SdiSessionError(RuntimeError):
@@ -244,6 +251,9 @@ class MetadataSession:
         metadata = metadata or self._last()
         if metadata is None:
             raise MetadataSessionError("nothing to push yet — run %sdi get_xml(uuid) first")
+        # Arguments first: a bad target_name / dds_path / folder is reported as
+        # such, before any DDS or Dremio settings are looked up.
+        metadata_path(dds_path, metadata.uuid, folder=folder, target_name=target_name)
         return self._push_controller(with_catalog=check_catalog).push_to_dds(
             metadata,
             dds_path,
