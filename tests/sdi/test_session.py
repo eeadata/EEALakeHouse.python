@@ -306,7 +306,9 @@ def test_push_wrong_target_name_type_is_a_session_error() -> None:
     sdi = SdiSession(env=ENV)
     sdi.get_xml(UUID)
 
-    with pytest.raises(MetadataSessionError, match="target_name must be a file name"):
+    with pytest.raises(
+        MetadataSessionError, match=r"argument 2 \(target_name\) must be str or None, not int"
+    ):
         _metadata_session(sdi, env={**ENV, **IDENTITY}).push_to_dds(
             "water", 42, check_catalog=False  # type: ignore[arg-type]
         )
@@ -322,3 +324,41 @@ def test_bad_target_name_is_reported_before_any_settings(bad: str) -> None:
 
     with pytest.raises(MetadataSessionError, match="target_name"):
         no_settings.push_to_dds("water", bad)
+
+
+@pytest.mark.parametrize(
+    ("args", "kwargs", "message"),
+    [
+        ((42,), {}, r"argument 1 \(dds_path\) must be str, not int"),
+        (("water", None, "not a record"), {}, r"argument 3 \(metadata\) must be SdiMetadata"),
+        (("water", None, None, 7), {}, r"argument 4 \(folder\) must be str, not int"),
+        (("water", None, None, "metadata", 1), {}, r"argument 5 \(force\) must be bool, not int"),
+        (("water",), {"check_catalog": "no"}, r"argument 6 \(check_catalog\) must be bool"),
+    ],
+)
+def test_push_checks_every_argument_type_strictly(
+    args: tuple[object, ...], kwargs: dict[str, object], message: str
+) -> None:
+    # Reported before anything else, so no record or settings are needed.
+    with pytest.raises(MetadataSessionError, match=message):
+        _metadata_session(env={}).push_to_dds(*args, **kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"colour": "red"}, "got an unexpected keyword argument 'colour'"),
+        ({"dds_path": "again"}, "multiple values for argument 'dds_path'"),
+    ],
+)
+def test_call_that_does_not_fit_the_signature_shows_the_usage(
+    kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises(MetadataSessionError) as info:
+        _metadata_session(env={}).push_to_dds("water", **kwargs)  # type: ignore[arg-type]
+
+    assert message in str(info.value)
+    assert str(info.value).endswith(
+        "usage: push_to_dds(dds_path, target_name=None, metadata=None, folder='metadata', "
+        "force=False, check_catalog=True)"
+    )

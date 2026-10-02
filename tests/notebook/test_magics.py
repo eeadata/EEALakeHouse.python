@@ -515,3 +515,71 @@ def test_metadata_help_lists_methods_without_building_a_session(
     assert "separated with either '.' or '/'" in out
     assert "dds_path, target_name=None, metadata=None, folder=&#x27;metadata&#x27;" in table_html
     assert _magics_instance(ip)._metadata_session is None
+
+
+class _FakePushSession:
+    """Just the signature `%metadata push_to_dds` exposes — never pushes."""
+
+    def push_to_dds(
+        self,
+        dds_path: str,
+        target_name: str | None = None,
+        metadata: object | None = None,
+        folder: str = "metadata",
+        force: bool = False,
+        check_catalog: bool = True,
+    ) -> str:
+        return "pushed"
+
+
+USAGE = (
+    "usage: push_to_dds(dds_path, target_name=None, metadata=None, folder='metadata', "
+    "force=False, check_catalog=True)"
+)
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        (
+            "push_to_dds(P, metadata=m, True)",
+            "argument 3 (True) has no name, but comes after metadata=m — once an argument is "
+            "given by name, every argument after it needs a name too. Did you mean force=True "
+            "or check_catalog=True?",
+        ),
+        (
+            'push_to_dds(P, metadata=m, "x.xml")',
+            'Did you mean target_name="x.xml" or folder="x.xml"?',
+        ),
+        ("push_to_dds(P, metadata=m, flag)", "Did you mean target_name=flag or folder=flag"),
+        ('push_to_dds("a, b", force=True, "c(,)")', 'argument 3 ("c(,)") has no name'),
+        ("push_to_dds(P,", "invalid syntax:"),
+    ],
+)
+def test_syntax_error_names_the_argument_and_shows_the_signature(
+    ip: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    line: str,
+    expected: str,
+) -> None:
+    monkeypatch.setattr(magics_module, "_build_metadata_session", lambda last: _FakePushSession())
+
+    assert ip.run_line_magic("metadata", line) is None
+
+    out = capsys.readouterr().out
+    assert out.startswith("metadata error: ")
+    assert expected in out
+    assert USAGE in out
+
+
+def test_syntax_error_on_an_unknown_method_has_no_usage(
+    ip: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(magics_module, "_build_metadata_session", lambda last: _FakePushSession())
+
+    ip.run_line_magic("metadata", "nope(a=1, 2)")
+
+    out = capsys.readouterr().out
+    assert out.startswith("metadata error: invalid syntax:")
+    assert "usage:" not in out

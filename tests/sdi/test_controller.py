@@ -148,6 +148,16 @@ def test_metadata_path_rejects_the_record_as_target_name(sdi: SdiController) -> 
         metadata_path("water", UUID, target_name=record)  # type: ignore[arg-type]
 
 
+def test_controller_push_checks_argument_types(sdi: SdiController) -> None:
+    record = extracted(sdi)
+    with pytest.raises(TypeError, match=r"argument 3 \(target_name\) must be str or None"):
+        sdi.push_to_dds(record, "water", record)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match=r"argument 1 \(metadata\) must be SdiMetadata, not str"):
+        sdi.push_to_dds("water", "water")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match=r"argument 5 \(force\) must be bool, not int"):
+        sdi.push_to_dds(record, "water", force=1)  # type: ignore[arg-type]
+
+
 def test_metadata_path_rejects_non_str_uuid() -> None:
     with pytest.raises(TypeError, match="uuid must be a str"):
         metadata_path("water", 42)  # type: ignore[arg-type]

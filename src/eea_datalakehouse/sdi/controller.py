@@ -199,6 +199,15 @@ class SdiController:
         The XML is re-checked first, so a hand-built :class:`SdiMetadata`
         cannot put one record under another's UUID.
         """
+        check_arg_types(
+            "push_to_dds",
+            ("metadata", metadata, SdiMetadata, False),
+            ("dds_path", dds_path, str, False),
+            ("target_name", target_name, str, True),
+            ("folder", folder, str, False),
+            ("force", force, bool, False),
+            ("check_catalog", check_catalog, bool, False),
+        )
         iso.check(metadata.xml, metadata.uuid)
         target = metadata_path(dds_path, metadata.uuid, folder=folder, target_name=target_name)
         if check_catalog and self._catalog is not None:
@@ -371,6 +380,40 @@ def metadata_path(
 
 
 _INVALID_NAME_CHARS = set('<>:"|?*')
+
+
+def check_arg_types(
+    func: str, *specs: tuple[str, object, type | tuple[type, ...], bool]
+) -> None:
+    """Raise ``TypeError`` unless every argument has exactly its declared type.
+
+    ``specs`` are ``(name, value, expected, optional)`` in the function's
+    parameter order, so the message can name the position too — the argument
+    most likely to be wrong is one passed positionally into the wrong slot.
+    Strict: ``bool`` parameters take only ``True`` / ``False`` (not ``0`` /
+    ``1``), and a ``str`` parameter takes no other type. ``optional`` allows
+    ``None``.
+    """
+    for position, (name, value, expected, optional) in enumerate(specs, start=1):
+        if value is None and optional:
+            continue
+        kinds = expected if isinstance(expected, tuple) else (expected,)
+        # bool is a subclass of int: only a bool parameter may take a bool.
+        if any(
+            isinstance(value, kind) and (kind is bool or not isinstance(value, bool))
+            for kind in kinds
+        ):
+            continue
+        wanted = " or ".join(kind.__name__ for kind in kinds) + (" or None" if optional else "")
+        hint = (
+            " — pass the record as metadata=..."
+            if isinstance(value, SdiMetadata) and name != "metadata"
+            else ""
+        )
+        raise TypeError(
+            f"{func}: argument {position} ({name}) must be {wanted}, "
+            f"not {type(value).__name__}{hint}"
+        )
 
 
 def _require_target_name(target_name: str) -> str:
