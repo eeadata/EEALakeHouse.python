@@ -583,3 +583,75 @@ def test_syntax_error_on_an_unknown_method_has_no_usage(
     out = capsys.readouterr().out
     assert out.startswith("metadata error: invalid syntax:")
     assert "usage:" not in out
+
+
+class _FakeVersionSession:
+    """`create_version`'s signature, failing the way `CatalogSession` does."""
+
+    def create_version(
+        self,
+        source_path: str,
+        version_name: str,
+        tables: list[str] | None = None,
+        target_path: str | None = None,
+        *,
+        overwrite: bool = False,
+        create_target_folder: bool = True,
+    ) -> Any:
+        from eea_datalakehouse.catalog.session import CatalogSessionError
+
+        if not version_name.strip():
+            raise CatalogSessionError("version_name must not be empty")
+        return "created"
+
+    def get_context(self) -> str:
+        return "catalog"
+
+    def broken(self) -> None:
+        raise TypeError("bug inside the method")
+
+
+VERSION_USAGE = (
+    "usage: create_version(source_path, version_name, tables=None, target_path=None, "
+    "overwrite=False, create_target_folder=True)"
+)
+
+
+@pytest.mark.parametrize(
+    ("line", "error"),
+    [
+        ("create_version('a.b', ' ')", "catalog error: version_name must not be empty"),
+        (
+            "create_version('a.b', 'v1', colour='red')",
+            "got an unexpected keyword argument 'colour'",
+        ),
+        ("create_version('a.b')", "missing 1 required positional argument: 'version_name'"),
+        ("create_version('a.b', tables=['x'], 'v1')", "argument 3 ('v1') has no name"),
+    ],
+)
+def test_create_version_errors_show_its_usage(
+    ip: Any, capsys: pytest.CaptureFixture[str], line: str, error: str
+) -> None:
+    _magics_instance(ip)._catalog_session = _FakeVersionSession()  # type: ignore[assignment]
+
+    assert ip.run_line_magic("catalog", line) is None
+
+    out = capsys.readouterr().out
+    assert error in out
+    assert out.rstrip().endswith(VERSION_USAGE)
+
+
+def test_create_version_success_prints_no_usage(
+    ip: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _magics_instance(ip)._catalog_session = _FakeVersionSession()  # type: ignore[assignment]
+
+    assert ip.run_line_magic("catalog", "create_version('a.b', 'v1')") == "created"
+    assert "usage:" not in capsys.readouterr().out
+
+
+def test_a_type_error_inside_a_method_keeps_its_traceback(ip: Any) -> None:
+    _magics_instance(ip)._catalog_session = _FakeVersionSession()  # type: ignore[assignment]
+
+    with pytest.raises(TypeError, match="bug inside the method"):
+        ip.run_line_magic("catalog", "broken()")

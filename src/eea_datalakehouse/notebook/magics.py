@@ -173,6 +173,20 @@ _CATALOG_HELP = [
         "overwrite=False (default) raises CatalogOperationError if target_path already "
         "exists; overwrite=True replaces it and is not undoable. " + _CREATE_TARGET_FOLDER_NOTE,
     ),
+    (
+        "create_version",
+        "Copy the listed tables from source_path into a new folder target_path.version_name "
+        "(as CREATE TABLE snapshots, keeping each table's sub-folders). source_path and "
+        "version_name must not be blank. tables omitted or empty copies everything under "
+        "source_path. Each entry is a table "
+        "or a folder (= every table under it), named as listed under source_path or as list() "
+        "shows them. target_path omitted means the current context — use() picks where "
+        "versions go; a missing target_path is created unless create_target_folder=False. "
+        "Reference/vocabulary tables (a "
+        "folder named reference(s)/vocabulary(ies) in the path) and views are skipped; the "
+        "report's notes say which. An existing version folder is an error unless "
+        "overwrite=True (replaces the listed tables, keeps the rest).",
+    ),
     # -- table ----------------------------------------------------------------
     (
         "list",
@@ -473,6 +487,40 @@ def _fits(annotation: Any, value_text: str) -> bool:
     return type(value).__name__ in allowed or (value is None and "None" in allowed)
 
 
+# Commands whose every error also prints the correct form of the call — the
+# ones with several positional parameters, where a slot mix-up is the likely
+# cause. A call that doesn't fit a method's signature shows it for any command.
+_USAGE_ON_ERROR = frozenset({"create_version"})
+
+
+def _called_method(session: Any, line: str) -> Any | None:
+    """The session method `line` calls (``name(...)``), or ``None``."""
+    callee = _CALLEE.match(line)
+    method = getattr(type(session), callee.group(1), None) if callee else None
+    return method if callable(method) else None
+
+
+def _usage_for(session: Any, line: str) -> str | None:
+    """``usage: name(params)`` for the session method `line` calls, if known."""
+    method = _called_method(session, line)
+    if method is None:
+        return None
+    return f"usage: {method.__name__}({_plain_params(method)})"
+
+
+def _is_call_shape_error(exc: TypeError) -> bool:
+    """Whether `exc` came from the call itself not fitting the method's
+    signature (unknown keyword, too many / missing arguments), rather than
+    from inside the method: the traceback then ends in the evaluated magic
+    line, never entering the method's own code."""
+    tb = exc.__traceback__
+    if tb is None:
+        return False
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    return tb.tb_frame.f_code.co_filename == "<string>"
+
+
 def _explain_syntax_error(session: Any, line: str, exc: SyntaxError) -> str:
     """A magic line that isn't valid Python, explained against the method it calls.
 
@@ -480,9 +528,8 @@ def _explain_syntax_error(session: Any, line: str, exc: SyntaxError) -> str:
     names the offending argument and suggests the parameters it could be;
     always ends with the correct form of the call when the method is known.
     """
-    callee = _CALLEE.match(line)
-    method = getattr(type(session), callee.group(1), None) if callee else None
-    if not callable(method):
+    method = _called_method(session, line)
+    if method is None:
         return f"invalid syntax: {exc.msg}"
     usage = f"usage: {method.__name__}({_plain_params(method)})"
     match = _CALL.fullmatch(line)
@@ -561,6 +608,15 @@ def _dispatch(
         return _DISPATCH_FAILED
     except error_type as exc:
         print(f"{label} error: {exc}")
+        callee = _CALLEE.match(line)
+        if callee and callee.group(1) in _USAGE_ON_ERROR:
+            print(_usage_for(session, line))
+        return _DISPATCH_FAILED
+    except TypeError as exc:
+        usage = _usage_for(session, line)
+        if usage is None or not _is_call_shape_error(exc):
+            raise  # a bug inside the method: keep the traceback
+        print(f"{label} error: {exc}\n{usage}")
         return _DISPATCH_FAILED
     return result
 

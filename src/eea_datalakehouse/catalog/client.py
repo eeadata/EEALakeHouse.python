@@ -35,7 +35,7 @@ import weakref
 from typing import Any, Literal
 
 from . import operations, retry_state
-from .operations import TableInfo
+from .operations import TableInfo, VersionResult
 from .rest import CatalogRestClient
 from .sql import (
     DEFAULT_TIMEOUT,
@@ -48,7 +48,7 @@ from .sql import (
 
 # Which operations' retries must go back over Flight rather than REST — kept
 # in sync with which methods below pass self._flight_executor.
-_FLIGHT_OPERATIONS = frozenset({"datacopy", "datamove"})
+_FLIGHT_OPERATIONS = frozenset({"datacopy", "datamove", "createversion"})
 
 _open_catalogs: weakref.WeakSet[Catalog] = weakref.WeakSet()
 _signal_lock = threading.Lock()
@@ -219,6 +219,30 @@ class Catalog:
             overwrite=overwrite,
             create_target_folder=create_target_folder,
             catalog_rest=self._catalog_rest,
+            idempotency_key=idempotency_key,
+        )
+
+    def createversion(
+        self,
+        source_path: str,
+        version_name: str,
+        tables: list[str] | None = None,
+        *,
+        target_path: str,
+        overwrite: bool = False,
+        create_target_folder: bool = True,
+        idempotency_key: str,
+    ) -> VersionResult:
+        # Arrow Flight, not REST: it is a series of datacopy calls.
+        return operations.createversion(
+            self._flight_executor,
+            self._catalog_rest,
+            source_path,
+            version_name,
+            tables,
+            target_path=target_path,
+            overwrite=overwrite,
+            create_target_folder=create_target_folder,
             idempotency_key=idempotency_key,
         )
 

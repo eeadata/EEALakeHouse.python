@@ -22,7 +22,9 @@ from .client import Catalog
 from .errors import CatalogOperationError, EngineStartingError
 from .operations import (
     TableInfo,
+    VersionResult,
     createfolder,
+    createversion,
     datacopy,
     datamove,
     deletefolder,
@@ -70,7 +72,9 @@ __all__ = [
     "SqlExecutor",
     "SqlResult",
     "TableInfo",
+    "VersionResult",
     "createfolder",
+    "createversion",
     "datacopy",
     "datamove",
     "deletefolder",
