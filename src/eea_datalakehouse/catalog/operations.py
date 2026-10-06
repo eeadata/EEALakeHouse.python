@@ -1,5 +1,5 @@
 """The catalog operations: table2view, draft2version, publishversion,
-datacopy, datamove, deleteview, gettablesfrom, gettableitemsfrom,
+datacopy, datamove, createversion, deleteview, gettablesfrom, gettableitemsfrom,
 getwikifrom, gettagsfrom, setwikito, deletewiki, setmeta2wiki,
 getmetafromwiki, settagsto, deletetags, createfolder, deletefolder.
 
@@ -76,7 +76,7 @@ from __future__ import annotations
 
 import inspect
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from . import retry_state
@@ -577,6 +577,355 @@ def datamove(
         idempotency_key=idempotency_key,
         params=params,
     )
+
+
+# Folder names whose tables are reference data or vocabularies (codelists),
+# not part of a dataset's release: createversion leaves them out, and says so.
+_SHARED_TABLE_FOLDERS = frozenset({"reference", "references", "vocabulary", "vocabularies"})
+
+
+@dataclass(frozen=True)
+class VersionResult:
+    """What `createversion` did.
+
+    `copied` is ``(source, target)`` per table copied; `skipped` is
+    ``(source, reason)`` per table left out (a reference/vocabulary table, or
+    a view); `replaced` lists the targets that already existed and were
+    overwritten (only with ``overwrite=True``); `created_folder` says whether
+    the version folder was created by this call, and
+    `created_target_folders` which levels of the target path it created
+    (top-down; only with ``create_target_folder=True``).
+    """
+
+    version_path: str
+    copied: list[tuple[str, str]] = field(default_factory=list)
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+    replaced: list[str] = field(default_factory=list)
+    created_folder: bool = False
+    created_target_folders: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _VersionPlan:
+    version_path: str
+    copies: list[tuple[str, str]]  # (source table, target table)
+    skipped: list[tuple[str, str]]  # (source table, reason)
+    target_exists: bool
+    folder_exists: bool
+
+
+def _check_version_args(
+    source_path: Any, version_name: Any, tables: Any
+) -> tuple[str, str, list[str]]:
+    """Cheap argument checks, before anything touches Dremio.
+
+    Returns `source_path`, `version_name` and the table entries, stripped
+    (``[]`` when `tables` is ``None`` or empty: everything under the source).
+    Raises `CatalogOperationError` for a blank `source_path` or
+    `version_name` (empty or only whitespace), a version name that isn't a
+    single path segment, or a duplicated table list.
+    """
+    if not isinstance(source_path, str) or not source_path.strip():
+        raise CatalogOperationError("source_path must not be empty")
+    source_path = source_path.strip()
+    if tables is None:
+        tables = []
+    if isinstance(tables, str) or not isinstance(tables, (list, tuple)):
+        raise CatalogOperationError(
+            f"tables must be a list of table or folder names, not {type(tables).__name__}"
+        )
+    entries: list[str] = []
+    for entry in tables:
+        if not isinstance(entry, str) or not entry.strip(" ."):
+            raise CatalogOperationError(f"every table must be a non-empty name, got {entry!r}")
+        entries.append(entry.strip())
+    duplicates = sorted({e for e in entries if entries.count(e) > 1})
+    if duplicates:
+        raise CatalogOperationError(f"tables listed more than once: {duplicates}")
+    if not isinstance(version_name, str) or not version_name.strip():
+        raise CatalogOperationError("version_name must not be empty")
+    version_name = version_name.strip()
+    if "." in version_name:
+        raise CatalogOperationError(
+            f"version_name must be a single folder name, without '.': {version_name!r}"
+        )
+    return source_path, version_name, entries
+
+
+def _relative_to(source_path: str, entry: str) -> str:
+    """`entry` relative to `source_path`: given either way — as listed under
+    the source (``bw_assessment.assessments``) or as the full path a `list()`
+    of the source returns."""
+    if entry.startswith(f"{source_path}."):
+        return entry[len(source_path) + 1 :]
+    return entry.lstrip(".")
+
+
+def _entries_under(
+    executor: SqlExecutor, schema_path: str, *, idempotency_key: str
+) -> dict[str, str]:
+    """``{full path: "TABLE" | "VIEW"}`` for everything under `schema_path`, at
+    any depth — one INFORMATION_SCHEMA query, as `gettablesfrom` does, plus
+    each entry's `TABLE_TYPE`."""
+    like_pattern = f"{_like_escape(schema_path)}.%"
+    sql = (
+        'SELECT "TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE" FROM INFORMATION_SCHEMA."TABLES" '
+        f"WHERE \"TABLE_SCHEMA\" = {_quote_literal(schema_path)} "
+        f"OR \"TABLE_SCHEMA\" LIKE {_quote_literal(like_pattern)} ESCAPE '\\'"
+    )
+    rows = executor.fetch_all(sql, idempotency_key=idempotency_key)
+    return {
+        f"{row['TABLE_SCHEMA']}.{row['TABLE_NAME']}": (
+            "VIEW" if "VIEW" in str(row.get("TABLE_TYPE", "")).upper() else "TABLE"
+        )
+        for row in rows
+    }
+
+
+def _expand_entries(
+    source_path: str, entries: list[str], available: dict[str, str]
+) -> list[str]:
+    """The full source paths the listed `entries` stand for.
+
+    No entries means everything under `source_path`, at any depth. An entry
+    naming a table or view stands for itself; one naming a folder stands for
+    everything under it, at any depth (in path order). Raises
+    `CatalogOperationError` naming every entry that is neither — including a
+    folder with nothing in it — or when the source holds nothing at all. A
+    table reached twice (listed and also inside a listed folder) is copied
+    once.
+    """
+    if not entries:
+        if not available:
+            raise CatalogOperationError(f"nothing to copy — {source_path!r} has no tables")
+        return sorted(available)
+    expanded: list[str] = []
+    missing: list[str] = []
+    for entry in entries:
+        rel = _relative_to(source_path, entry)
+        full = f"{source_path}.{rel}"
+        if full in available:
+            matches = [full]
+        else:
+            matches = sorted(path for path in available if path.startswith(f"{full}."))
+        if not matches:
+            missing.append(rel)
+        expanded.extend(path for path in matches if path not in expanded)
+    if missing:
+        raise CatalogOperationError(
+            f"no table or folder with tables under {source_path!r}: {missing}"
+        )
+    return expanded
+
+
+def _plan_version(
+    executor: SqlExecutor,
+    catalog_rest: CatalogRestClient,
+    source_path: str,
+    tables: list[str],
+    version_name: str,
+    target_path: str,
+    *,
+    overwrite: bool,
+    create_target_folder: bool,
+    idempotency_key: str,
+) -> _VersionPlan:
+    """Everything `createversion` checks before it writes anything."""
+    if not catalog_rest.exists(source_path):
+        raise CatalogOperationError(f"source {source_path!r} does not exist")
+    target_exists = catalog_rest.exists(target_path)
+    if not target_exists and not create_target_folder:
+        raise CatalogOperationError(
+            f"target {target_path!r} does not exist — pass create_target_folder=True to "
+            "create it"
+        )
+    version_path = f"{target_path}.{version_name}"
+    folder_exists = target_exists and catalog_rest.exists(version_path)
+    if folder_exists and not overwrite:
+        raise CatalogOperationError(
+            f"version {version_path!r} already exists — pass overwrite=True to replace "
+            "the listed tables in it"
+        )
+    if folder_exists and not catalog_rest.is_folder(version_path):
+        raise CatalogOperationError(f"{version_path!r} exists but is not a folder")
+
+    available = _entries_under(executor, source_path, idempotency_key=idempotency_key)
+    copies: list[tuple[str, str]] = []
+    skipped: list[tuple[str, str]] = []
+    for source_table in _expand_entries(source_path, tables, available):
+        folders = {segment.lower() for segment in source_table.split(".")[:-1]}
+        shared = sorted(folders & _SHARED_TABLE_FOLDERS)
+        if shared:
+            skipped.append((source_table, f"{shared[0]} table — not versioned"))
+        elif available[source_table] == "VIEW":
+            skipped.append((source_table, "view — only tables are versioned"))
+        else:
+            rel = source_table[len(source_path) + 1 :]
+            copies.append((source_table, f"{version_path}.{rel}"))
+    if not copies:
+        reasons = "; ".join(f"{table}: {reason}" for table, reason in skipped)
+        raise CatalogOperationError(f"nothing to copy — every listed table was skipped ({reasons})")
+    return _VersionPlan(version_path, copies, skipped, target_exists, folder_exists)
+
+
+def createversion(
+    executor: SqlExecutor,
+    catalog_rest: CatalogRestClient,
+    source_path: str,
+    version_name: str,
+    tables: list[str] | None = None,
+    *,
+    target_path: str,
+    overwrite: bool = False,
+    create_target_folder: bool = True,
+    idempotency_key: str,
+) -> VersionResult:
+    """Copy the listed `tables` from `source_path` into a new version folder,
+    `{target_path}.{version_name}`.
+
+    `tables` omitted (``None``) or empty copies everything under
+    `source_path`. Each entry in it is a table, or a folder standing for every table
+    under it (at any depth), named as listed under `source_path`
+    (``"bw_assessment.assessments"``, ``"bw_assessment"``) or as the full
+    path `gettablesfrom` returns. Each table keeps its sub-folders inside the
+    version (``{target_path}.{version_name}.bw_assessment.assessments``).
+    Each copy is a `datacopy` (``CREATE TABLE ... AS SELECT``), so a version
+    is a snapshot, independent of later changes to the source.
+
+    Left out, and listed in `VersionResult.skipped` with the reason:
+
+    - reference and vocabulary tables — any table with a folder named
+      ``reference``/``references``/``vocabulary``/``vocabularies`` in its
+      path (case-insensitive);
+    - views — only tables are versioned.
+
+    `create_target_folder=True` (the default) creates `target_path` — every
+    missing level under the space/source, which itself must exist — when it
+    doesn't exist yet; ``False`` makes a missing target an error.
+
+    Raises `CatalogOperationError`, before writing anything, for a blank
+    (empty or whitespace-only) `source_path` or `version_name`, a
+    `version_name` with a ``.``, a duplicated table list, a missing source,
+    entries that are neither a table nor a folder with tables (all named at
+    once), or nothing left to copy. An existing version folder is an error
+    unless ``overwrite=True``, which keeps the folder, replaces the listed
+    tables in it and leaves anything else in it untouched.
+
+    Not transactional by itself, so on any failure it removes what *this
+    call* created — the target levels and version folder it created, or
+    otherwise the tables it newly copied — then re-raises. A table it
+    overwrote cannot be restored. `CatalogSession.create_version` adds the
+    session's commit/rollback on top.
+    """
+    source_path, version_name, entries = _check_version_args(source_path, version_name, tables)
+    params: dict[str, Any] = {
+        "source_path": source_path,
+        "tables": entries,
+        "version_name": version_name,
+        "target_path": target_path,
+        "overwrite": overwrite,
+        "create_target_folder": create_target_folder,
+    }
+    created_targets: list[str] = []
+    created_folder = False
+    new_tables: list[str] = []
+    version_path = f"{target_path}.{version_name}"
+    try:
+        plan = _plan_version(
+            executor,
+            catalog_rest,
+            source_path,
+            entries,
+            version_name,
+            target_path,
+            overwrite=overwrite,
+            create_target_folder=create_target_folder,
+            idempotency_key=f"{idempotency_key}-plan",
+        )
+        if not plan.target_exists:
+            created_targets = catalog_rest.ensure_folder_path(target_path)
+        if not plan.folder_exists:
+            createfolder(catalog_rest, version_path, idempotency_key=f"{idempotency_key}-folder")
+            created_folder = True
+        copied: list[tuple[str, str]] = []
+        replaced: list[str] = []
+        for number, (source_table, target_table) in enumerate(plan.copies, start=1):
+            copy_key = f"{idempotency_key}-copy-{number}"
+            existed = plan.folder_exists and _entry_exists(
+                executor, target_table, idempotency_key=copy_key
+            )
+            datacopy(
+                executor,
+                source_table,
+                target_table,
+                overwrite=overwrite,
+                create_target_folder=True,
+                catalog_rest=catalog_rest,
+                idempotency_key=copy_key,
+            )
+            copied.append((source_table, target_table))
+            (replaced if existed else new_tables).append(target_table)
+    except Exception as exc:
+        # The topmost folder this call created holds everything else it created.
+        created_top = created_targets[0] if created_targets else (
+            version_path if created_folder else None
+        )
+        problem = _undo_partial_version(
+            executor,
+            catalog_rest,
+            created_top,
+            new_tables,
+            idempotency_key=f"{idempotency_key}-cleanup",
+        )
+        if problem:
+            exc.add_note(problem)
+        if isinstance(exc, EngineStartingError):
+            retry_state.record(
+                idempotency_key, "createversion", version_path, str(exc), params=params
+            )
+        raise
+    retry_state.clear(idempotency_key)
+    return VersionResult(
+        version_path=plan.version_path,
+        copied=copied,
+        skipped=plan.skipped,
+        replaced=replaced,
+        created_folder=created_folder,
+        created_target_folders=created_targets,
+    )
+
+
+def _undo_partial_version(
+    executor: SqlExecutor,
+    catalog_rest: CatalogRestClient,
+    created_top: str | None,
+    new_tables: list[str],
+    *,
+    idempotency_key: str,
+) -> str | None:
+    """Remove what a failed `createversion` created: the topmost folder it
+    created (with everything in it), or else the tables it newly copied.
+    Returns what could not be removed, for the caller to attach to the
+    original error, or ``None``."""
+    try:
+        if created_top is not None:
+            deletefolder(
+                executor,
+                catalog_rest,
+                created_top,
+                cascade=True,
+                idempotency_key=idempotency_key,
+            )
+            return None
+        for number, table in enumerate(new_tables, start=1):
+            executor.execute(
+                f"DROP TABLE IF EXISTS {_quote_path(table)}",
+                idempotency_key=f"{idempotency_key}-{number}",
+            )
+    except Exception as cleanup_error:  # noqa: BLE001 — the original failure is what's raised
+        leftover = created_top or ", ".join(new_tables)
+        return f"cleanup failed, check {leftover} by hand: {cleanup_error}"
+    return None
 
 
 def createview(
@@ -1305,6 +1654,7 @@ _OPERATIONS = {
     "publishversion": publishversion,
     "datacopy": datacopy,
     "datamove": datamove,
+    "createversion": createversion,
     "createview": createview,
     "deleteview": deleteview,
     "deletetable": deletetable,

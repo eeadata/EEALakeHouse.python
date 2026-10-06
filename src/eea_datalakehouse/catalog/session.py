@@ -78,9 +78,14 @@ class CatalogCommitError(CatalogSessionError):
 
 @dataclass
 class CommitReport:
-    """What a successful `commit()` actually did, in order."""
+    """What a successful `commit()` actually did, in order.
+
+    `notes` carries what a step wants the caller to know beyond "it
+    succeeded" — e.g. the tables `create_version` skipped, and why.
+    """
 
     succeeded: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
 
 class _Irreversible(Exception):  # noqa: N818 — internal control-flow signal, not a user-facing error
@@ -91,6 +96,8 @@ class _Irreversible(Exception):  # noqa: N818 — internal control-flow signal, 
 class _Step:
     description: str
     run: Callable[[Catalog, str], _Undo | None]
+    # Filled in by `run`, reported in `CommitReport.notes` once the commit succeeds.
+    notes: list[str] = field(default_factory=list)
 
 
 def _read_wiki_or_none(catalog: Catalog, path: str, *, idempotency_key: str) -> str | None:
@@ -102,6 +109,11 @@ def _read_wiki_or_none(catalog: Catalog, path: str, *, idempotency_key: str) -> 
     except CatalogOperationError:
         return None
 
+
+DRAFT_FOLDER = "draft"
+# Where draft_to_version puts versions: a sibling of the draft folder, as in
+# debugger/bathing_water/README.md's layout (…bwd.draft / …bwd.versions).
+VERSIONS_FOLDER = "versions"
 
 _ROOT_SOURCE = "catalog"
 # This deployment's one real top-level source/space (see e.g. the "catalog." prefix
@@ -131,7 +143,8 @@ def _drop_entry(catalog: Catalog, path: str, *, idempotency_key: str) -> None:
 class CatalogSession:
     """Queue catalog verbs against `catalog`, then `commit()` them as one batch.
 
-    Every queueing method (`data_copy`, `data_move`, `create_view`, `set_tags`,
+    Every queueing method (`data_copy`, `data_move`, `create_version`, `draft_to_version`,
+    `create_view`, `set_tags`,
     `delete_tags`, `set_wiki`, `delete_wiki`, `create_folder`,
     `delete_folder`, `delete_view`, `delete_table`) only records the intent —
     nothing reaches Dremio until `commit()`. Each returns
@@ -398,6 +411,161 @@ class CatalogSession:
 
         self._steps.append(_Step(f"data_move {source_path!r} -> {target_path!r}", run))
         return self
+
+    def create_version(
+        self,
+        source_path: str,
+        version_name: str,
+        tables: list[str] | None = None,
+        target_path: str | None = None,
+        *,
+        overwrite: bool = False,
+        create_target_folder: bool = True,
+    ) -> CatalogSession:
+        """Queue a `createversion`: copy the listed `tables` from `source_path`
+        into a new folder `{target_path}.{version_name}`.
+
+        `source_path` and `version_name` must not be blank (empty or only
+        whitespace). `tables` omitted or empty copies everything under
+        `source_path`. Each entry in `tables` is a table, or a folder standing for every
+        table under it (``"bw_assessment.assessments"``, ``"bw_assessment"``),
+        named as listed under `source_path` or as the full paths `list()`
+        returns; each table keeps its sub-folders inside the version. Reference and
+        vocabulary tables (a folder named ``reference``/``references``/
+        ``vocabulary``/``vocabularies`` in the path) and views are skipped —
+        the commit report's `notes` say which, and why.
+
+        `source_path` and `target_path` may be relative — with or without a
+        leading `.` — to the session's current context. `target_path`
+        omitted means the current context itself, so ``use(...)`` picks where
+        versions go; with no context set either, this raises. A `target_path`
+        that doesn't exist yet is created (every missing level) unless
+        ``create_target_folder=False``.
+
+        An existing version folder is an error unless ``overwrite=True``,
+        which replaces the listed tables in it. Undo deletes the target levels
+        and version folder this step created, or drops the tables it newly
+        copied into an existing one; a table it overwrote cannot be restored, so a step that
+        replaced any is irreversible (see `CatalogCommitError`)."""
+        try:
+            source_path, version_name, tables = operations._check_version_args(  # noqa: SLF001
+                source_path, version_name, tables
+            )
+        except CatalogOperationError as exc:
+            raise CatalogSessionError(str(exc)) from None
+        source_path = self._resolve_path(source_path)
+        if target_path is None:
+            if self._context is None:
+                raise CatalogSessionError(
+                    "target_path was omitted but no context is set yet — pass target_path, "
+                    "or call use() first to choose where the version goes"
+                )
+            target_path = self._context
+        else:
+            target_path = self._resolve_path(target_path)
+        step = _Step(
+            f"create version '{target_path}.{version_name}' from {source_path!r} "
+            + (f"({len(tables)} table(s) listed)" if tables else "(all tables)"),
+            lambda catalog, key: None,  # replaced below, once `step` exists to report into
+        )
+
+        def run(catalog: Catalog, key: str) -> _Undo | None:
+            result = catalog.createversion(
+                source_path,
+                version_name,
+                tables,
+                target_path=target_path,
+                overwrite=overwrite,
+                create_target_folder=create_target_folder,
+                idempotency_key=key,
+            )
+            step.notes.extend(
+                f"skipped {table!r}: {reason}" for table, reason in result.skipped
+            )
+            step.notes.extend(f"replaced {table!r}" for table in result.replaced)
+            if result.replaced:
+                raise _Irreversible(
+                    f"overwrote {len(result.replaced)} existing table(s) in the version"
+                )
+            new_tables = [target for _, target in result.copied]
+
+            created_top = (
+                result.created_target_folders[0]
+                if result.created_target_folders
+                else (result.version_path if result.created_folder else None)
+            )
+
+            def undo() -> None:
+                if created_top is not None:
+                    catalog.deletefolder(created_top, cascade=True, idempotency_key=f"{key}-undo")
+                    return
+                for number, table in enumerate(new_tables, start=1):
+                    _drop_entry(catalog, table, idempotency_key=f"{key}-undo-{number}")
+
+            return undo
+
+        step.run = run
+        self._steps.append(step)
+        return self
+
+    def draft_to_version(
+        self,
+        version_name: str,
+        tables: list[str] | None = None,
+        *,
+        overwrite: bool = False,
+    ) -> CatalogSession:
+        """Queue a `create_version` from the dataflow's ``draft`` folder: copy
+        `tables` from it into ``{draft's parent}.versions.{version_name}``.
+
+        Neither path is passed — both come from the current context:
+
+        - the context is the ``draft`` folder, or anywhere inside it (the
+          nearest ``draft`` segment of the context is used);
+        - or the context is the folder that holds ``draft`` (e.g. the
+          dataflow, ``…bwd``).
+
+        Otherwise this raises, saying where it looked. The ``versions``
+        folder is created if it doesn't exist yet. `tables` behaves exactly
+        as in `create_version`: omitted or empty copies everything in
+        ``draft``; an entry is a table or a folder (every table under it),
+        relative to ``draft`` or a full path; reference/vocabulary tables and
+        views are skipped and reported. An existing version is an error
+        unless ``overwrite=True``. Rollback is `create_version`'s."""
+        draft = self._find_draft()
+        parent = operations._parent_path(draft)  # noqa: SLF001 — same-package internal
+        if parent is None:
+            raise CatalogSessionError(f"{draft!r} has no parent folder to put versions under")
+        return self.create_version(
+            draft,
+            version_name,
+            tables,
+            f"{parent}.{VERSIONS_FOLDER}",
+            overwrite=overwrite,
+            create_target_folder=True,
+        )
+
+    def _find_draft(self) -> str:
+        """The ``draft`` folder the current context points at — see
+        `draft_to_version`. Checks the catalog only when the context is the
+        folder holding ``draft``; a ``draft`` segment in the context itself
+        is taken as given."""
+        if self._context is None:
+            raise CatalogSessionError(
+                "no context is set — use() the draft folder, or the folder that holds it, first"
+            )
+        segments = self._context.split(".")
+        if DRAFT_FOLDER in segments:
+            nearest = len(segments) - 1 - segments[::-1].index(DRAFT_FOLDER)
+            return ".".join(segments[: nearest + 1])
+        candidate = f"{self._context}.{DRAFT_FOLDER}"
+        if self._catalog._catalog_rest.exists(candidate):  # noqa: SLF001 — see module docstring
+            return candidate
+        raise CatalogSessionError(
+            f"no {DRAFT_FOLDER!r} folder for the context {self._context!r}: it isn't inside one, "
+            f"and {candidate!r} doesn't exist — use() the draft folder, or the folder that "
+            "holds it, first"
+        )
 
     def create_view(
         self,
@@ -749,7 +917,10 @@ class CatalogSession:
                 rolled_back=not unresolved,
                 unresolved=unresolved,
             ) from exc
-        return CommitReport(succeeded=[step.description for step, _ in executed])
+        return CommitReport(
+            succeeded=[step.description for step, _ in executed],
+            notes=[note for step, _ in executed for note in step.notes],
+        )
 
     def _rollback(self, executed: list[tuple[_Step, _Undo | None]]) -> list[str]:
         problems: list[str] = []
