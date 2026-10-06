@@ -117,6 +117,11 @@ exact same arguments.
   version folder without `overwrite=True` raise before anything is written. On failure it
   removes what it created. `%catalog create_version(source_path, version_name, tables)` uses the
   current context as `target_path` when it's omitted.
+- `%catalog draft_to_version(version_name, tables=None, overwrite=False)` — `create_version`
+  from the dataflow's `draft` folder without typing any path: the source is the `draft` folder
+  the context is in (or the `draft` inside the context), the target is
+  `{draft's parent}.versions.{version_name}` (`versions` is created if missing). `tables` works
+  as in `create_version`.
 - `draft2version(draft_path, version_path)` / `publishversion(consumer_view_path, version_path)`
   — **not implemented yet** (both raise `NotImplementedError`); promoting a draft table into a
   permanent version and repointing a consumer-facing view at it.

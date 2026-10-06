@@ -578,3 +578,104 @@ def test_session_overwrite_that_replaced_tables_is_irreversible() -> None:
 
     assert info.value.rolled_back is False
     assert "overwrote 1 existing table(s)" in info.value.unresolved[0]
+
+
+# -- draft_to_version ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        "catalog.bwd",  # the folder that holds draft
+        SOURCE,  # draft itself
+        f"{SOURCE}.bw_assessment",  # inside draft
+    ],
+)
+def test_draft_to_version_finds_draft_from_the_context(context: str) -> None:
+    rest, dremio = _world()
+    session = _session(rest, dremio)
+    session.use(context)
+
+    report = session.draft_to_version("v2025_1", ["bw_assessment.assessments"]).commit()
+
+    assert report.succeeded == [
+        f"create version '{VERSION}' from '{SOURCE}' (1 table(s) listed)"
+    ]
+    assert f"{VERSION}.bw_assessment.assessments" in dremio.tables
+
+
+def test_draft_to_version_without_tables_copies_all_of_draft() -> None:
+    rest, dremio = _world()
+    session = _session(rest, dremio)
+    session.use("catalog.bwd")
+
+    report = session.draft_to_version("v2025_1").commit()
+
+    assert f"{VERSION}.bw_assessment.stations" in dremio.tables
+    assert report.notes == [
+        f"skipped '{SOURCE}.bw_assessment.latest': view — only tables are versioned",
+        f"skipped '{SOURCE}.reference.quality_classes': reference table — not versioned",
+    ]
+
+
+def test_draft_to_version_creates_the_versions_folder_if_missing() -> None:
+    rest, dremio = _world()
+    rest.existing.discard(TARGET)
+    rest.folders.discard(TARGET)
+    session = _session(rest, dremio)
+    session.use(SOURCE)
+
+    session.draft_to_version("v1", ["bw_assessment"]).commit()
+
+    assert TARGET in rest.existing
+    assert f"{TARGET}.v1.bw_assessment.assessments" in dremio.tables
+
+
+def test_draft_to_version_uses_the_nearest_draft_in_the_context() -> None:
+    rest, dremio = _world()
+    nested = "catalog.bwd.draft.archive.draft"
+    for folder in ("catalog.bwd.draft.archive", nested):
+        rest.existing.add(folder)
+        rest.folders.add(folder)
+    dremio.tables[f"{nested}.t"] = "TABLE"
+    rest.existing.add(f"{nested}.t")
+    session = _session(rest, dremio)
+    session.use(nested)
+
+    session.draft_to_version("v1", ["t"]).commit()
+
+    assert "catalog.bwd.draft.archive.versions.v1.t" in dremio.tables
+
+
+def test_draft_to_version_without_a_draft_raises_at_once() -> None:
+    rest, dremio = _world()
+    session = _session(rest, dremio)
+    session.use(TARGET)  # versions has no draft inside, and isn't inside one
+
+    with pytest.raises(CatalogSessionError, match="no 'draft' folder for the context"):
+        session.draft_to_version("v1")
+    assert repr(session) == "CatalogSession(pending=0)"
+
+
+def test_draft_to_version_validates_like_create_version() -> None:
+    rest, dremio = _world()
+    session = _session(rest, dremio)
+    session.use(SOURCE)
+
+    with pytest.raises(CatalogSessionError, match="version_name must not be empty"):
+        session.draft_to_version("  ")
+
+
+def test_draft_to_version_rollback_removes_the_version() -> None:
+    rest, dremio = _world()
+    session = _session(rest, dremio)
+    session.use(SOURCE)
+
+    session.draft_to_version("v2025_1", ["bw_assessment"])
+    session.set_tags("catalog.bwd.missing", ["x"])
+
+    with pytest.raises(CatalogCommitError) as info:
+        session.commit()
+
+    assert info.value.rolled_back is True
+    assert VERSION not in rest.existing

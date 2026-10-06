@@ -187,6 +187,13 @@ _CATALOG_HELP = [
         "report's notes say which. An existing version folder is an error unless "
         "overwrite=True (replaces the listed tables, keeps the rest).",
     ),
+    (
+        "draft_to_version",
+        "create_version from the dataflow's draft folder, with no paths to type: the source is "
+        "the draft folder the context is in (or the draft folder inside the context), the "
+        "target is draft's parent.versions.version_name (versions is created if missing). "
+        "tables as in create_version: omitted or empty copies everything in draft.",
+    ),
     # -- table ----------------------------------------------------------------
     (
         "list",
@@ -490,7 +497,7 @@ def _fits(annotation: Any, value_text: str) -> bool:
 # Commands whose every error also prints the correct form of the call — the
 # ones with several positional parameters, where a slot mix-up is the likely
 # cause. A call that doesn't fit a method's signature shows it for any command.
-_USAGE_ON_ERROR = frozenset({"create_version"})
+_USAGE_ON_ERROR = frozenset({"create_version", "draft_to_version"})
 
 
 def _called_method(session: Any, line: str) -> Any | None:

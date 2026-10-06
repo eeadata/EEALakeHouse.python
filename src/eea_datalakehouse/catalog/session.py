@@ -110,6 +110,11 @@ def _read_wiki_or_none(catalog: Catalog, path: str, *, idempotency_key: str) -> 
         return None
 
 
+DRAFT_FOLDER = "draft"
+# Where draft_to_version puts versions: a sibling of the draft folder, as in
+# debugger/bathing_water/README.md's layout (…bwd.draft / …bwd.versions).
+VERSIONS_FOLDER = "versions"
+
 _ROOT_SOURCE = "catalog"
 # This deployment's one real top-level source/space (see e.g. the "catalog." prefix
 # on every real path in debugger/test_catalog_magic.ipynb's TEST_ROOT) — a bare path
@@ -138,7 +143,8 @@ def _drop_entry(catalog: Catalog, path: str, *, idempotency_key: str) -> None:
 class CatalogSession:
     """Queue catalog verbs against `catalog`, then `commit()` them as one batch.
 
-    Every queueing method (`data_copy`, `data_move`, `create_version`, `create_view`, `set_tags`,
+    Every queueing method (`data_copy`, `data_move`, `create_version`, `draft_to_version`,
+    `create_view`, `set_tags`,
     `delete_tags`, `set_wiki`, `delete_wiki`, `create_folder`,
     `delete_folder`, `delete_view`, `delete_table`) only records the intent —
     nothing reaches Dremio until `commit()`. Each returns
@@ -501,6 +507,65 @@ class CatalogSession:
         step.run = run
         self._steps.append(step)
         return self
+
+    def draft_to_version(
+        self,
+        version_name: str,
+        tables: list[str] | None = None,
+        *,
+        overwrite: bool = False,
+    ) -> CatalogSession:
+        """Queue a `create_version` from the dataflow's ``draft`` folder: copy
+        `tables` from it into ``{draft's parent}.versions.{version_name}``.
+
+        Neither path is passed — both come from the current context:
+
+        - the context is the ``draft`` folder, or anywhere inside it (the
+          nearest ``draft`` segment of the context is used);
+        - or the context is the folder that holds ``draft`` (e.g. the
+          dataflow, ``…bwd``).
+
+        Otherwise this raises, saying where it looked. The ``versions``
+        folder is created if it doesn't exist yet. `tables` behaves exactly
+        as in `create_version`: omitted or empty copies everything in
+        ``draft``; an entry is a table or a folder (every table under it),
+        relative to ``draft`` or a full path; reference/vocabulary tables and
+        views are skipped and reported. An existing version is an error
+        unless ``overwrite=True``. Rollback is `create_version`'s."""
+        draft = self._find_draft()
+        parent = operations._parent_path(draft)  # noqa: SLF001 — same-package internal
+        if parent is None:
+            raise CatalogSessionError(f"{draft!r} has no parent folder to put versions under")
+        return self.create_version(
+            draft,
+            version_name,
+            tables,
+            f"{parent}.{VERSIONS_FOLDER}",
+            overwrite=overwrite,
+            create_target_folder=True,
+        )
+
+    def _find_draft(self) -> str:
+        """The ``draft`` folder the current context points at — see
+        `draft_to_version`. Checks the catalog only when the context is the
+        folder holding ``draft``; a ``draft`` segment in the context itself
+        is taken as given."""
+        if self._context is None:
+            raise CatalogSessionError(
+                "no context is set — use() the draft folder, or the folder that holds it, first"
+            )
+        segments = self._context.split(".")
+        if DRAFT_FOLDER in segments:
+            nearest = len(segments) - 1 - segments[::-1].index(DRAFT_FOLDER)
+            return ".".join(segments[: nearest + 1])
+        candidate = f"{self._context}.{DRAFT_FOLDER}"
+        if self._catalog._catalog_rest.exists(candidate):  # noqa: SLF001 — see module docstring
+            return candidate
+        raise CatalogSessionError(
+            f"no {DRAFT_FOLDER!r} folder for the context {self._context!r}: it isn't inside one, "
+            f"and {candidate!r} doesn't exist — use() the draft folder, or the folder that "
+            "holds it, first"
+        )
 
     def create_view(
         self,
