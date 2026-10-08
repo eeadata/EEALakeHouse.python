@@ -10,6 +10,17 @@ class CatalogOperationError(RuntimeError):
     """
 
 
+class CatalogAuthError(CatalogOperationError):
+    """Dremio refused the request itself (401/403): the token is invalid or
+    expired, or lacks access to the path.
+
+    Raised even by the best-effort existence checks
+    (`CatalogRestClient.exists`/`is_folder`/`is_table_or_view`), which otherwise
+    read a failed lookup as "not there" — an expired token must not look like a
+    missing path.
+    """
+
+
 class EngineStartingError(RuntimeError):
     """A SQL call likely failed/stalled because a Dremio engine is starting.
 

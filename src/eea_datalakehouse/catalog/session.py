@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 from . import operations
 from .client import Catalog
-from .errors import CatalogOperationError, EngineStartingError
+from .errors import CatalogAuthError, CatalogOperationError, EngineStartingError
 from .operations import TableInfo
 
 _Undo = Callable[[], None]
@@ -122,6 +122,15 @@ _ROOT_SOURCE = "catalog"
 # `_resolve_path`.
 
 
+def _dotted(path: str) -> str:
+    """``catalog/a/b`` (the slash form the catalog tree and DDS use) as
+    ``catalog.a.b``, the form every verb here expects; a dotted path is
+    returned unchanged."""
+    if "/" not in path:
+        return path
+    return ".".join(segment for segment in path.split("/") if segment)
+
+
 def _drop_entry(catalog: Catalog, path: str, *, idempotency_key: str) -> None:
     """Drop whatever entity (table or view) now sits at `path`.
 
@@ -195,8 +204,12 @@ class CatalogSession:
         a Comm — see `docs/notebook-facade-for-data-scientists.md`,
         "Pre-filling catalog context") is its other caller, seeding it
         before any path has been typed yet.
+
+        A path with ``/`` separators (``catalog/a/b``, as the catalog tree
+        and DDS write them) is stored in the dot form (``catalog.a.b``) every
+        other verb expects.
         """
-        self._context = path
+        self._context = _dotted(path) if path else path
         return self
 
     def use(self, path: str | None) -> CatalogSession:
@@ -229,9 +242,10 @@ class CatalogSession:
         if path is None or path == "":
             self._context = _ROOT_SOURCE
             return self
+        path = _dotted(path)
         try:
             found = self._catalog._catalog_rest.exists(path)  # noqa: SLF001 — see module docstring
-        except EngineStartingError as exc:
+        except (EngineStartingError, CatalogAuthError) as exc:
             raise CatalogSessionError(f"could not check whether {path!r} exists: {exc}") from exc
         if not found:
             raise CatalogSessionError(f"{path!r} does not exist in the catalog")
@@ -277,6 +291,8 @@ class CatalogSession:
         `"../stations"` is a sibling of the context, `"../../stations"` a
         level further up, and so on; `".."` alone (no name after it)
         resolves to the context's parent itself."""
+        if not path.startswith(".") and "/" in path:
+            path = _dotted(path)  # catalog/a/b — the slash form — means catalog.a.b
         if path == ".." or path.startswith("../"):
             return self._resolve_parent_path(path)
         if path in (".", "./"):
@@ -559,7 +575,13 @@ class CatalogSession:
             nearest = len(segments) - 1 - segments[::-1].index(DRAFT_FOLDER)
             return ".".join(segments[: nearest + 1])
         candidate = f"{self._context}.{DRAFT_FOLDER}"
-        if self._catalog._catalog_rest.exists(candidate):  # noqa: SLF001 — see module docstring
+        try:
+            found = self._catalog._catalog_rest.exists(candidate)  # noqa: SLF001
+        except (EngineStartingError, CatalogAuthError) as exc:
+            raise CatalogSessionError(
+                f"could not check whether {candidate!r} exists: {exc}"
+            ) from exc
+        if found:
             return candidate
         raise CatalogSessionError(
             f"no {DRAFT_FOLDER!r} folder for the context {self._context!r}: it isn't inside one, "
@@ -812,12 +834,14 @@ class CatalogSession:
         return self._catalog.gettagsfrom(path, idempotency_key=self._key())
 
     def list(self, path: str = "") -> list[str]:
-        """Full paths of every table and view under `path`, at any depth
-        (see `gettablesfrom`). Answered immediately — not queued, since
+        """Full paths of every table and view under `path`: its own tables,
+        then every child folder's, at any depth. Found by walking the catalog
+        tree folder by folder through Dremio's REST catalog API (see
+        `CatalogRestClient.list_datasets`), so it lists what the catalog
+        holds even where a source doesn't report its tables in
+        ``INFORMATION_SCHEMA``. Answered immediately — not queued, since
         there's nothing to commit or undo. Raises `CatalogOperationError`
-        if `path` doesn't exist — `gettablesfrom` itself doesn't check this
-        (an empty result and "nothing there" look the same to it), so this
-        checks first rather than returning `[]` for a typo'd path.
+        if `path` doesn't exist, rather than returning `[]` for a typo.
 
         `path` may be a whole, absolute path, or relative — with or
         without a leading `.` — to the session's current context (see
@@ -832,9 +856,7 @@ class CatalogSession:
             path = self._context
         else:
             path = self._resolve_path(path)
-        if not self._catalog._catalog_rest.exists(path):  # noqa: SLF001 — see module docstring
-            raise CatalogOperationError(f"{path!r} does not exist")
-        return self._catalog.gettablesfrom(path, idempotency_key=self._key())
+        return self._catalog._catalog_rest.list_datasets(path.split("."))  # noqa: SLF001
 
     def schema(self, path: str) -> TableInfo:
         """The column schema and row count of `path` (see

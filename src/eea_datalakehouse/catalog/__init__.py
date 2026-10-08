@@ -19,7 +19,7 @@ rather manage the executor yourself.
 from __future__ import annotations
 
 from .client import Catalog
-from .errors import CatalogOperationError, EngineStartingError
+from .errors import CatalogAuthError, CatalogOperationError, EngineStartingError
 from .operations import (
     TableInfo,
     VersionResult,
@@ -60,6 +60,7 @@ __all__ = [
     "FLIGHT_LOCATION_ENV_VAR",
     "TRANSPORT_ENV_VAR",
     "Catalog",
+    "CatalogAuthError",
     "CatalogCommitError",
     "CatalogOperationError",
     "CatalogRestClient",
