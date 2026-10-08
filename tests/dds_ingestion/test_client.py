@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 import respx
+
 from eea_datalakehouse.dds_ingestion.client import (
     IngestApiError,
     IngestClient,
@@ -371,3 +372,26 @@ def test_a_503_from_a_proxy_is_not_called_a_storage_fault(creds: DremioCreds) ->
 
     assert not isinstance(exc.value, StorageUnavailableError)
     assert "POST /api/v1/ingest/begin" in str(exc.value)
+
+
+@respx.mock
+def test_stage_uploads_one_file_through_dds_with_bearer_auth(creds: DremioCreds) -> None:
+    route = respx.post(f"{BASE_URL}/api/v1/ingest/stage").mock(
+        return_value=httpx.Response(
+            200, json={"rel_path": "sub/a.parquet", "key": "p/sub/a.parquet", "bytes": 6}
+        )
+    )
+    with IngestClient(BASE_URL, creds) as client:
+        result = client.stage("sess-1", "sub/a.parquet", b"PAR1-a")
+
+    assert (result.rel_path, result.key, result.bytes_written) == (
+        "sub/a.parquet",
+        "p/sub/a.parquet",
+        6,
+    )
+    request = route.calls.last.request
+    assert request.headers["Authorization"] == "Bearer s3cr3t-pwd"
+    body = request.read()
+    assert b'name="session_id"' in body and b"sess-1" in body
+    assert b'name="rel_path"' in body and b"sub/a.parquet" in body
+    assert b'filename="a.parquet"' in body and b"PAR1-a" in body

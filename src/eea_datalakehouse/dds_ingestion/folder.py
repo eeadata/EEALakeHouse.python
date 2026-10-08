@@ -32,6 +32,7 @@ from .models import (
     FileSpec,
     Intent,
     StatusResult,
+    UploadMode,
     UploadTarget,
 )
 from .progress import make_progress_bar
@@ -69,6 +70,7 @@ class IngestOutcome:
     files_skipped: int
     etags: dict[str, str] = field(default_factory=dict)
     resumed: bool = False
+    upload_mode: str = "direct"  # how the files went: "direct" (presigned S3) or "proxy" (DDS)
 
 
 def scan_folder(folder: Path, data_format: DataFormat) -> list[FileSpec]:
@@ -138,12 +140,17 @@ class FolderIngest:
         idempotency_key: str | None = None,
         multipart: bool | None = None,
         show_progress: bool = True,
+        upload_mode: UploadMode = "auto",
         client: IngestClient | None = None,
         base_url: str | None = None,
         creds: DremioCreds | None = None,
     ) -> None:
         if parallelism < 1:
             raise ValueError("parallelism must be >= 1")
+        if upload_mode not in ("auto", "direct", "proxy"):
+            raise ValueError(
+                f"upload_mode must be 'auto', 'direct' or 'proxy', not {upload_mode!r}"
+            )
         self.folder = Path(folder)
         if not self.folder.is_dir():
             raise NotADirectoryError(f"not a directory: {self.folder}")
@@ -157,6 +164,7 @@ class FolderIngest:
         self.idempotency_key = idempotency_key
         self.multipart = multipart
         self.show_progress = show_progress
+        self.upload_mode = upload_mode
 
         # Set once ``begin`` runs (or by ``attach``); the handle every session
         # command below works from.
@@ -231,7 +239,16 @@ class FolderIngest:
             files_uploaded=uploaded,
             files_skipped=skipped,
             etags=etags,
+            upload_mode="proxy" if self._uses_proxy(begin) else "direct",
         )
+
+    def _uses_proxy(self, begin: BeginResult) -> bool:
+        """Whether to send the files through DDS rather than to S3 directly:
+        always with ``upload_mode="proxy"``, never with ``"direct"``, and with
+        ``"auto"`` when ``begin`` says ``upload_mode: "proxy"``."""
+        if self.upload_mode == "auto":
+            return begin.upload_mode == "proxy"
+        return self.upload_mode == "proxy"
 
     def begin(self) -> BeginResult:
         """Open the transfer and get the presigned upload targets (step 1 of 3).
@@ -401,6 +418,9 @@ class FolderIngest:
         self, begin: BeginResult
     ) -> tuple[dict[str, str], list[dict[str, object]], int, int]:
         targets = list(begin.s3.uploads)
+        proxy = self._uses_proxy(begin)
+        if proxy:
+            logger.info("uploading through DDS (proxy), not to the presigned S3 targets")
         done = self._already_done(begin.session_id)
         pending = [t for t in targets if t.rel_path not in done]
         skipped = len(targets) - len(pending)
@@ -418,7 +438,9 @@ class FolderIngest:
             if not pending:
                 return etags, multipart_etags, 0, skipped
             with ThreadPoolExecutor(max_workers=self.parallelism) as pool:
-                futures = {pool.submit(self._upload_one, t): t for t in pending}
+                futures = {
+                    pool.submit(self._upload_one, t, begin.session_id, proxy): t for t in pending
+                }
                 for future in as_completed(futures):
                     target = futures[future]
                     etag, parts = future.result()
@@ -441,15 +463,21 @@ class FolderIngest:
         return etags, multipart_etags, len(pending), skipped
 
     def _upload_one(
-        self, target: UploadTarget
+        self, target: UploadTarget, session_id: str, proxy: bool = False
     ) -> tuple[str | None, list[dict[str, object]] | None]:
         """Upload one file; return ``(single_etag, multipart_parts)``.
 
-        Exactly one element is non-``None``: a single-shot upload yields the ETag
-        (or ``None`` if S3 omitted it); a multipart upload yields the per-part
-        ETag list and the single ETag is ``None``.
+        At most one element is non-``None``: a single-shot upload yields the
+        ETag (or ``None`` if S3 omitted it); a multipart upload yields the
+        per-part ETag list and the single ETag is ``None``. A proxied upload
+        (`proxy`) sends the whole file through DDS — DDS writes it to S3 with
+        its own connection, so this process never contacts the storage — and
+        yields neither: there are no S3 ETags to hand to commit.
         """
         data = (self.folder / target.rel_path).read_bytes()
+        if proxy:
+            self._client.stage(session_id, target.rel_path, data)
+            return None, None
         if target.is_multipart:
             parts = self._client.upload_file_multipart(target, data)
             return None, [dict(p) for p in parts]
