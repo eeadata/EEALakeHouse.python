@@ -671,3 +671,118 @@ def test_set_tags_raises_engine_starting_on_first_post_timeout() -> None:
 
     with pytest.raises(EngineStartingError):
         client.set_tags("a.b", ["pii"])
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("check", ["exists", "is_folder", "is_table_or_view"])
+def test_a_refused_token_raises_instead_of_reading_as_missing(status: int, check: str) -> None:
+    from eea_datalakehouse.catalog.errors import CatalogAuthError
+
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(return_value=httpx.Response(status))
+    client = CatalogRestClient(BASE_URL, "expired-pat")
+
+    with pytest.raises(CatalogAuthError, match=f"refused the lookup of 'a.b' \\({status}\\)"):
+        getattr(client, check)("a.b")
+
+
+# -- list_datasets: the REST tree walk ------------------------------------------
+
+
+def _container(path: list[str], *children: dict[str, object], **extra: object) -> dict[str, object]:
+    return {"entityType": "folder", "path": path, "children": list(children), **extra}
+
+
+def _child(kind: str, *path: str) -> dict[str, object]:
+    return {"id": "/".join(path), "path": list(path), "type": kind}
+
+
+@respx.mock
+def test_list_datasets_walks_every_child_folder() -> None:
+    by_path = f"{BASE_URL}/api/v3/catalog/by-path"
+    respx.get(f"{by_path}/s/top").mock(
+        return_value=httpx.Response(
+            200,
+            json=_container(
+                ["s", "top"],
+                _child("DATASET", "s", "top", "t1"),
+                _child("CONTAINER", "s", "top", "sub"),
+            ),
+        )
+    )
+    respx.get(f"{by_path}/s/top/sub").mock(
+        return_value=httpx.Response(
+            200,
+            json=_container(
+                ["s", "top", "sub"],
+                _child("DATASET", "s", "top", "sub", "t2"),
+                _child("CONTAINER", "s", "top", "sub", "deeper"),
+            ),
+        )
+    )
+    respx.get(f"{by_path}/s/top/sub/deeper").mock(
+        return_value=httpx.Response(
+            200,
+            json=_container(
+                ["s", "top", "sub", "deeper"], _child("DATASET", "s", "top", "sub", "deeper", "t3")
+            ),
+        )
+    )
+
+    tables = CatalogRestClient(BASE_URL, "pat").list_datasets(["s", "top"])
+
+    assert tables == ["s.top.sub.deeper.t3", "s.top.sub.t2", "s.top.t1"]
+
+
+@respx.mock
+def test_list_datasets_follows_paged_children() -> None:
+    route = respx.get(f"{BASE_URL}/api/v3/catalog/by-path/s/top")
+    route.side_effect = [
+        httpx.Response(
+            200,
+            json=_container(["s", "top"], _child("DATASET", "s", "top", "a"), nextPageToken="p2"),
+        ),
+        httpx.Response(
+            200, json=_container(["s", "top"], _child("DATASET", "s", "top", "b"))
+        ),
+    ]
+
+    assert CatalogRestClient(BASE_URL, "pat").list_datasets(["s", "top"]) == ["s.top.a", "s.top.b"]
+    assert route.calls[1].request.url.params["pageToken"] == "p2"
+
+
+@respx.mock
+def test_list_datasets_encodes_names_with_dots_and_spaces() -> None:
+    route = respx.get(f"{BASE_URL}/api/v3/catalog/by-path/s/my%20folder/v1.0").mock(
+        return_value=httpx.Response(200, json=_container(["s", "my folder", "v1.0"]))
+    )
+
+    assert CatalogRestClient(BASE_URL, "pat").list_datasets(["s", "my folder", "v1.0"]) == []
+    assert route.called
+
+
+@respx.mock
+def test_list_datasets_of_a_table_lists_just_it() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/s/t").mock(
+        return_value=httpx.Response(200, json={"entityType": "dataset", "path": ["s", "t"]})
+    )
+
+    assert CatalogRestClient(BASE_URL, "pat").list_datasets(["s", "t"]) == ["s.t"]
+
+
+@respx.mock
+def test_list_datasets_missing_path_raises() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/s/nope").mock(return_value=httpx.Response(404))
+
+    with pytest.raises(CatalogOperationError, match="'s.nope' does not exist"):
+        CatalogRestClient(BASE_URL, "pat").list_datasets(["s", "nope"])
+
+
+@respx.mock
+def test_list_datasets_refused_token_raises_auth_error() -> None:
+    from eea_datalakehouse.catalog.errors import CatalogAuthError
+
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/s/top").mock(return_value=httpx.Response(401))
+
+    with pytest.raises(CatalogAuthError):
+        CatalogRestClient(BASE_URL, "expired").list_datasets(["s", "top"])

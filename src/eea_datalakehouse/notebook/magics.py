@@ -197,7 +197,9 @@ _CATALOG_HELP = [
     # -- table ----------------------------------------------------------------
     (
         "list",
-        "Show every table/view under path, at any depth, as full dot-separated paths. "
+        "Show every table/view under path, as full dot-separated paths: its own, then every "
+        "child folder's, at any depth — walked folder by folder through Dremio's catalog "
+        "API, no SQL. path may use '.' or '/' separators. "
         "path may be omitted to list the current context itself — raises "
         "CatalogSessionError if none is set. Raises CatalogOperationError if path "
         "doesn't exist.",

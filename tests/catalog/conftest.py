@@ -112,6 +112,22 @@ class FakeCatalogRest:
     def is_folder(self, path: str) -> bool:
         return path in self.folders
 
+    def list_datasets(self, segments: list[str]) -> list[str]:
+        """Every seeded table/view (an `existing` path that isn't a folder)
+        under `segments`, at any depth — the REST tree walk, in memory."""
+        from eea_datalakehouse.catalog.errors import CatalogOperationError
+
+        if self._raise_on_exists is not None:
+            raise self._raise_on_exists
+        path = ".".join(segments)
+        if path not in self.existing:
+            raise CatalogOperationError(f"{path!r} does not exist")
+        if path not in self.folders:  # a table/view itself
+            return [path]
+        return sorted(
+            p for p in self.existing if p.startswith(f"{path}.") and p not in self.folders
+        )
+
     def is_table_or_view(self, path: str) -> bool:
         # Every seeded path is either a folder (if also in self.folders) or,
         # by default, a table/view — mirrors a real entity always being

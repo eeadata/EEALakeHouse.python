@@ -115,27 +115,37 @@ def test_get_tags_raises_on_a_folder() -> None:
 
 
 # -- list -----------------------------------------------------------------------
+# list() walks the catalog tree through the REST catalog API (no SQL) — see
+# CatalogRestClient.list_datasets; FakeCatalogRest.list_datasets is its stand-in.
 
 
-def test_list_returns_full_paths() -> None:
-    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference"})
-    executor = FakeExecutor(
-        rows=[{"TABLE_SCHEMA": "bwd.reference", "TABLE_NAME": "water_temperature"}]
-    )
-    session = _session(rest, executor)
+def _tree() -> FakeCatalogRest:
+    folders = {"bwd", "bwd.reference", "bwd.reference.sub", "bwd.reference.sub.deeper"}
+    tables = {
+        "bwd.reference.water_temperature",
+        "bwd.reference.sub.stations",
+        "bwd.reference.sub.deeper.codes",
+    }
+    return FakeCatalogRest(existing={"a", *folders, *tables}, folders=folders)
 
-    assert session.list("bwd.reference") == ["bwd.reference.water_temperature"]
+
+def test_list_walks_every_child_folder_and_returns_full_paths() -> None:
+    executor = FakeExecutor()
+    session = _session(_tree(), executor)
+
+    assert session.list("bwd.reference") == [
+        "bwd.reference.sub.deeper.codes",
+        "bwd.reference.sub.stations",
+        "bwd.reference.water_temperature",
+    ]
+    assert executor.statements == []  # navigation only — no SQL at all
 
 
 def test_list_resolves_a_relative_path() -> None:
-    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference"})
-    executor = FakeExecutor(rows=[])
-    session = _session(rest, executor)
+    session = _session(_tree())
     session.use("bwd")
 
-    session.list(".reference")  # must not raise — "bwd.reference" exists
-
-    assert executor.statements  # the gettablesfrom query actually ran
+    assert "bwd.reference.water_temperature" in session.list(".reference")
 
 
 def test_list_resolves_a_bare_relative_path_too() -> None:
@@ -143,36 +153,24 @@ def test_list_resolves_a_bare_relative_path_too() -> None:
     # leading '.' as relative once a context exists — the dot is optional
     # sugar there, not the marker for relative vs absolute (use() is the
     # one exception — see test_session_context.py).
-    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference"})
-    executor = FakeExecutor(rows=[])
-    session = _session(rest, executor)
+    session = _session(_tree())
     session.use("bwd")
 
-    session.list("reference")  # bare, no dot — still resolves to "bwd.reference"
-
-    assert executor.statements  # the gettablesfrom query actually ran
+    assert "bwd.reference.sub.stations" in session.list("reference")
 
 
 def test_list_with_no_path_lists_the_context_itself() -> None:
-    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference"})
-    executor = FakeExecutor(
-        rows=[{"TABLE_SCHEMA": "bwd.reference", "TABLE_NAME": "water_temperature"}]
-    )
-    session = _session(rest, executor)
-    session.use("bwd.reference")
+    session = _session(_tree())
+    session.use("bwd.reference.sub")
 
-    assert session.list() == ["bwd.reference.water_temperature"]
+    assert session.list() == ["bwd.reference.sub.deeper.codes", "bwd.reference.sub.stations"]
 
 
 def test_list_with_empty_path_lists_the_context_itself() -> None:
-    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference"})
-    executor = FakeExecutor(rows=[])
-    session = _session(rest, executor)
-    session.use("bwd.reference")
+    session = _session(_tree())
+    session.use("bwd.reference.sub.deeper")
 
-    session.list("")  # explicit empty string — same as omitting path
-
-    assert executor.statements  # the gettablesfrom query actually ran
+    assert session.list("") == ["bwd.reference.sub.deeper.codes"]
 
 
 def test_list_with_no_path_and_no_context_raises() -> None:
@@ -184,23 +182,39 @@ def test_list_with_no_path_and_no_context_raises() -> None:
 
 
 def test_list_absolute_path_still_works_with_no_context() -> None:
-    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.reference"})
-    executor = FakeExecutor(
-        rows=[{"TABLE_SCHEMA": "bwd.reference", "TABLE_NAME": "water_temperature"}]
-    )
-    session = _session(rest, executor)
+    session = _session(_tree())
 
-    assert session.list("bwd.reference") == ["bwd.reference.water_temperature"]
+    assert session.list("bwd.reference.sub.deeper") == ["bwd.reference.sub.deeper.codes"]
 
 
 def test_list_raises_when_path_does_not_exist() -> None:
-    # Unlike the raw gettablesfrom (which would just return []), list()
-    # checks first rather than treating a typo as "nothing found".
-    rest = FakeCatalogRest(existing={"a", "bwd"})
-    session = _session(rest)
+    session = _session(_tree())
 
     with pytest.raises(CatalogOperationError, match="does not exist"):
         session.list("bwd.missing")
+
+
+def test_list_accepts_the_slash_form_of_a_path() -> None:
+    session = _session(_tree())
+
+    assert session.list("bwd/reference/sub/deeper") == ["bwd.reference.sub.deeper.codes"]
+
+
+def test_a_slash_context_from_the_catalog_tree_is_stored_with_dots() -> None:
+    session = _session(_tree())
+
+    session.set_context("bwd/reference/sub")  # what the JupyterLab tree pushes
+
+    assert session.get_context() == "bwd.reference.sub"
+    assert session.list() == ["bwd.reference.sub.deeper.codes", "bwd.reference.sub.stations"]
+
+
+def test_use_accepts_the_slash_form_too() -> None:
+    session = _session(_tree())
+
+    session.use("bwd/reference")
+
+    assert session.get_context() == "bwd.reference"
 
 
 # -- schema ---------------------------------------------------------------------
