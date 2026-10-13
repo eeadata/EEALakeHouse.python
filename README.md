@@ -122,6 +122,15 @@ exact same arguments.
   the context is in (or the `draft` inside the context), the target is
   `{draft's parent}.versions.{version_name}` (`versions` is created if missing). `tables` works
   as in `create_version`.
+- `%catalog update_latest_release(version_name, overwrite=False)` — a view at the dataflow's root for
+  every table in `{context}.versions.{version_name}`, keeping its sub-folders
+  (`versions.v1.eu_sdg_06_30.monitoringsites` gets the view `eu_sdg_06_30.monitoringsites`;
+  missing folders are created). The context, set with `use`, must be the dataflow folder, three
+  levels below `catalog` (`catalog.<domain>.<group>.<dataflow>`), and `versions` and
+  `versions.{version_name}` must exist — checked when the call is made. Views in the version
+  are skipped. Every target is checked before any view is created: an existing view is an error
+  unless `overwrite=True` (which replaces it and can't be undone), and an existing table always
+  is.
 - `draft2version(draft_path, version_path)` / `publishversion(consumer_view_path, version_path)`
   — **not implemented yet** (both raise `NotImplementedError`); promoting a draft table into a
   permanent version and repointing a consumer-facing view at it.

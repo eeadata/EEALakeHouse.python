@@ -194,6 +194,16 @@ _CATALOG_HELP = [
         "target is draft's parent.versions.version_name (versions is created if missing). "
         "tables as in create_version: omitted or empty copies everything in draft.",
     ),
+    (
+        "update_latest_release",
+        "Create a view at the dataflow's root for every table in versions.version_name, "
+        "keeping its sub-folders (versions.v1.a.t gets the view a.t; missing folders are "
+        "created). The context must be the dataflow, three levels below 'catalog' "
+        "(catalog.<domain>.<group>.<dataflow>), and versions and versions.version_name must "
+        "exist — raises at once otherwise. Views in the version are skipped. An existing view "
+        "is an error unless overwrite=True (replaces it, not undoable); an existing table is "
+        "always an error.",
+    ),
     # -- table ----------------------------------------------------------------
     (
         "list",
