@@ -613,9 +613,57 @@ def test_draft_to_version_without_tables_copies_all_of_draft() -> None:
 
     assert f"{VERSION}.bw_assessment.stations" in dremio.tables
     assert report.notes == [
-        f"skipped '{SOURCE}.bw_assessment.latest': view — only tables are versioned",
+        f"copied view '{SOURCE}.bw_assessment.latest' as a table",
         f"skipped '{SOURCE}.reference.quality_classes': reference table — not versioned",
     ]
+
+
+def test_draft_to_version_copies_a_view_into_the_version_as_a_table() -> None:
+    rest, dremio = _world()
+    session = _session(rest, dremio)
+    session.use("catalog.bwd")
+
+    session.draft_to_version("v2025_1").commit()
+
+    assert dremio.tables[f"{VERSION}.bw_assessment.latest"] == "TABLE"
+    assert dremio.tables[f"{SOURCE}.bw_assessment.latest"] == "VIEW"  # the draft is untouched
+    assert any(
+        s.startswith('CREATE TABLE "catalog"."bwd"."versions"."v2025_1"."bw_assessment"."latest"')
+        and s.endswith('FROM "catalog"."bwd"."draft"."bw_assessment"."latest"')
+        for s in dremio.statements
+    )
+
+
+def test_draft_to_version_copies_a_listed_view() -> None:
+    rest, dremio = _world()
+    session = _session(rest, dremio)
+    session.use("catalog.bwd")
+
+    report = session.draft_to_version("v2025_1", ["bw_assessment.latest"]).commit()
+
+    assert dremio.tables[f"{VERSION}.bw_assessment.latest"] == "TABLE"
+    assert report.notes == [f"copied view '{SOURCE}.bw_assessment.latest' as a table"]
+
+
+def test_create_version_still_skips_views() -> None:
+    rest, dremio = _world()
+    session = _session(rest, dremio)
+
+    report = session.create_version(SOURCE, "v2025_1", ["bw_assessment"], TARGET).commit()
+
+    assert f"{VERSION}.bw_assessment.latest" not in dremio.tables
+    assert report.notes == [
+        f"skipped '{SOURCE}.bw_assessment.latest': view — only tables are versioned"
+    ]
+
+
+def test_include_views_lists_the_views_it_copied() -> None:
+    rest, dremio = _world()
+
+    result = _create(dremio, rest, ["bw_assessment"], include_views=True)
+
+    assert result.from_views == [f"{SOURCE}.bw_assessment.latest"]
+    assert (f"{SOURCE}.bw_assessment.latest", f"{VERSION}.bw_assessment.latest") in result.copied
 
 
 def test_draft_to_version_creates_the_versions_folder_if_missing() -> None:

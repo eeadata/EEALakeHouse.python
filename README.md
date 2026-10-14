@@ -113,7 +113,8 @@ exact same arguments.
   `source_path` or as a full path. A missing `target_path` is created, every level, unless
   `create_target_folder=False`. Reference and vocabulary tables (a folder named
   `reference(s)`/`vocabulary(ies)` in the path) and views are skipped and listed in
-  `VersionResult.skipped`. Entries missing from the source (all named at once) or an existing
+  `VersionResult.skipped` — views are copied as tables instead with `include_views=True`
+  (listed in `VersionResult.from_views`). Entries missing from the source (all named at once) or an existing
   version folder without `overwrite=True` raise before anything is written. On failure it
   removes what it created. `%catalog create_version(source_path, version_name, tables)` uses the
   current context as `target_path` when it's omitted.
@@ -121,7 +122,20 @@ exact same arguments.
   from the dataflow's `draft` folder without typing any path: the source is the `draft` folder
   the context is in (or the `draft` inside the context), the target is
   `{draft's parent}.versions.{version_name}` (`versions` is created if missing). `tables` works
-  as in `create_version`.
+  as in `create_version`. Unlike `create_version`, views in `draft` are not skipped: each one is
+  copied into the version as a table — a snapshot of what the view returns — and the commit
+  report's notes list them.
+- `%catalog update_latest_release(version_name, overwrite=True)` — a view at the Area's root for
+  every table in `{context}.versions.{version_name}`, keeping its sub-folders
+  (`versions.v1.eu_sdg_06_30.monitoringsites` gets the view `eu_sdg_06_30.monitoringsites`;
+  missing folders are created). The context, set with `use`, must be the Area folder — one with
+  `draft` and `versions` folders just below it, typically
+  `catalog.<domain>.<subdomain>.<area>` — and `versions.{version_name}` must exist —
+  checked when the call is made. Views in the version
+  are skipped. Every target is checked before any view is created: an existing view is dropped
+  and created again over the version (`overwrite=True`, the default — re-pointing the views at a
+  new version is the normal use; it can't be undone), `overwrite=False` makes it an error
+  instead, and an existing table is always an error.
 - `draft2version(draft_path, version_path)` / `publishversion(consumer_view_path, version_path)`
   — **not implemented yet** (both raise `NotImplementedError`); promoting a draft table into a
   permanent version and repointing a consumer-facing view at it.

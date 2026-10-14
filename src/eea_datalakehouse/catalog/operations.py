@@ -594,7 +594,9 @@ class VersionResult:
     overwritten (only with ``overwrite=True``); `created_folder` says whether
     the version folder was created by this call, and
     `created_target_folders` which levels of the target path it created
-    (top-down; only with ``create_target_folder=True``).
+    (top-down; only with ``create_target_folder=True``); `from_views` lists
+    the sources in `copied` that are views, copied as tables (only with
+    ``include_views=True``).
     """
 
     version_path: str
@@ -603,12 +605,14 @@ class VersionResult:
     replaced: list[str] = field(default_factory=list)
     created_folder: bool = False
     created_target_folders: list[str] = field(default_factory=list)
+    from_views: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class _VersionPlan:
     version_path: str
     copies: list[tuple[str, str]]  # (source table, target table)
+    from_views: list[str]  # sources in `copies` that are views
     skipped: list[tuple[str, str]]  # (source table, reason)
     target_exists: bool
     folder_exists: bool
@@ -728,6 +732,7 @@ def _plan_version(
     *,
     overwrite: bool,
     create_target_folder: bool,
+    include_views: bool,
     idempotency_key: str,
 ) -> _VersionPlan:
     """Everything `createversion` checks before it writes anything."""
@@ -752,20 +757,23 @@ def _plan_version(
     available = _entries_under(executor, source_path, idempotency_key=idempotency_key)
     copies: list[tuple[str, str]] = []
     skipped: list[tuple[str, str]] = []
+    from_views: list[str] = []
     for source_table in _expand_entries(source_path, tables, available):
         folders = {segment.lower() for segment in source_table.split(".")[:-1]}
         shared = sorted(folders & _SHARED_TABLE_FOLDERS)
         if shared:
             skipped.append((source_table, f"{shared[0]} table — not versioned"))
-        elif available[source_table] == "VIEW":
+        elif available[source_table] == "VIEW" and not include_views:
             skipped.append((source_table, "view — only tables are versioned"))
         else:
             rel = source_table[len(source_path) + 1 :]
             copies.append((source_table, f"{version_path}.{rel}"))
+            if available[source_table] == "VIEW":
+                from_views.append(source_table)
     if not copies:
         reasons = "; ".join(f"{table}: {reason}" for table, reason in skipped)
         raise CatalogOperationError(f"nothing to copy — every listed table was skipped ({reasons})")
-    return _VersionPlan(version_path, copies, skipped, target_exists, folder_exists)
+    return _VersionPlan(version_path, copies, from_views, skipped, target_exists, folder_exists)
 
 
 def createversion(
@@ -778,6 +786,7 @@ def createversion(
     target_path: str,
     overwrite: bool = False,
     create_target_folder: bool = True,
+    include_views: bool = False,
     idempotency_key: str,
 ) -> VersionResult:
     """Copy the listed `tables` from `source_path` into a new version folder,
@@ -797,7 +806,9 @@ def createversion(
     - reference and vocabulary tables — any table with a folder named
       ``reference``/``references``/``vocabulary``/``vocabularies`` in its
       path (case-insensitive);
-    - views — only tables are versioned.
+    - views — only tables are versioned, unless ``include_views=True``: then
+      each view is copied as a table too (a snapshot of what it returns),
+      and listed in `VersionResult.from_views`.
 
     `create_target_folder=True` (the default) creates `target_path` — every
     missing level under the space/source, which itself must exist — when it
@@ -825,6 +836,7 @@ def createversion(
         "target_path": target_path,
         "overwrite": overwrite,
         "create_target_folder": create_target_folder,
+        "include_views": include_views,
     }
     created_targets: list[str] = []
     created_folder = False
@@ -840,6 +852,7 @@ def createversion(
             target_path,
             overwrite=overwrite,
             create_target_folder=create_target_folder,
+            include_views=include_views,
             idempotency_key=f"{idempotency_key}-plan",
         )
         if not plan.target_exists:
@@ -892,6 +905,7 @@ def createversion(
         replaced=replaced,
         created_folder=created_folder,
         created_target_folders=created_targets,
+        from_views=plan.from_views,
     )
 
 
