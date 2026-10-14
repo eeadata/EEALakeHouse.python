@@ -192,12 +192,28 @@ _CATALOG_HELP = [
         "create_version from the dataflow's draft folder, with no paths to type: the source is "
         "the draft folder the context is in (or the draft folder inside the context), the "
         "target is draft's parent.versions.version_name (versions is created if missing). "
-        "tables as in create_version: omitted or empty copies everything in draft.",
+        "tables as in create_version: omitted or empty copies everything in draft. Unlike "
+        "create_version, views in draft are not skipped: each is copied into the version as a "
+        "table (a snapshot of what it returns); the report's notes say which.",
+    ),
+    (
+        "update_latest_release",
+        "Create a view at the Area's root for every table in versions.version_name, "
+        "keeping its sub-folders (versions.v1.a.t gets the view a.t; missing folders are "
+        "created). The context must be the Area folder — one with draft and versions folders "
+        "just below it, typically catalog.<domain>.<subdomain>.<area> — "
+        "and versions.version_name must exist — raises at once otherwise. Views in the version "
+        "are skipped. An existing view "
+        "is dropped and recreated over the version (overwrite=True, the default; not undoable) — "
+        "overwrite=False makes it an error instead; an existing table is "
+        "always an error.",
     ),
     # -- table ----------------------------------------------------------------
     (
         "list",
-        "Show every table/view under path, at any depth, as full dot-separated paths. "
+        "Show every table/view under path, as full dot-separated paths: its own, then every "
+        "child folder's, at any depth — walked folder by folder through Dremio's catalog "
+        "API, no SQL. path may use '.' or '/' separators. "
         "path may be omitted to list the current context itself — raises "
         "CatalogSessionError if none is set. Raises CatalogOperationError if path "
         "doesn't exist.",

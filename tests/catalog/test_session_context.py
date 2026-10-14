@@ -676,3 +676,16 @@ def test_use_wraps_a_stalled_existence_check_as_a_catalog_session_error() -> Non
     # a friendly printed message.
     with pytest.raises(CatalogSessionError, match="could not check whether"):
         session.use("bwd.reference")
+
+
+def test_use_with_a_refused_token_says_so_instead_of_does_not_exist() -> None:
+    from eea_datalakehouse.catalog.errors import CatalogAuthError
+    from eea_datalakehouse.catalog.session import CatalogSessionError
+
+    rest = FakeCatalogRest(
+        raise_on_exists=CatalogAuthError("Dremio refused the lookup of 'a.b' (401) — expired")
+    )
+    session = _session(rest)
+
+    with pytest.raises(CatalogSessionError, match="could not check whether 'a.b' exists: .*401"):
+        session.use("a.b")

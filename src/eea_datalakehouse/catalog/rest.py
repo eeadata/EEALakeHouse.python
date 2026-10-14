@@ -23,7 +23,7 @@ from urllib.parse import quote
 
 import httpx
 
-from .errors import CatalogOperationError, EngineStartingError
+from .errors import CatalogAuthError, CatalogOperationError, EngineStartingError
 
 DEFAULT_TIMEOUT = 60.0
 
@@ -76,15 +76,71 @@ class CatalogRestClient:
         encoded = "/".join(quote(segment, safe="") for segment in segments)
         return self._lookup_encoded(encoded, ".".join(segments))
 
-    def _lookup_encoded(self, encoded: str, path: str) -> dict[str, Any] | None:
+    def list_datasets(self, segments: Sequence[str]) -> list[str]:
+        """Full dot-paths of every table and view under the path made of
+        `segments`, found by walking the catalog tree: the folder's children,
+        then each child folder's children, and so on, at any depth.
+
+        Uses the REST catalog API only — every level is read with the same
+        by-path lookup Dremio's UI uses, following `nextPageToken` when a
+        folder's children come in pages — so it sees exactly what the catalog
+        holds, independent of how (or whether) a source reports its tables in
+        ``INFORMATION_SCHEMA``. A path that names a table or view itself
+        lists just that. Raises `CatalogOperationError` if the path doesn't
+        exist, `CatalogAuthError` if Dremio refuses the token.
+        """
+        root = self.get_entity(segments)
+        if root is None:
+            raise CatalogOperationError(f"{'.'.join(segments)!r} does not exist")
+        if root.get("entityType") == "dataset":
+            return [".".join(segments)]
+        found: list[str] = []
+        pending: list[tuple[list[str], dict[str, Any]]] = [(list(segments), root)]
+        while pending:
+            folder, entity = pending.pop()
+            for child in self._all_children(folder, entity):
+                child_path = [str(part) for part in child.get("path") or []]
+                if not child_path:
+                    continue
+                if child.get("type") == "DATASET":
+                    found.append(".".join(child_path))
+                elif child.get("type") == "CONTAINER":
+                    sub_entity = self.get_entity(child_path)
+                    if sub_entity is not None:
+                        pending.append((child_path, sub_entity))
+        return sorted(found)
+
+    def _all_children(self, segments: list[str], entity: dict[str, Any]) -> list[dict[str, Any]]:
+        """`entity`'s children, following Dremio's `nextPageToken` pages."""
+        children: list[dict[str, Any]] = list(entity.get("children") or [])
+        token = entity.get("nextPageToken")
+        encoded = "/".join(quote(segment, safe="") for segment in segments)
+        while token:
+            page = self._lookup_encoded(encoded, ".".join(segments), params={"pageToken": token})
+            if page is None:
+                break
+            children.extend(page.get("children") or [])
+            token = page.get("nextPageToken")
+        return children
+
+    def _lookup_encoded(
+        self, encoded: str, path: str, *, params: dict[str, str] | None = None
+    ) -> dict[str, Any] | None:
         try:
             resp = self._http.get(
-                f"{self._base_url}/api/v3/catalog/by-path/{encoded}", headers=self._headers
+                f"{self._base_url}/api/v3/catalog/by-path/{encoded}",
+                headers=self._headers,
+                params=params,
             )
         except httpx.TimeoutException as exc:
             raise EngineStartingError(f"catalog lookup for {path!r} timed out") from exc
         if resp.status_code == 404:
             return None
+        if resp.status_code in (401, 403):
+            raise CatalogAuthError(
+                f"Dremio refused the lookup of {path!r} ({resp.status_code}) — the token is "
+                "invalid or expired, or has no access to this path"
+            )
         if resp.status_code >= 400:
             raise CatalogOperationError(
                 f"could not look up {path!r} ({resp.status_code}): {resp.text[:300]}"
@@ -102,9 +158,17 @@ class CatalogRestClient:
         `CatalogSession.create_folder` check whether a not-yet-created
         folder is already there without that check itself blowing up the
         creation it's only meant to make undoable.
+
+        The one exception is Dremio refusing the request itself (401/403 — an
+        invalid or expired token, or no access): that raises
+        `CatalogAuthError` rather than reading as "not found", so an expired
+        token is never reported as a missing path. Same for `is_folder` and
+        `is_table_or_view`.
         """
         try:
             return self._lookup_by_path(path) is not None
+        except CatalogAuthError:
+            raise
         except CatalogOperationError:
             return False
 
@@ -127,6 +191,8 @@ class CatalogRestClient:
         """
         try:
             entity = self._lookup_by_path(path)
+        except CatalogAuthError:
+            raise
         except CatalogOperationError:
             return False
         return entity is not None and entity.get("entityType") == "folder"
@@ -147,6 +213,8 @@ class CatalogRestClient:
         """
         try:
             entity = self._lookup_by_path(path)
+        except CatalogAuthError:
+            raise
         except CatalogOperationError:
             return False
         return entity is not None and entity.get("entityType") == "dataset"
@@ -289,7 +357,13 @@ class CatalogRestClient:
 
     def create_folder(self, path: str) -> bool:
         """POST `path` into existence. Returns whether it was newly created
-        (False on 409 — it was already there)."""
+        (False on 409 — it was already there).
+
+        A 403 on a folder that already exists also returns False: Dremio
+        checks ALTER before it checks existence, so a caller without ALTER on
+        a level it only passes through (a domain or subdomain, which only
+        `catalog_admin` can alter) is refused even though nothing needs
+        creating. A 403 on a folder that doesn't exist is still raised."""
         try:
             resp = self._http.post(
                 f"{self._base_url}/api/v3/catalog",
@@ -301,11 +375,21 @@ class CatalogRestClient:
         # 409: it was already there (either from before this call, or a
         # concurrent creation) — the post-condition ("it exists now") still
         # holds either way.
+        if resp.status_code == 403 and self._exists_quietly(path):
+            return False
         if resp.status_code not in (200, 201, 409):
             raise CatalogOperationError(
                 f"could not create folder {path!r} ({resp.status_code}): {resp.text[:300]}"
             )
         return resp.status_code != 409
+
+    def _exists_quietly(self, path: str) -> bool:
+        """`exists`, but a refused lookup reads as "not found" — for
+        `create_folder`'s 403 check, where the 403 itself is what gets raised."""
+        try:
+            return self.exists(path)
+        except CatalogAuthError:
+            return False
 
     def ensure_folder_path(self, path: str) -> list[str]:
         """Create every missing folder level of `path`. Returns the levels

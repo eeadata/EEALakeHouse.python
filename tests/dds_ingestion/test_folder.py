@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import pytest
+
 from eea_datalakehouse.dds_ingestion.client import StorageUnavailableError
 from eea_datalakehouse.dds_ingestion.folder import (
     FolderIngest,
@@ -329,3 +330,103 @@ def test_run_stops_before_uploading_when_dds_cannot_write_to_s3(
     assert "administrator" in str(exc.value)
     assert client.uploaded == []
     assert client.commit_calls == []
+
+
+class ProxyHintFakeClient(FakeClient):
+    """`begin` hints ``upload_mode: "proxy"``; `stage` records server-proxied uploads."""
+
+    def __init__(self, *, hint: str | None = "proxy") -> None:
+        super().__init__()
+        self.hint = hint
+        self.staged: list[tuple[str, str, bytes]] = []
+
+    def begin(self, *, files: list[FileSpec], **kwargs: object) -> BeginResult:
+        result = super().begin(files=files, **kwargs)
+        return BeginResult(
+            session_id=result.session_id,
+            status=result.status,
+            s3=result.s3,
+            upload_mode=self.hint,
+        )
+
+    def stage(self, session_id: str, rel_path: str, data: bytes) -> object:
+        with self._lock:
+            self.staged.append((session_id, rel_path, data))
+        return object()
+
+
+def test_proxy_hint_sends_every_file_through_dds_not_s3(data_folder: Path) -> None:
+    client = ProxyHintFakeClient()
+
+    outcome = _make_ingest(data_folder, client).run()
+
+    assert client.uploaded == []  # the presigned S3 targets were never used
+    assert sorted(rel for _, rel, _ in client.staged) == ["a.parquet", "sub/b.parquet"]
+    assert {sid for sid, _, _ in client.staged} == {"sess-X"}
+    assert (data_folder / "a.parquet").read_bytes() in [d for _, _, d in client.staged]
+    assert client.commit_calls[0]["multipart_etags"] is None  # nothing from S3 to pass on
+    assert outcome.upload_mode == "proxy"
+    assert outcome.files_uploaded == 2
+
+
+def test_proxy_hint_wins_over_multipart_targets(data_folder: Path) -> None:
+    class Both(ProxyHintFakeClient, MultipartFakeClient):
+        pass
+
+    client = Both()
+
+    _make_ingest(data_folder, client, multipart=True).run()
+
+    assert client.uploaded == [] and len(client.staged) == 2
+
+
+def test_no_hint_keeps_direct_uploads(data_folder: Path) -> None:
+    client = ProxyHintFakeClient(hint=None)
+
+    outcome = _make_ingest(data_folder, client).run()
+
+    assert sorted(client.uploaded) == ["a.parquet", "sub/b.parquet"]
+    assert client.staged == []
+    assert outcome.upload_mode == "direct"
+
+
+def test_upload_mode_proxy_forces_dds_even_without_a_hint(data_folder: Path) -> None:
+    client = ProxyHintFakeClient(hint=None)
+
+    _make_ingest(data_folder, client, upload_mode="proxy").run()
+
+    assert client.uploaded == [] and len(client.staged) == 2
+
+
+def test_upload_mode_direct_ignores_the_hint(data_folder: Path) -> None:
+    client = ProxyHintFakeClient(hint="proxy")
+
+    _make_ingest(data_folder, client, upload_mode="direct").run()
+
+    assert len(client.uploaded) == 2 and client.staged == []
+
+
+def test_invalid_upload_mode_rejected(data_folder: Path) -> None:
+    with pytest.raises(ValueError, match="upload_mode must be"):
+        _make_ingest(data_folder, FakeClient(), upload_mode="s3")
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"upload_mode": "proxy"}, "proxy"),
+        ({"s3_extra": {"upload_mode": "proxy"}}, "proxy"),
+        ({}, None),
+    ],
+)
+def test_begin_result_reads_the_upload_mode_hint(
+    payload: dict[str, object], expected: str | None
+) -> None:
+    s3: dict[str, object] = {"bucket": "b", "key_prefix": "p/", "uploads": []}
+    data: dict[str, object] = {"session_id": "s", "status": "open", "s3": s3}
+    if "s3_extra" in payload:
+        s3.update(payload["s3_extra"])  # type: ignore[arg-type]
+    else:
+        data.update(payload)
+
+    assert BeginResult.from_json(data).upload_mode == expected

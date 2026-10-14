@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 from . import operations
 from .client import Catalog
-from .errors import CatalogOperationError, EngineStartingError
+from .errors import CatalogAuthError, CatalogOperationError, EngineStartingError
 from .operations import TableInfo
 
 _Undo = Callable[[], None]
@@ -122,6 +122,15 @@ _ROOT_SOURCE = "catalog"
 # `_resolve_path`.
 
 
+def _dotted(path: str) -> str:
+    """``catalog/a/b`` (the slash form the catalog tree and DDS use) as
+    ``catalog.a.b``, the form every verb here expects; a dotted path is
+    returned unchanged."""
+    if "/" not in path:
+        return path
+    return ".".join(segment for segment in path.split("/") if segment)
+
+
 def _drop_entry(catalog: Catalog, path: str, *, idempotency_key: str) -> None:
     """Drop whatever entity (table or view) now sits at `path`.
 
@@ -140,11 +149,52 @@ def _drop_entry(catalog: Catalog, path: str, *, idempotency_key: str) -> None:
     )
 
 
+def _plan_version_views(
+    catalog: Catalog,
+    dataflow: str,
+    version: str,
+    overwrite: bool,
+    key: str,
+    notes: list[str],
+) -> list[tuple[str, str, bool]]:
+    """``(table, view, view_exists)`` for every table in `version` — see
+    `CatalogSession.update_latest_release`. Checks every target first, so nothing
+    is created when one of them is refused; skipped views go into `notes`."""
+    executor = catalog._executor  # noqa: SLF001 — same-package internal, as in _drop_entry
+    plan: list[tuple[str, str, bool]] = []
+    problems: list[str] = []
+    for number, source in enumerate(
+        catalog._catalog_rest.list_datasets(version.split(".")), start=1  # noqa: SLF001
+    ):
+        check_key = f"{key}-check-{number}"
+        if operations._entry_kind(executor, source, idempotency_key=check_key) == "VIEW":  # noqa: SLF001
+            notes.append(f"skipped {source!r}: view — only tables get a view")
+            continue
+        relative = source[len(version) + 1 :]
+        if relative.split(".", 1)[0] in (DRAFT_FOLDER, VERSIONS_FOLDER):
+            problems.append(f"{source!r} would put its view inside {dataflow}.{relative}")
+            continue
+        target = f"{dataflow}.{relative}"
+        existed = operations._entry_exists(executor, target, idempotency_key=check_key)  # noqa: SLF001
+        if existed:
+            kind = operations._entry_kind(executor, target, idempotency_key=check_key)  # noqa: SLF001
+            if kind == "TABLE":
+                problems.append(f"{target!r} is a table — a view never replaces one")
+            elif not overwrite:
+                problems.append(f"view {target!r} already exists — pass overwrite=True")
+        plan.append((source, target, existed))
+    if problems:
+        raise CatalogOperationError("no views created: " + "; ".join(problems))
+    if not plan:
+        raise CatalogOperationError(f"{version!r} has no tables to create views for")
+    return plan
+
+
 class CatalogSession:
     """Queue catalog verbs against `catalog`, then `commit()` them as one batch.
 
     Every queueing method (`data_copy`, `data_move`, `create_version`, `draft_to_version`,
-    `create_view`, `set_tags`,
+    `update_latest_release`, `create_view`, `set_tags`,
     `delete_tags`, `set_wiki`, `delete_wiki`, `create_folder`,
     `delete_folder`, `delete_view`, `delete_table`) only records the intent —
     nothing reaches Dremio until `commit()`. Each returns
@@ -195,8 +245,12 @@ class CatalogSession:
         a Comm — see `docs/notebook-facade-for-data-scientists.md`,
         "Pre-filling catalog context") is its other caller, seeding it
         before any path has been typed yet.
+
+        A path with ``/`` separators (``catalog/a/b``, as the catalog tree
+        and DDS write them) is stored in the dot form (``catalog.a.b``) every
+        other verb expects.
         """
-        self._context = path
+        self._context = _dotted(path) if path else path
         return self
 
     def use(self, path: str | None) -> CatalogSession:
@@ -229,9 +283,10 @@ class CatalogSession:
         if path is None or path == "":
             self._context = _ROOT_SOURCE
             return self
+        path = _dotted(path)
         try:
             found = self._catalog._catalog_rest.exists(path)  # noqa: SLF001 — see module docstring
-        except EngineStartingError as exc:
+        except (EngineStartingError, CatalogAuthError) as exc:
             raise CatalogSessionError(f"could not check whether {path!r} exists: {exc}") from exc
         if not found:
             raise CatalogSessionError(f"{path!r} does not exist in the catalog")
@@ -277,6 +332,8 @@ class CatalogSession:
         `"../stations"` is a sibling of the context, `"../../stations"` a
         level further up, and so on; `".."` alone (no name after it)
         resolves to the context's parent itself."""
+        if not path.startswith(".") and "/" in path:
+            path = _dotted(path)  # catalog/a/b — the slash form — means catalog.a.b
         if path == ".." or path.startswith("../"):
             return self._resolve_parent_path(path)
         if path in (".", "./"):
@@ -447,6 +504,29 @@ class CatalogSession:
         and version folder this step created, or drops the tables it newly
         copied into an existing one; a table it overwrote cannot be restored, so a step that
         replaced any is irreversible (see `CatalogCommitError`)."""
+        return self._queue_version(
+            source_path,
+            version_name,
+            tables,
+            target_path,
+            overwrite=overwrite,
+            create_target_folder=create_target_folder,
+            include_views=False,
+        )
+
+    def _queue_version(
+        self,
+        source_path: str,
+        version_name: str,
+        tables: list[str] | None,
+        target_path: str | None,
+        *,
+        overwrite: bool,
+        create_target_folder: bool,
+        include_views: bool,
+    ) -> CatalogSession:
+        """`create_version`, plus `include_views` (see `createversion`) —
+        `draft_to_version` copies the draft's views as tables too."""
         try:
             source_path, version_name, tables = operations._check_version_args(  # noqa: SLF001
                 source_path, version_name, tables
@@ -477,7 +557,11 @@ class CatalogSession:
                 target_path=target_path,
                 overwrite=overwrite,
                 create_target_folder=create_target_folder,
+                include_views=include_views,
                 idempotency_key=key,
+            )
+            step.notes.extend(
+                f"copied view {view!r} as a table" for view in result.from_views
             )
             step.notes.extend(
                 f"skipped {table!r}: {reason}" for table, reason in result.skipped
@@ -529,20 +613,24 @@ class CatalogSession:
         folder is created if it doesn't exist yet. `tables` behaves exactly
         as in `create_version`: omitted or empty copies everything in
         ``draft``; an entry is a table or a folder (every table under it),
-        relative to ``draft`` or a full path; reference/vocabulary tables and
-        views are skipped and reported. An existing version is an error
-        unless ``overwrite=True``. Rollback is `create_version`'s."""
+        relative to ``draft`` or a full path; reference/vocabulary tables are
+        skipped and reported. Unlike `create_version`, views are not skipped:
+        each view in ``draft`` is copied into the version as a table (a
+        snapshot of what it returns), and the commit report's `notes` say
+        which. An existing version is an error unless ``overwrite=True``.
+        Rollback is `create_version`'s."""
         draft = self._find_draft()
         parent = operations._parent_path(draft)  # noqa: SLF001 — same-package internal
         if parent is None:
             raise CatalogSessionError(f"{draft!r} has no parent folder to put versions under")
-        return self.create_version(
+        return self._queue_version(
             draft,
             version_name,
             tables,
             f"{parent}.{VERSIONS_FOLDER}",
             overwrite=overwrite,
             create_target_folder=True,
+            include_views=True,
         )
 
     def _find_draft(self) -> str:
@@ -559,13 +647,132 @@ class CatalogSession:
             nearest = len(segments) - 1 - segments[::-1].index(DRAFT_FOLDER)
             return ".".join(segments[: nearest + 1])
         candidate = f"{self._context}.{DRAFT_FOLDER}"
-        if self._catalog._catalog_rest.exists(candidate):  # noqa: SLF001 — see module docstring
+        try:
+            found = self._catalog._catalog_rest.exists(candidate)  # noqa: SLF001
+        except (EngineStartingError, CatalogAuthError) as exc:
+            raise CatalogSessionError(
+                f"could not check whether {candidate!r} exists: {exc}"
+            ) from exc
+        if found:
             return candidate
         raise CatalogSessionError(
             f"no {DRAFT_FOLDER!r} folder for the context {self._context!r}: it isn't inside one, "
             f"and {candidate!r} doesn't exist — use() the draft folder, or the folder that "
             "holds it, first"
         )
+
+    def update_latest_release(
+        self, version_name: str, *, overwrite: bool = True
+    ) -> CatalogSession:
+        """Queue a view at the Area's root for every table in
+        ``{context}.versions.{version_name}``, keeping the version's
+        sub-folders: ``versions.v1.eu_sdg_06_30.monitoringsites`` gets the
+        view ``{context}.eu_sdg_06_30.monitoringsites`` over it. Missing
+        sub-folders are created.
+
+        The context must be an Area folder — a folder with both a ``draft``
+        and a ``versions`` folder just below it, typically
+        ``catalog.<domain>.<subdomain>.<area>`` — set it with `use` first.
+        Checked now, against Dremio, before anything is queued: that the
+        context has those two folders just below it, and that
+        ``{context}.versions.{version_name}`` exists; `CatalogSessionError`
+        otherwise.
+
+        The version's tables are listed when the step runs. Views in the
+        version are skipped, and the commit report's `notes` say which. A
+        table whose first sub-folder is ``draft`` or ``versions`` is refused,
+        since its view would land inside the Area's own draft or versions.
+        Before any view is created, every target is checked: an existing view
+        is dropped and created again over the version (``overwrite=True``, the
+        default — re-pointing the views at a new version is the normal use);
+        ``overwrite=False`` makes it an error instead. An existing table is
+        always an error — a view never replaces one.
+
+        Undo drops the views this step created and the folders it created
+        for them. A view it replaced cannot be restored, so a step that
+        replaced any is irreversible (see `CatalogCommitError`)."""
+        if not isinstance(version_name, str) or not version_name.strip():
+            raise CatalogSessionError("version_name must not be empty")
+        version_name = version_name.strip()
+        if "." in version_name or "/" in version_name:
+            raise CatalogSessionError(
+                f"version_name must be a single folder name, without '.' or '/': {version_name!r}"
+            )
+        dataflow = self._require_dataflow_context()
+        versions = f"{dataflow}.{VERSIONS_FOLDER}"
+        version = f"{versions}.{version_name}"
+        missing = [
+            name
+            for name in (DRAFT_FOLDER, VERSIONS_FOLDER)
+            if not self._is_folder(f"{dataflow}.{name}")
+        ]
+        if missing:
+            raise CatalogSessionError(
+                f"{dataflow!r} is not an Area folder: it has no "
+                + " and no ".join(repr(name) for name in missing)
+                + " folder just below it — use() the Area folder first"
+            )
+        if not self._is_folder(version):
+            raise CatalogSessionError(f"{version!r} does not exist, or is not a folder")
+        step = _Step(
+            f"create views under {dataflow!r} for the tables in {version!r}",
+            lambda catalog, key: None,  # replaced below, once `step` exists to report into
+        )
+
+        def run(catalog: Catalog, key: str) -> _Undo | None:
+            plan = _plan_version_views(catalog, dataflow, version, overwrite, key, step.notes)
+            new_views: list[str] = []
+            new_folders: list[str] = []
+
+            def undo() -> None:
+                for number, view in enumerate(new_views, start=1):
+                    _drop_entry(catalog, view, idempotency_key=f"{key}-undo-{number}")
+                for folder in reversed(new_folders):
+                    catalog.deletefolder(folder, idempotency_key=f"{key}-undo-folder")
+
+            try:
+                for number, (source, target, existed) in enumerate(plan, start=1):
+                    parent = operations._parent_path(target)  # noqa: SLF001
+                    if parent is not None and parent != dataflow:
+                        new_folders.extend(catalog._catalog_rest.ensure_folder_path(parent))  # noqa: SLF001
+                    catalog.createview(
+                        source, target, overwrite=existed, idempotency_key=f"{key}-{number}"
+                    )
+                    if existed:
+                        step.notes.append(f"replaced view {target!r}")
+                    else:
+                        new_views.append(target)
+            except Exception as exc:
+                try:
+                    undo()
+                except Exception as cleanup_error:  # noqa: BLE001 — the original failure is raised
+                    exc.add_note(f"cleanup failed, check {dataflow!r} by hand: {cleanup_error}")
+                raise
+            replaced = sum(existed for _, _, existed in plan)
+            if replaced:
+                raise _Irreversible(f"replaced {replaced} existing view(s)")
+            return undo
+
+        step.run = run
+        self._steps.append(step)
+        return self
+
+    def _is_folder(self, path: str) -> bool:
+        """Whether `path` is a folder, checked against Dremio now."""
+        try:
+            return self._catalog._catalog_rest.is_folder(path)  # noqa: SLF001
+        except (EngineStartingError, CatalogAuthError) as exc:
+            raise CatalogSessionError(f"could not check whether {path!r} exists: {exc}") from exc
+
+    def _require_dataflow_context(self) -> str:
+        """The context — whether it is an Area folder is checked by
+        `update_latest_release` itself."""
+        if self._context is None:
+            raise CatalogSessionError(
+                "no context is set — use() the Area folder "
+                f"({_ROOT_SOURCE}.<domain>.<subdomain>.<area>) first"
+            )
+        return self._context
 
     def create_view(
         self,
@@ -812,12 +1019,14 @@ class CatalogSession:
         return self._catalog.gettagsfrom(path, idempotency_key=self._key())
 
     def list(self, path: str = "") -> list[str]:
-        """Full paths of every table and view under `path`, at any depth
-        (see `gettablesfrom`). Answered immediately — not queued, since
+        """Full paths of every table and view under `path`: its own tables,
+        then every child folder's, at any depth. Found by walking the catalog
+        tree folder by folder through Dremio's REST catalog API (see
+        `CatalogRestClient.list_datasets`), so it lists what the catalog
+        holds even where a source doesn't report its tables in
+        ``INFORMATION_SCHEMA``. Answered immediately — not queued, since
         there's nothing to commit or undo. Raises `CatalogOperationError`
-        if `path` doesn't exist — `gettablesfrom` itself doesn't check this
-        (an empty result and "nothing there" look the same to it), so this
-        checks first rather than returning `[]` for a typo'd path.
+        if `path` doesn't exist, rather than returning `[]` for a typo.
 
         `path` may be a whole, absolute path, or relative — with or
         without a leading `.` — to the session's current context (see
@@ -832,9 +1041,7 @@ class CatalogSession:
             path = self._context
         else:
             path = self._resolve_path(path)
-        if not self._catalog._catalog_rest.exists(path):  # noqa: SLF001 — see module docstring
-            raise CatalogOperationError(f"{path!r} does not exist")
-        return self._catalog.gettablesfrom(path, idempotency_key=self._key())
+        return self._catalog._catalog_rest.list_datasets(path.split("."))  # noqa: SLF001
 
     def schema(self, path: str) -> TableInfo:
         """The column schema and row count of `path` (see
