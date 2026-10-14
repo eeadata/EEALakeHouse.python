@@ -53,6 +53,7 @@ def _world(tables: dict[str, str] | None = None) -> tuple[FakeCatalogRest, ViewD
         "catalog.water",
         "catalog.water.surface",
         DATAFLOW,
+        f"{DATAFLOW}.draft",
         VERSIONS,
         VERSION,
         f"{VERSION}.eu_sdg",
@@ -116,33 +117,73 @@ def test_views_in_the_version_are_skipped_and_reported() -> None:
     assert report.notes == [f"skipped '{VERSION}.latest': view — only tables get a view"]
 
 
-@pytest.mark.parametrize(
-    "context",
-    ["catalog", "catalog.water.surface", VERSIONS, "catalog.water.surface.bod_rivers.versions.v1"],
-)
-def test_context_must_be_three_levels_below_catalog(context: str) -> None:
+@pytest.mark.parametrize("context", ["catalog", "catalog.water", "catalog.water.surface"])
+def test_a_context_above_the_area_is_refused_whatever_its_level(context: str) -> None:
     rest, dremio = _world()
     session = _session(rest, dremio, context)
 
-    with pytest.raises(CatalogSessionError, match="three levels below 'catalog'"):
+    with pytest.raises(CatalogSessionError, match=f"'{context}' is not an Area folder"):
         session.update_latest_release("v1")
     assert repr(session) == "CatalogSession(pending=0)"
+
+
+def test_an_area_at_any_level_is_accepted() -> None:
+    area = "catalog.flow"
+    rest, dremio = _world({f"{area}.versions.v1.t": "TABLE"})
+    for folder in (area, f"{area}.draft", f"{area}.versions", f"{area}.versions.v1"):
+        rest.existing.add(folder)
+        rest.folders.add(folder)
+
+    _session(rest, dremio, area).update_latest_release("v1").commit()
+
+    assert f"{area}.t" in _views(dremio)
+
+
+def test_a_dataflow_deeper_than_three_levels_is_accepted() -> None:
+    deep = f"{DATAFLOW}.sub"
+    rest, dremio = _world({f"{deep}.versions.v1.t": "TABLE"})
+    for folder in (deep, f"{deep}.draft", f"{deep}.versions", f"{deep}.versions.v1"):
+        rest.existing.add(folder)
+        rest.folders.add(folder)
+
+    _session(rest, dremio, deep).update_latest_release("v1").commit()
+
+    assert f"{deep}.t" in _views(dremio)
+
+
+def test_a_context_inside_the_versions_folder_has_no_versions_of_its_own() -> None:
+    rest, dremio = _world()
+
+    with pytest.raises(CatalogSessionError, match="no 'draft' and no 'versions' folder"):
+        _session(rest, dremio, VERSION).update_latest_release("v1")
 
 
 def test_context_cleared_is_an_error() -> None:
     rest, dremio = _world()
     session = _session(rest, dremio).set_context(None)
 
-    with pytest.raises(CatalogSessionError, match="use\\(\\) it first"):
+    with pytest.raises(CatalogSessionError, match="no context is set"):
         session.update_latest_release("v1")
 
 
-def test_missing_versions_folder_raises_at_once() -> None:
+@pytest.mark.parametrize(
+    ("removed", "message"),
+    [
+        (["versions"], "has no 'versions' folder just below it"),
+        (["draft"], "has no 'draft' folder just below it"),
+        (["draft", "versions"], "has no 'draft' and no 'versions' folder just below it"),
+    ],
+)
+def test_the_area_needs_draft_and_versions_just_below_it(
+    removed: list[str], message: str
+) -> None:
     rest, dremio = _world()
-    rest.folders.discard(VERSIONS)
+    for name in removed:
+        rest.folders.discard(f"{DATAFLOW}.{name}")
 
-    with pytest.raises(CatalogSessionError, match=f"'{VERSIONS}' does not exist"):
+    with pytest.raises(CatalogSessionError, match=message) as info:
         _session(rest, dremio).update_latest_release("v1")
+    assert f"'{DATAFLOW}' is not an Area folder" in str(info.value)
 
 
 def test_missing_version_folder_raises_at_once() -> None:
@@ -164,29 +205,43 @@ def test_bad_version_name_raises_at_once(version_name: str, message: str) -> Non
         _session(rest, dremio).update_latest_release(version_name)
 
 
-def test_an_existing_view_is_an_error_and_nothing_is_created() -> None:
+def test_without_overwrite_an_existing_view_is_an_error_and_nothing_is_created() -> None:
     rest, dremio = _world()
     dremio.tables[f"{DATAFLOW}.summary"] = "VIEW"
     rest.existing.add(f"{DATAFLOW}.summary")
 
     with pytest.raises(CatalogCommitError, match="pass overwrite=True") as info:
-        _session(rest, dremio).update_latest_release("v1").commit()
+        _session(rest, dremio).update_latest_release("v1", overwrite=False).commit()
 
     assert info.value.rolled_back is True
     assert _views(dremio) == {f"{DATAFLOW}.summary"}
     assert f"{DATAFLOW}.eu_sdg" not in rest.existing
 
 
-def test_overwrite_replaces_a_view_and_is_irreversible() -> None:
+def test_an_existing_view_is_dropped_and_recreated_by_default() -> None:
     rest, dremio = _world()
     dremio.tables[f"{DATAFLOW}.summary"] = "VIEW"
     rest.existing.add(f"{DATAFLOW}.summary")
     session = _session(rest, dremio)
 
-    report = session.update_latest_release("v1", overwrite=True).commit()
+    report = session.update_latest_release("v1").commit()
 
     assert report.notes == [f"replaced view '{DATAFLOW}.summary'"]
-    session.update_latest_release("v1", overwrite=True)
+    target = '"catalog"."water"."surface"."bod_rivers"."summary"'
+    statements = dremio.statements
+    drop_sql = f"DROP VIEW IF EXISTS {target}"
+    drop = next(i for i, s in enumerate(statements) if s.startswith(drop_sql))
+    create = next(i for i, s in enumerate(statements) if s.startswith(f"CREATE VIEW {target}"))
+    assert drop < create
+    assert _views(dremio) >= {f"{DATAFLOW}.summary", f"{DATAFLOW}.eu_sdg.observations"}
+
+
+def test_a_replaced_view_makes_the_step_irreversible() -> None:
+    rest, dremio = _world()
+    session = _session(rest, dremio)
+    session.update_latest_release("v1").commit()  # the views now exist
+
+    session.update_latest_release("v1")
     session.set_tags("catalog.water.missing", ["x"])  # fails: path does not exist
     with pytest.raises(CatalogCommitError) as info:
         session.commit()
@@ -200,7 +255,7 @@ def test_an_existing_table_is_never_replaced() -> None:
     rest.existing.add(f"{DATAFLOW}.summary")
 
     with pytest.raises(CatalogCommitError, match="is a table — a view never replaces one"):
-        _session(rest, dremio).update_latest_release("v1", overwrite=True).commit()
+        _session(rest, dremio).update_latest_release("v1").commit()
 
     assert dremio.tables[f"{DATAFLOW}.summary"] == "TABLE"
 

@@ -504,6 +504,29 @@ class CatalogSession:
         and version folder this step created, or drops the tables it newly
         copied into an existing one; a table it overwrote cannot be restored, so a step that
         replaced any is irreversible (see `CatalogCommitError`)."""
+        return self._queue_version(
+            source_path,
+            version_name,
+            tables,
+            target_path,
+            overwrite=overwrite,
+            create_target_folder=create_target_folder,
+            include_views=False,
+        )
+
+    def _queue_version(
+        self,
+        source_path: str,
+        version_name: str,
+        tables: list[str] | None,
+        target_path: str | None,
+        *,
+        overwrite: bool,
+        create_target_folder: bool,
+        include_views: bool,
+    ) -> CatalogSession:
+        """`create_version`, plus `include_views` (see `createversion`) —
+        `draft_to_version` copies the draft's views as tables too."""
         try:
             source_path, version_name, tables = operations._check_version_args(  # noqa: SLF001
                 source_path, version_name, tables
@@ -534,7 +557,11 @@ class CatalogSession:
                 target_path=target_path,
                 overwrite=overwrite,
                 create_target_folder=create_target_folder,
+                include_views=include_views,
                 idempotency_key=key,
+            )
+            step.notes.extend(
+                f"copied view {view!r} as a table" for view in result.from_views
             )
             step.notes.extend(
                 f"skipped {table!r}: {reason}" for table, reason in result.skipped
@@ -586,20 +613,24 @@ class CatalogSession:
         folder is created if it doesn't exist yet. `tables` behaves exactly
         as in `create_version`: omitted or empty copies everything in
         ``draft``; an entry is a table or a folder (every table under it),
-        relative to ``draft`` or a full path; reference/vocabulary tables and
-        views are skipped and reported. An existing version is an error
-        unless ``overwrite=True``. Rollback is `create_version`'s."""
+        relative to ``draft`` or a full path; reference/vocabulary tables are
+        skipped and reported. Unlike `create_version`, views are not skipped:
+        each view in ``draft`` is copied into the version as a table (a
+        snapshot of what it returns), and the commit report's `notes` say
+        which. An existing version is an error unless ``overwrite=True``.
+        Rollback is `create_version`'s."""
         draft = self._find_draft()
         parent = operations._parent_path(draft)  # noqa: SLF001 — same-package internal
         if parent is None:
             raise CatalogSessionError(f"{draft!r} has no parent folder to put versions under")
-        return self.create_version(
+        return self._queue_version(
             draft,
             version_name,
             tables,
             f"{parent}.{VERSIONS_FOLDER}",
             overwrite=overwrite,
             create_target_folder=True,
+            include_views=True,
         )
 
     def _find_draft(self) -> str:
@@ -631,28 +662,31 @@ class CatalogSession:
         )
 
     def update_latest_release(
-        self, version_name: str, *, overwrite: bool = False
+        self, version_name: str, *, overwrite: bool = True
     ) -> CatalogSession:
-        """Queue a view at the dataflow's root for every table in
+        """Queue a view at the Area's root for every table in
         ``{context}.versions.{version_name}``, keeping the version's
         sub-folders: ``versions.v1.eu_sdg_06_30.monitoringsites`` gets the
         view ``{context}.eu_sdg_06_30.monitoringsites`` over it. Missing
         sub-folders are created.
 
-        The context must be a dataflow folder, exactly three levels below
-        the catalog root (``catalog.<domain>.<group>.<dataflow>``) — set it
-        with `use` first. Checked now, against Dremio, before anything is
-        queued: the context's depth, that ``{context}.versions`` exists, and
-        that ``{context}.versions.{version_name}`` exists; `CatalogSessionError`
+        The context must be an Area folder — a folder with both a ``draft``
+        and a ``versions`` folder just below it, typically
+        ``catalog.<domain>.<subdomain>.<area>`` — set it with `use` first.
+        Checked now, against Dremio, before anything is queued: that the
+        context has those two folders just below it, and that
+        ``{context}.versions.{version_name}`` exists; `CatalogSessionError`
         otherwise.
 
         The version's tables are listed when the step runs. Views in the
         version are skipped, and the commit report's `notes` say which. A
         table whose first sub-folder is ``draft`` or ``versions`` is refused,
-        since its view would land inside the dataflow's own draft or versions.
-        Before any view is created, every target is checked: an existing view is an
-        error unless ``overwrite=True``, which replaces it; an existing table
-        is always an error — a view never replaces one.
+        since its view would land inside the Area's own draft or versions.
+        Before any view is created, every target is checked: an existing view
+        is dropped and created again over the version (``overwrite=True``, the
+        default — re-pointing the views at a new version is the normal use);
+        ``overwrite=False`` makes it an error instead. An existing table is
+        always an error — a view never replaces one.
 
         Undo drops the views this step created and the folders it created
         for them. A view it replaced cannot be restored, so a step that
@@ -667,15 +701,19 @@ class CatalogSession:
         dataflow = self._require_dataflow_context()
         versions = f"{dataflow}.{VERSIONS_FOLDER}"
         version = f"{versions}.{version_name}"
-        for folder in (versions, version):
-            try:
-                found = self._catalog._catalog_rest.is_folder(folder)  # noqa: SLF001
-            except (EngineStartingError, CatalogAuthError) as exc:
-                raise CatalogSessionError(
-                    f"could not check whether {folder!r} exists: {exc}"
-                ) from exc
-            if not found:
-                raise CatalogSessionError(f"{folder!r} does not exist, or is not a folder")
+        missing = [
+            name
+            for name in (DRAFT_FOLDER, VERSIONS_FOLDER)
+            if not self._is_folder(f"{dataflow}.{name}")
+        ]
+        if missing:
+            raise CatalogSessionError(
+                f"{dataflow!r} is not an Area folder: it has no "
+                + " and no ".join(repr(name) for name in missing)
+                + " folder just below it — use() the Area folder first"
+            )
+        if not self._is_folder(version):
+            raise CatalogSessionError(f"{version!r} does not exist, or is not a folder")
         step = _Step(
             f"create views under {dataflow!r} for the tables in {version!r}",
             lambda catalog, key: None,  # replaced below, once `step` exists to report into
@@ -719,18 +757,22 @@ class CatalogSession:
         self._steps.append(step)
         return self
 
+    def _is_folder(self, path: str) -> bool:
+        """Whether `path` is a folder, checked against Dremio now."""
+        try:
+            return self._catalog._catalog_rest.is_folder(path)  # noqa: SLF001
+        except (EngineStartingError, CatalogAuthError) as exc:
+            raise CatalogSessionError(f"could not check whether {path!r} exists: {exc}") from exc
+
     def _require_dataflow_context(self) -> str:
-        """The context, if it is a dataflow folder: exactly three levels
-        below `_ROOT_SOURCE` — see `update_latest_release`."""
-        context = self._context
-        segments = context.split(".") if context else []
-        if len(segments) != 4 or segments[0] != _ROOT_SOURCE:
+        """The context — whether it is an Area folder is checked by
+        `update_latest_release` itself."""
+        if self._context is None:
             raise CatalogSessionError(
-                f"the context must be a dataflow folder, three levels below {_ROOT_SOURCE!r} "
-                f"({_ROOT_SOURCE}.<domain>.<group>.<dataflow>), not {context!r} — use() it first"
+                "no context is set — use() the Area folder "
+                f"({_ROOT_SOURCE}.<domain>.<subdomain>.<area>) first"
             )
-        assert context is not None
-        return context
+        return self._context
 
     def create_view(
         self,

@@ -231,6 +231,7 @@ class Catalog:
         target_path: str,
         overwrite: bool = False,
         create_target_folder: bool = True,
+        include_views: bool = False,
         idempotency_key: str,
     ) -> VersionResult:
         # Arrow Flight, not REST: it is a series of datacopy calls.
@@ -243,6 +244,7 @@ class Catalog:
             target_path=target_path,
             overwrite=overwrite,
             create_target_folder=create_target_folder,
+            include_views=include_views,
             idempotency_key=idempotency_key,
         )
 

@@ -270,6 +270,60 @@ def test_create_folder_raises_engine_starting_on_timeout() -> None:
         client.create_folder("a.b")
 
 
+_FORBIDDEN = httpx.Response(
+    403,
+    json={
+        "errorMessage": (
+            "Forbidden: User not authorized to perform CREATE_NAMESPACE, "
+            "privileges [ALTER] are required"
+        )
+    },
+)
+
+
+@respx.mock
+def test_create_folder_reads_403_on_an_existing_folder_as_already_there() -> None:
+    # The new RBAC model: only catalog_admin holds ALTER on a domain, and
+    # Dremio checks ALTER before existence — so passing through one is a 403.
+    respx.post(f"{BASE_URL}/api/v3/catalog").mock(return_value=_FORBIDDEN)
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/domain").mock(
+        return_value=httpx.Response(200, json={"entityType": "folder"})
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert client.create_folder("a.domain") is False
+
+
+@respx.mock
+def test_create_folder_raises_403_on_a_missing_folder() -> None:
+    respx.post(f"{BASE_URL}/api/v3/catalog").mock(return_value=_FORBIDDEN)
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/new").mock(return_value=httpx.Response(404))
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(CatalogOperationError, match="403"):
+        client.create_folder("a.new")
+
+
+@respx.mock
+def test_ensure_folder_path_passes_through_levels_it_may_not_alter() -> None:
+    def post(request: httpx.Request) -> httpx.Response:
+        path = json.loads(request.content)["path"]
+        if path == ["a", "domain"]:
+            return _FORBIDDEN
+        return httpx.Response(200, json={})
+
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/domain").mock(
+        return_value=httpx.Response(200, json={"entityType": "folder"})
+    )
+    respx.post(f"{BASE_URL}/api/v3/catalog").mock(side_effect=post)
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert client.ensure_folder_path("a.domain.flow") == ["a.domain.flow"]
+
+
 @respx.mock
 def test_create_folder_raises_on_other_errors() -> None:
     respx.post(f"{BASE_URL}/api/v3/catalog").mock(return_value=httpx.Response(500, text="boom"))

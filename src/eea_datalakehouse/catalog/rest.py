@@ -357,7 +357,13 @@ class CatalogRestClient:
 
     def create_folder(self, path: str) -> bool:
         """POST `path` into existence. Returns whether it was newly created
-        (False on 409 — it was already there)."""
+        (False on 409 — it was already there).
+
+        A 403 on a folder that already exists also returns False: Dremio
+        checks ALTER before it checks existence, so a caller without ALTER on
+        a level it only passes through (a domain or subdomain, which only
+        `catalog_admin` can alter) is refused even though nothing needs
+        creating. A 403 on a folder that doesn't exist is still raised."""
         try:
             resp = self._http.post(
                 f"{self._base_url}/api/v3/catalog",
@@ -369,11 +375,21 @@ class CatalogRestClient:
         # 409: it was already there (either from before this call, or a
         # concurrent creation) — the post-condition ("it exists now") still
         # holds either way.
+        if resp.status_code == 403 and self._exists_quietly(path):
+            return False
         if resp.status_code not in (200, 201, 409):
             raise CatalogOperationError(
                 f"could not create folder {path!r} ({resp.status_code}): {resp.text[:300]}"
             )
         return resp.status_code != 409
+
+    def _exists_quietly(self, path: str) -> bool:
+        """`exists`, but a refused lookup reads as "not found" — for
+        `create_folder`'s 403 check, where the 403 itself is what gets raised."""
+        try:
+            return self.exists(path)
+        except CatalogAuthError:
+            return False
 
     def ensure_folder_path(self, path: str) -> list[str]:
         """Create every missing folder level of `path`. Returns the levels
