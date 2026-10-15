@@ -10,6 +10,7 @@ exist.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -139,6 +140,36 @@ def test_list_walks_every_child_folder_and_returns_full_paths() -> None:
         "bwd.reference.water_temperature",
     ]
     assert executor.statements == []  # navigation only — no SQL at all
+
+
+def test_list_marks_each_entry_as_table_or_view() -> None:
+    rest = _tree()
+    rest.existing.add("bwd.reference.latest")
+    rest.views.add("bwd.reference.latest")
+    session = _session(rest)
+
+    listing = session.list("bwd.reference.sub")
+    assert listing.kinds == {
+        "bwd.reference.sub.deeper.codes": "TABLE",
+        "bwd.reference.sub.stations": "TABLE",
+    }
+    listing = session.list("bwd.reference")
+    assert listing.kinds["bwd.reference.latest"] == "VIEW"
+    assert json.loads(repr(listing)) == [
+        {"type": "VIEW", "name": "bwd.reference.latest"},
+        {"type": "TABLE", "name": "bwd.reference.sub.deeper.codes"},
+        {"type": "TABLE", "name": "bwd.reference.sub.stations"},
+        {"type": "TABLE", "name": "bwd.reference.water_temperature"},
+    ]
+
+
+def test_list_of_an_empty_folder_is_an_empty_json_array() -> None:
+    rest = FakeCatalogRest(existing={"a", "bwd", "bwd.empty"}, folders={"bwd", "bwd.empty"})
+
+    listing = _session(rest).list("bwd.empty")
+
+    assert listing == []
+    assert repr(listing) == "[]"
 
 
 def test_list_resolves_a_relative_path() -> None:
