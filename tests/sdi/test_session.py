@@ -185,7 +185,9 @@ def test_find_dotenv_walks_up_from_the_working_directory(
     monkeypatch.chdir(nested)
 
     assert find_dotenv() == tmp_path / ".env"
-    assert MetadataSession(env={}).dds_base_url().startswith("https://dds.parent.test")
+    assert MetadataSession(env={}).dds_base_url() == (
+        f"https://dds.parent.test  (from {tmp_path / '.env'})"
+    )
 
 
 def test_read_dotenv_value_last_assignment_wins(tmp_path: Path) -> None:
