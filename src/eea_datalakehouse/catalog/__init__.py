@@ -45,7 +45,13 @@ from .operations import (
     table2view,
 )
 from .rest import CatalogRestClient
-from .session import CatalogCommitError, CatalogSession, CatalogSessionError, CommitReport
+from .session import (
+    CatalogCommitError,
+    CatalogListing,
+    CatalogSession,
+    CatalogSessionError,
+    CommitReport,
+)
 from .sql import (
     FLIGHT_LOCATION_ENV_VAR,
     TRANSPORT_ENV_VAR,
@@ -62,6 +68,7 @@ __all__ = [
     "Catalog",
     "CatalogAuthError",
     "CatalogCommitError",
+    "CatalogListing",
     "CatalogOperationError",
     "CatalogRestClient",
     "CatalogSession",

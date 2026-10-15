@@ -30,10 +30,12 @@ catalog operation can't run before its target has actually been ingested
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from . import operations
 from .client import Catalog
@@ -86,6 +88,34 @@ class CommitReport:
 
     succeeded: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+
+
+class CatalogListing(list[str]):  # noqa: FURB189 — a real list, so it compares/pastes like one
+    """What `CatalogSession.list` returns: the full paths, as a plain
+    ``list[str]`` — compares equal to one, and each entry can be passed on
+    as is (e.g. in `create_version`'s `tables`) — plus `kinds`, each path's
+    ``"TABLE"`` or ``"VIEW"``. Displayed (repr, or a notebook cell's output)
+    as a JSON array of ``{"type": ..., "name": ...}`` objects — see
+    `as_dicts`."""
+
+    def __init__(self, entries: list[tuple[str, str]] | None = None) -> None:
+        entries = entries or []
+        super().__init__(path for path, _ in entries)
+        self.kinds: dict[str, str] = dict(entries)
+
+    def as_dicts(self) -> list[dict[str, str]]:
+        """One ``{"type": "TABLE" | "VIEW", "name": full path}`` per entry, in order."""
+        return [{"type": self.kinds.get(path, "?"), "name": path} for path in self]
+
+    def to_json(self, indent: int | None = 2) -> str:
+        """`as_dicts` as a JSON array."""
+        return json.dumps(self.as_dicts(), indent=indent)
+
+    def __repr__(self) -> str:
+        return self.to_json()
+
+    def _repr_pretty_(self, printer: Any, cycle: bool) -> None:
+        printer.text(repr(self))
 
 
 class _Irreversible(Exception):  # noqa: N818 — internal control-flow signal, not a user-facing error
@@ -1018,8 +1048,9 @@ class CatalogSession:
         path = self._resolve_path(path)
         return self._catalog.gettagsfrom(path, idempotency_key=self._key())
 
-    def list(self, path: str = "") -> list[str]:
-        """Full paths of every table and view under `path`: its own tables,
+    def list(self, path: str = "") -> CatalogListing:
+        """Full paths of every table and view under `path`, each shown with
+        whether it's a TABLE or a VIEW (see `CatalogListing`): its own tables,
         then every child folder's, at any depth. Found by walking the catalog
         tree folder by folder through Dremio's REST catalog API (see
         `CatalogRestClient.list_datasets`), so it lists what the catalog
@@ -1041,7 +1072,9 @@ class CatalogSession:
             path = self._context
         else:
             path = self._resolve_path(path)
-        return self._catalog._catalog_rest.list_datasets(path.split("."))  # noqa: SLF001
+        return CatalogListing(
+            self._catalog._catalog_rest.list_dataset_kinds(path.split("."))  # noqa: SLF001
+        )
 
     def schema(self, path: str) -> TableInfo:
         """The column schema and row count of `path` (see

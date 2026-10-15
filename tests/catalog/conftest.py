@@ -73,7 +73,8 @@ class FakeCatalogRest:
     should succeed rather than raise on a missing space. `folders` seeds
     which of those paths are specifically folders (for `is_folder`) —
     independent of `existing`, since a real entity could be a table/view
-    instead.
+    instead. `views` seeds which table/view paths `list_dataset_kinds`
+    reports as views (the rest are tables).
     """
 
     def __init__(
@@ -89,9 +90,11 @@ class FakeCatalogRest:
         raise_on_create_folder: Exception | None = None,
         raise_on_delete_folder: Exception | None = None,
         raise_on_exists: Exception | None = None,
+        views: set[str] | None = None,
     ) -> None:
         self.existing = set(existing or set())
         self.folders = set(folders or set())
+        self.views = set(views or set())
         self.created: list[str] = []
         self.deleted: list[str] = []
         self._wikis = dict(wikis or {})
@@ -127,6 +130,14 @@ class FakeCatalogRest:
         return sorted(
             p for p in self.existing if p.startswith(f"{path}.") and p not in self.folders
         )
+
+    def list_dataset_kinds(self, segments: list[str]) -> list[tuple[str, str]]:
+        """`list_datasets`, each path paired with "VIEW" if seeded in `views`,
+        else "TABLE"."""
+        return [
+            (path, "VIEW" if path in self.views else "TABLE")
+            for path in self.list_datasets(segments)
+        ]
 
     def is_table_or_view(self, path: str) -> bool:
         # Every seeded path is either a folder (if also in self.folders) or,
