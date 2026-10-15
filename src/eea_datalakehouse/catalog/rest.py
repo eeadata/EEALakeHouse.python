@@ -78,23 +78,33 @@ class CatalogRestClient:
 
     def list_datasets(self, segments: Sequence[str]) -> list[str]:
         """Full dot-paths of every table and view under the path made of
-        `segments`, found by walking the catalog tree: the folder's children,
-        then each child folder's children, and so on, at any depth.
+        `segments` — `list_dataset_kinds` without the kinds."""
+        return [path for path, _ in self.list_dataset_kinds(segments)]
+
+    def list_dataset_kinds(self, segments: Sequence[str]) -> list[tuple[str, str]]:
+        """``(full dot-path, "TABLE" or "VIEW")`` for every table and view
+        under the path made of `segments`, sorted by path, found by walking
+        the catalog tree: the folder's children, then each child folder's
+        children, and so on, at any depth.
 
         Uses the REST catalog API only — every level is read with the same
         by-path lookup Dremio's UI uses, following `nextPageToken` when a
         folder's children come in pages — so it sees exactly what the catalog
         holds, independent of how (or whether) a source reports its tables in
-        ``INFORMATION_SCHEMA``. A path that names a table or view itself
-        lists just that. Raises `CatalogOperationError` if the path doesn't
-        exist, `CatalogAuthError` if Dremio refuses the token.
+        ``INFORMATION_SCHEMA``. The kind comes from the same JSON: a child's
+        ``datasetType`` (``VIRTUAL`` is a view, anything else a table), or the
+        entity's own ``type`` (``VIRTUAL_DATASET``) for a path that names a
+        table or view itself — which lists just that. Raises
+        `CatalogOperationError` if the path doesn't exist, `CatalogAuthError`
+        if Dremio refuses the token.
         """
         root = self.get_entity(segments)
         if root is None:
             raise CatalogOperationError(f"{'.'.join(segments)!r} does not exist")
         if root.get("entityType") == "dataset":
-            return [".".join(segments)]
-        found: list[str] = []
+            kind = "VIEW" if root.get("type") == "VIRTUAL_DATASET" else "TABLE"
+            return [(".".join(segments), kind)]
+        found: list[tuple[str, str]] = []
         pending: list[tuple[list[str], dict[str, Any]]] = [(list(segments), root)]
         while pending:
             folder, entity = pending.pop()
@@ -103,7 +113,8 @@ class CatalogRestClient:
                 if not child_path:
                     continue
                 if child.get("type") == "DATASET":
-                    found.append(".".join(child_path))
+                    kind = "VIEW" if child.get("datasetType") == "VIRTUAL" else "TABLE"
+                    found.append((".".join(child_path), kind))
                 elif child.get("type") == "CONTAINER":
                     sub_entity = self.get_entity(child_path)
                     if sub_entity is not None:

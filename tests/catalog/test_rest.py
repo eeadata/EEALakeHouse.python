@@ -825,6 +825,31 @@ def test_list_datasets_of_a_table_lists_just_it() -> None:
 
 
 @respx.mock
+def test_list_dataset_kinds_tells_views_from_tables() -> None:
+    view = {**_child("DATASET", "s", "top", "v"), "datasetType": "VIRTUAL"}
+    table = {**_child("DATASET", "s", "top", "t"), "datasetType": "PROMOTED"}
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/s/top").mock(
+        return_value=httpx.Response(200, json=_container(["s", "top"], view, table))
+    )
+
+    assert CatalogRestClient(BASE_URL, "pat").list_dataset_kinds(["s", "top"]) == [
+        ("s.top.t", "TABLE"),
+        ("s.top.v", "VIEW"),
+    ]
+
+
+@respx.mock
+def test_list_dataset_kinds_of_a_view_itself() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/s/v").mock(
+        return_value=httpx.Response(
+            200, json={"entityType": "dataset", "type": "VIRTUAL_DATASET", "path": ["s", "v"]}
+        )
+    )
+
+    assert CatalogRestClient(BASE_URL, "pat").list_dataset_kinds(["s", "v"]) == [("s.v", "VIEW")]
+
+
+@respx.mock
 def test_list_datasets_missing_path_raises() -> None:
     respx.get(f"{BASE_URL}/api/v3/catalog/by-path/s/nope").mock(return_value=httpx.Response(404))
 
