@@ -232,7 +232,9 @@ def test_an_older_server_gets_the_definition_on_commit(tmp_path: Path) -> None:
 
 def test_without_a_definition_nothing_extra_is_sent(tmp_path: Path) -> None:
     client = PlanClient(plan=PLAN_JSON)
-    _job(_csv_folder(tmp_path), client).run()
+    # infer_schema=False: PY-6 would otherwise send inferred columns for an
+    # editable CSV ingest (test_folder_formats.py).
+    _job(_csv_folder(tmp_path), client, infer_schema=False).run()
     assert client.begin_calls[0]["definition"] is None
     assert client.commit_calls[0]["definition"] is None
 

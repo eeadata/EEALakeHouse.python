@@ -24,12 +24,15 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pyarrow as pa
 
 from .client import IngestApiError, IngestClient
 from .credentials import DremioCreds, load_base_url, load_creds
+from .formats import FORMATS, compare_columns, local_columns
 from .models import (
     BeginPlan,
     BeginResult,
+    ColumnDef,
     CommitResult,
     DataFormat,
     DryRunResult,
@@ -39,17 +42,13 @@ from .models import (
     StatusResult,
     TableDefinition,
     UploadTarget,
+    definition_payload,
 )
 from .progress import make_progress_bar
 
 logger = logging.getLogger("eea_datalakehouse.dds_ingestion")
 
 DEFAULT_PARALLELISM = 4
-_FORMAT_EXTENSIONS: dict[DataFormat, tuple[str, ...]] = {
-    "parquet": (".parquet",),
-    "csv": (".csv",),
-    "json": (".json", ".ndjson"),
-}
 
 
 class IngestStateError(RuntimeError):
@@ -85,7 +84,7 @@ def scan_folder(folder: Path, data_format: DataFormat) -> list[FileSpec]:
     platforms. Results are sorted for deterministic ordering.
     """
 
-    exts = _FORMAT_EXTENSIONS[data_format]
+    exts = FORMATS[data_format].extensions
     specs: list[FileSpec] = []
     for path in sorted(folder.rglob("*")):
         if not path.is_file():
@@ -145,6 +144,9 @@ class FolderIngest:
         multipart: bool | None = None,
         table_definition: TableDefinition | Mapping[str, Any] | None = None,
         cleanup_on_failure: bool = False,
+        csv_options: Mapping[str, Any] | None = None,
+        json_options: Mapping[str, Any] | None = None,
+        infer_schema: bool = True,
         show_progress: bool = True,
         client: IngestClient | None = None,
         base_url: str | None = None,
@@ -171,6 +173,15 @@ class FolderIngest:
         # DI-12.26: after a commit failure the server could retry, drop the
         # session (and its uploaded files) instead of keeping it for retry().
         self.cleanup_on_failure = cleanup_on_failure
+        # Parsing hints sent on begin (the server already accepts them).
+        self.csv_options = csv_options
+        self.json_options = json_options
+        # PY-6: for CSV/JSON into an editable table without a table_definition,
+        # infer the columns locally from every file and send them.
+        self.infer_schema = infer_schema
+        # The definition actually sent on begin (the caller's, or inferred); a
+        # server that did not take it on begin gets it again on commit.
+        self._sent_definition: TableDefinition | Mapping[str, Any] | None = None
         self.show_progress = show_progress
 
         # Set once ``begin`` runs (or by ``attach``); the handle every session
@@ -267,6 +278,7 @@ class FolderIngest:
             raise FileNotFoundError(
                 f"no {self.data_format} files found under {self.folder}"
             )
+        self._sent_definition = self._definition_to_send(files)
         begin = self._client.begin(
             target_catalog_path=self.target_catalog_path,
             intent=self.intent,
@@ -277,7 +289,9 @@ class FolderIngest:
             sub_path=self.sub_path,
             idempotency_key=self.idempotency_key,
             multipart=self.multipart,
-            definition=self.table_definition,
+            definition=self._sent_definition,
+            csv_options=self.csv_options,
+            json_options=self.json_options,
         )
         self._session_id = begin.session_id
         self._begin = begin
@@ -307,10 +321,69 @@ class FolderIngest:
             files=files,
             table_name=self.table_name,
             sub_path=self.sub_path,
-            definition=self.table_definition,
+            definition=self._definition_to_send(files),
+            csv_options=self.csv_options,
+            json_options=self.json_options,
         )
         self._report_plan(result.plan)
         return result
+
+    def _definition_to_send(
+        self, files: list[FileSpec]
+    ) -> TableDefinition | Mapping[str, Any] | None:
+        """The table definition begin should carry (PY-6).
+
+        * The caller's own, if given — for Parquet, its columns are first checked
+          against the local footers, so a mismatch fails here, before any upload,
+          with the server's ``schema_mismatch`` wording.
+        * Otherwise, for CSV/JSON into an **editable** table (the one case the
+          server creates the table from the given columns), the columns inferred
+          locally from every file, unless ``infer_schema=False``.
+        * Otherwise none.
+        """
+        fmt = FORMATS[self.data_format]
+        rel_paths = [f.rel_path for f in files]
+        if self.table_definition is not None:
+            given = (definition_payload(self.table_definition) or {}).get("columns") or []
+            if fmt.has_footer and given:
+                self._check_parquet_columns(rel_paths, given)
+            return self.table_definition
+        if fmt.has_footer or self.intent != "editable" or not self.infer_schema:
+            return None
+        options = self.csv_options if self.data_format == "csv" else self.json_options
+        try:
+            columns = local_columns(self.folder, rel_paths, self.data_format, options)
+        except (ValueError, pa.ArrowException) as exc:
+            logger.warning(
+                "could not infer the %s columns locally (%s); the server will ask for "
+                "them — pass table_definition=…",
+                self.data_format,
+                exc,
+            )
+            return None
+        inferred = TableDefinition(columns=tuple(ColumnDef(n, t) for n, t in columns))
+        summary = ", ".join(f"{n} {t}" for n, t in columns)
+        logger.info("inferred %s columns: %s", self.data_format, summary)
+        if self.show_progress:
+            print(f"Inferred columns: {summary}")
+        return inferred
+
+    def _check_parquet_columns(self, rel_paths: list[str], given: list[Mapping[str, Any]]) -> None:
+        """Refuse given Parquet columns that contradict the local footers, before
+        anything is uploaded — the same check the server runs at commit (DI-12.1d)."""
+        actual = local_columns(self.folder, rel_paths, "parquet", None)
+        problems = compare_columns(
+            [(str(c.get("name", "")), str(c.get("type", ""))) for c in given], actual
+        )
+        if problems:
+            err = IngestApiError(
+                422,
+                "the given columns do not match the Parquet files: " + "; ".join(problems),
+                where="local Parquet footer check (nothing was uploaded)",
+            )
+            err.error_slug = "schema_mismatch"
+            err.retryable = False
+            raise err
 
     def _report_plan(self, plan: BeginPlan) -> None:
         """Show what commit will do: printed when ``show_progress`` (the same
@@ -336,10 +409,11 @@ class FolderIngest:
         # A server that returned a plan took the definition on begin; an older
         # one (or an attached session, whose begin we did not see) gets it here.
         resend = self._begin is None or self._begin.plan is None
+        sent = self._sent_definition if self._begin is not None else self.table_definition
         return self._client.commit(
             session_id=self._session_id,
             multipart_etags=multipart_etags,
-            definition=self.table_definition if resend else None,
+            definition=sent if resend else None,
         )
 
     # -- session management -----------------------------------------------

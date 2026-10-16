@@ -202,6 +202,8 @@ class IngestClient:
         idempotency_key: str | None = None,
         multipart: bool | None = None,
         definition: TableDefinition | Mapping[str, Any] | None = None,
+        csv_options: Mapping[str, Any] | None = None,
+        json_options: Mapping[str, Any] | None = None,
     ) -> BeginResult:
         """Open a transfer (``POST /api/v1/ingest/begin``).
 
@@ -220,6 +222,8 @@ class IngestClient:
             idempotency_key=idempotency_key,
             multipart=multipart,
             definition=definition,
+            csv_options=csv_options,
+            json_options=json_options,
         )
         data = self._post("/api/v1/ingest/begin", body)
         return BeginResult.from_json(data)
@@ -235,6 +239,8 @@ class IngestClient:
         table_name: str | None = None,
         sub_path: str | None = None,
         definition: TableDefinition | Mapping[str, Any] | None = None,
+        csv_options: Mapping[str, Any] | None = None,
+        json_options: Mapping[str, Any] | None = None,
     ) -> DryRunResult:
         """Run every begin check and return the plan, creating nothing (DI-12.3).
 
@@ -254,6 +260,8 @@ class IngestClient:
             idempotency_key=None,
             multipart=None,
             definition=definition,
+            csv_options=csv_options,
+            json_options=json_options,
         )
         body["dry_run"] = True
         data = self._post("/api/v1/ingest/begin", body)
@@ -289,6 +297,8 @@ class IngestClient:
         idempotency_key: str | None,
         multipart: bool | None,
         definition: TableDefinition | Mapping[str, Any] | None,
+        csv_options: Mapping[str, Any] | None = None,
+        json_options: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """The begin request body; only the fields that were set are sent."""
         body: dict[str, Any] = {
@@ -310,6 +320,12 @@ class IngestClient:
         payload = definition_payload(definition)
         if payload is not None:
             body["definition"] = payload
+        # Parsing hints the server already accepts (CSV delimiter/quote/header;
+        # JSON layout); only for the format they describe.
+        if csv_options and data_format == "csv":
+            body["csv_options"] = dict(csv_options)
+        if json_options and data_format == "json":
+            body["json_options"] = dict(json_options)
         return body
 
     def commit(
