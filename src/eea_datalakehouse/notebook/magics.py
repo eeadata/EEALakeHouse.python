@@ -99,7 +99,13 @@ from IPython.display import HTML, display
 from ..catalog import Catalog
 from ..catalog.session import CatalogSession, CatalogSessionError
 from ..dds_ingestion.session import IngestSession, IngestSessionError
-from ..sdi.session import MetadataSession, MetadataSessionError, SdiSession, SdiSessionError
+from ..sdi.session import (
+    MetadataSession,
+    MetadataSessionError,
+    PushResult,
+    SdiSession,
+    SdiSessionError,
+)
 
 _USAGE = {
     "catalog": (
@@ -672,6 +678,32 @@ def _register_context_comm(shell: Any, magics: EEALakehouseMagics) -> None:
     comm_manager.register_target(_CONTEXT_COMM_TARGET, _on_comm_open)
 
 
+_DDS_PUSHED_COMM_TARGET = "eea_datalakehouse.dds_pushed"
+
+
+def _notify_dds_pushed(shell: Any, dds_path: str) -> None:
+    """Tell an integrated frontend (the JupyterLab Document Service panel,
+    in the separate `eeadata/EEALakeHouse` repo) that `%metadata
+    push_to_dds` just wrote a file, so the panel can refresh immediately
+    instead of waiting for its next poll tick.
+
+    Opposite direction from `_register_context_comm`: here the kernel opens
+    the comm rather than reacting to one. Best-effort and silent either
+    way — no live kernel comm_manager, or a frontend that never registered
+    `_DDS_PUSHED_COMM_TARGET` (no matching extension, or one without this
+    feature), both just leave the frontend as it was.
+    """
+    comm_manager = getattr(getattr(shell, "kernel", None), "comm_manager", None)
+    if comm_manager is None:
+        return
+    try:
+        from comm import create_comm
+
+        create_comm(target_name=_DDS_PUSHED_COMM_TARGET, data={"dds_path": dds_path}).close()
+    except Exception:
+        pass
+
+
 @magics_class
 class EEALakehouseMagics(Magics):
     """Registers `%catalog`, `%ingest`, `%sdi` and `%metadata` — see this module's docstring."""
@@ -825,6 +857,8 @@ class EEALakehouseMagics(Magics):
         result = _dispatch(
             self._metadata_session, line, self.shell.user_ns, "metadata", MetadataSessionError
         )
+        if isinstance(result, PushResult):
+            _notify_dds_pushed(self.shell, result.dds_path)
         return None if result is _DISPATCH_FAILED else result
 
 

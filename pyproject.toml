@@ -39,6 +39,7 @@ dev = [
     "mypy>=2.1",
     "respx>=0.23",       # mocks httpx for the ingestion test suite
     "types-tqdm",
+    "boto3>=1.35",       # debugger/s3_check.ipynb — lists an S3-compatible bucket
     "ipykernel>=6.29",   # run/debug notebooks against this environment
     "EEADataLakehouse[notebook]",
 ]
