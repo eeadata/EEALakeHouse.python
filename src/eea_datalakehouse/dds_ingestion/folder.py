@@ -25,7 +25,7 @@ from typing import Any
 
 import httpx
 
-from .client import IngestClient
+from .client import IngestApiError, IngestClient
 from .credentials import DremioCreds, load_base_url, load_creds
 from .models import (
     BeginPlan,
@@ -144,6 +144,7 @@ class FolderIngest:
         idempotency_key: str | None = None,
         multipart: bool | None = None,
         table_definition: TableDefinition | Mapping[str, Any] | None = None,
+        cleanup_on_failure: bool = False,
         show_progress: bool = True,
         client: IngestClient | None = None,
         base_url: str | None = None,
@@ -167,6 +168,9 @@ class FolderIngest:
         # into an editable table, and room for what later servers apply. Sent on
         # begin; the begin plan says which parts this server uses.
         self.table_definition = table_definition
+        # DI-12.26: after a commit failure the server could retry, drop the
+        # session (and its uploaded files) instead of keeping it for retry().
+        self.cleanup_on_failure = cleanup_on_failure
         self.show_progress = show_progress
 
         # Set once ``begin`` runs (or by ``attach``); the handle every session
@@ -237,9 +241,13 @@ class FolderIngest:
         try:
             etags, multipart_etags, uploaded, skipped = self._upload_all(begin)
         except Exception as err:
-            self._cancel_after_failed_upload(err)
+            self._cancel_after_failure(err)
             raise
-        commit = self.commit(multipart_etags=multipart_etags or None)
+        try:
+            commit = self.commit(multipart_etags=multipart_etags or None)
+        except IngestApiError as err:
+            self._after_failed_commit(err)
+            raise
         return IngestOutcome(
             begin=begin,
             commit=commit,
@@ -429,15 +437,36 @@ class FolderIngest:
 
     # -- upload phase -----------------------------------------------------
 
-    def _cancel_after_failed_upload(self, err: Exception) -> None:
-        """Cancel the session after an upload failed, and say so on ``err``.
+    def _after_failed_commit(self, err: IngestApiError) -> None:
+        """Describe a failed commit the way the server records it, and apply
+        ``cleanup_on_failure``. Best-effort: nothing here replaces ``err``.
 
-        An incomplete client upload cannot be resumed: the server only re-runs
-        the load (:meth:`retry`), and the session stays ``uploading`` until its
-        TTL. Cancelling now deletes whatever did land — for a read-only ingest
-        those files sit in the table's own folder — instead of leaving it for
-        the server's sweep. Best-effort: a failing cancel is noted, not raised,
-        so the upload error stays the one the caller sees.
+        The note is the session's own failure text (:meth:`StatusResult.
+        describe_failure`), the same the Transfers panel shows. A failure the
+        server cannot retry was already cleaned up server-side; a retryable one
+        is kept for :meth:`retry` unless ``cleanup_on_failure`` is set.
+        """
+        session_id = self._session_id
+        if session_id is None:
+            return
+        try:
+            err.add_note(self._client.get_status(session_id).describe_failure())
+        except Exception:  # noqa: BLE001 — the commit error is what matters
+            logger.debug("could not fetch the failed session's status", exc_info=True)
+        if self.cleanup_on_failure and err.retryable is True:
+            self._cancel_after_failure(err)
+
+    def _cancel_after_failure(self, err: Exception) -> None:
+        """Cancel the session after a failure, and say so on ``err``.
+
+        After a failed upload (PY-2): an incomplete client upload cannot be
+        resumed — the server only re-runs the load (:meth:`retry`) — and the
+        session would stay ``uploading`` until its TTL. After a failed commit,
+        only with ``cleanup_on_failure`` (see :meth:`_after_failed_commit`).
+        Cancelling deletes whatever did land — for a read-only ingest those files
+        sit in the table's own folder — instead of leaving it for the server's
+        sweep. Best-effort: a failing cancel is noted, not raised, so the
+        original error stays the one the caller sees.
         """
         session_id = self._session_id
         if session_id is None:

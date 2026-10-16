@@ -66,7 +66,15 @@ class IngestApiError(RuntimeError):
     It is part of the message because a transfer makes several different calls
     to two different systems, and "API error 500" alone does not say which one
     broke — see :class:`S3UploadError` for the other system.
+
+    ``error_slug`` is the DDS error's machine-readable ``error`` (e.g.
+    ``schema_required``; ``""`` when the body carried none) and ``retryable``
+    whether repeating the request — for a failed transfer, ``retry`` — can
+    succeed unchanged (``None`` from a server predating contract v0.8).
     """
+
+    error_slug: str = ""
+    retryable: bool | None = None
 
     def __init__(self, status_code: int, message: str, *, where: str | None = None) -> None:
         super().__init__(
@@ -530,9 +538,25 @@ class IngestClient:
         if resp.is_success:
             return
         message = cls._error_message(resp)
-        if cls._error_slug(resp) == "storage_unavailable":
-            raise StorageUnavailableError(resp.status_code, message, where=where)
-        raise IngestApiError(resp.status_code, message, where=where)
+        slug = cls._error_slug(resp)
+        err = (
+            StorageUnavailableError(resp.status_code, message, where=where)
+            if slug == "storage_unavailable"
+            else IngestApiError(resp.status_code, message, where=where)
+        )
+        err.error_slug = slug
+        err.retryable = cls._error_retryable(resp)
+        raise err
+
+    @staticmethod
+    def _error_retryable(resp: httpx.Response) -> bool | None:
+        """The ``retryable`` flag of a DDS error body (contract v0.8), or ``None``."""
+        try:
+            payload = resp.json()
+        except ValueError:
+            return None
+        value = payload.get("retryable") if isinstance(payload, dict) else None
+        return value if isinstance(value, bool) else None
 
     @classmethod
     def _raise_for_upload(

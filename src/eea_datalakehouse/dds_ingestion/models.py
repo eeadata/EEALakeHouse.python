@@ -362,6 +362,39 @@ class StatusResult:
         """
         return self.status == "failed" and bool(self.raw.get("resumable"))
 
+    @property
+    def failed_stage(self) -> str | None:
+        """Where a failed transfer broke: ``"upload"`` or ``"load"``."""
+        value = self.raw.get("failed_stage")
+        return str(value) if value else None
+
+    @property
+    def error_code(self) -> str | None:
+        """The failure's slug, e.g. ``"schema_required"`` (contract v0.8)."""
+        value = self.raw.get("error_code")
+        return str(value) if value else None
+
+    def describe_failure(self) -> str:
+        """The one way a failed transfer is described (DI-12.14).
+
+        Built only from the server's fields, worded exactly like the JupyterLab
+        extension's Transfers panel (``describeIngestFailure``), so a failure
+        reads alike in both. Fields an older server does not send are left out.
+        """
+        stage = self.failed_stage
+        head = f"Failed in the {stage} stage" if stage else "Failed"
+        if self.error_code:
+            head += f" ({self.error_code})"
+        if self.error:
+            head += f": {self.error}"
+        sentence = head if head.endswith((".", "!", "?")) else f"{head}."
+        resumable = self.raw.get("resumable")
+        if resumable is True:
+            return f"{sentence} Retry re-runs it with the files already uploaded."
+        if resumable is False and stage:
+            return f"{sentence} The uploaded files are gone; import the data again."
+        return sentence
+
 
 @dataclass(frozen=True, slots=True)
 class EstimateResult:
