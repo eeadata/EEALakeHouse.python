@@ -353,6 +353,31 @@ class IngestClient:
         self._raise_for_status(resp, f"GET /api/v1/ingest/{session_id}")
         return StatusResult.from_json(resp.json())
 
+    def health(self) -> None:
+        """Raise unless DDS answers its liveness probe (``GET /health``, no login)."""
+        resp = self._http.get(f"{self._base_url}/health")
+        self._raise_for_status(resp, "GET /health")
+
+    def limits(self, runner: str = "notebook") -> dict[str, Any]:
+        """The ingest size limits for this kind of client (``GET /api/v1/ingest/limits``,
+        contract v0.8). Needs a login, so it also proves the credential works."""
+        resp = self._http.get(
+            f"{self._base_url}/api/v1/ingest/limits",
+            params={"runner": runner},
+            headers=self._auth_headers,
+        )
+        self._raise_for_status(resp, "GET /api/v1/ingest/limits")
+        result: dict[str, Any] = resp.json()
+        return result
+
+    def storage_selftest(self) -> dict[str, Any]:
+        """Re-run DDS's S3 write test and return its verdict (``POST /storage-selftest``,
+        no login). ``storage_write_test.ok`` says whether ingest can write."""
+        resp = self._http.post(f"{self._base_url}/storage-selftest")
+        self._raise_for_status(resp, "POST /storage-selftest")
+        result: dict[str, Any] = resp.json()
+        return result
+
     def list_sessions(self, state: str | None = None) -> list[StatusResult]:
         """Your ingest sessions (``GET /api/v1/ingest``).
 

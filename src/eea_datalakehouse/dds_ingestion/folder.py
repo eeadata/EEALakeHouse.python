@@ -26,7 +26,7 @@ from typing import Any
 import httpx
 import pyarrow as pa
 
-from .client import IngestApiError, IngestClient
+from .client import IngestApiError, IngestClient, UnsupportedByServerError
 from .credentials import DremioCreds, load_base_url, load_creds
 from .formats import FORMATS, compare_columns, local_columns
 from .models import (
@@ -57,6 +57,27 @@ class IngestStateError(RuntimeError):
     Raised locally, before any HTTP call — e.g. committing a transfer that never
     began, or retrying one that is still running.
     """
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosisStep:
+    """One check of :meth:`FolderIngest.diagnose`; ``ok`` is ``None`` when skipped."""
+
+    name: str
+    ok: bool | None
+    detail: str
+
+
+@dataclass(slots=True)
+class Diagnosis:
+    """What :meth:`FolderIngest.diagnose` found, one step per check, in order."""
+
+    steps: list[DiagnosisStep] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """Whether every check that ran passed."""
+        return all(step.ok is not False for step in self.steps)
 
 
 @dataclass(slots=True)
@@ -400,6 +421,67 @@ class FolderIngest:
             err.error_slug = "schema_mismatch"
             err.retryable = False
             raise err
+
+    def diagnose(self) -> Diagnosis:
+        """Check, in plain language, whether this transfer would work — without
+        starting it (PY-7). Nothing is uploaded and no session is created.
+
+        In order: DDS reachable; the credential accepted; DDS's own S3 write test;
+        and a dry run of this exact folder, which covers the privileges on the
+        target, the target folder, collisions and the table definition. A check
+        that cannot run (DDS unreachable, a server predating it) is reported as
+        skipped, with the reason, instead of failing the ones after it.
+        """
+        result = Diagnosis()
+
+        def add(name: str, ok: bool | None, detail: str) -> None:
+            result.steps.append(DiagnosisStep(name, ok, detail))
+            if self.show_progress:
+                mark = {True: "✓", False: "✗", None: "–"}[ok]
+                print(f"{mark} {name}: {detail}")
+
+        try:
+            self._client.health()
+        except (httpx.HTTPError, IngestApiError) as exc:
+            add("DDS reachable", False, str(exc))
+            for name in ("Credential accepted", "Storage write test", "Dry run of this folder"):
+                add(name, None, "skipped: DDS is not reachable")
+            return result
+        add("DDS reachable", True, "the service answers")
+
+        try:
+            self._client.limits("notebook")
+            add("Credential accepted", True, "DDS accepts your Dremio credential")
+        except IngestApiError as exc:
+            if exc.status_code == 404:  # a server predating GET /ingest/limits
+                try:
+                    self._client.list_sessions()
+                    add("Credential accepted", True, "DDS accepts your Dremio credential")
+                except IngestApiError as inner:
+                    add("Credential accepted", False, inner.message)
+            else:
+                add("Credential accepted", False, exc.message)
+
+        try:
+            verdict = self._client.storage_selftest().get("storage_write_test") or {}
+            if verdict.get("ok"):
+                add("Storage write test", True, "DDS can write to its S3 storage")
+            elif verdict:
+                failures = "; ".join(str(f) for f in verdict.get("failures") or []) or "failed"
+                add("Storage write test", False, failures)
+            else:
+                add("Storage write test", None, "skipped: no verdict reported yet")
+        except IngestApiError as exc:
+            add("Storage write test", None, f"skipped: {exc.message}")
+
+        try:
+            dry = self.dry_run()
+            add("Dry run of this folder", True, dry.plan.describe())
+        except UnsupportedByServerError:
+            add("Dry run of this folder", None, "skipped: this DDS server has no dry run")
+        except (IngestApiError, FileNotFoundError, ValueError) as exc:
+            add("Dry run of this folder", False, str(getattr(exc, "message", exc)))
+        return result
 
     def _report_plan(self, plan: BeginPlan) -> None:
         """Show what commit will do: printed when ``show_progress`` (the same
