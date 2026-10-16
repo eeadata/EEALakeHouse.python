@@ -7,6 +7,7 @@ client keeps working if the server adds new keys.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -93,6 +94,109 @@ class S3Plan:
 
 
 @dataclass(frozen=True, slots=True)
+class ColumnDef:
+    """One column of a :class:`TableDefinition` (contract v0.8)."""
+
+    name: str
+    type: str  # a Dremio type: VARCHAR, BIGINT, DOUBLE, DECIMAL(10,2), …
+    nullable: bool | None = None  # accepted by the server; not applied yet
+    description: str | None = None  # accepted by the server; not applied yet
+
+    def as_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"name": self.name, "type": self.type}
+        if self.nullable is not None:
+            payload["nullable"] = self.nullable
+        if self.description is not None:
+            payload["description"] = self.description
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class TableDefinition:
+    """The optional table definition (contract v0.8, DI-12.1b).
+
+    One object with one meaning on begin, commit and retry. Every field is
+    optional; the server reports in the begin plan which parts the chosen process
+    and format apply (:attr:`BeginPlan.definition_ignored`). A plain ``dict`` in
+    the contract's shape is accepted wherever a ``TableDefinition`` is.
+    """
+
+    columns: tuple[ColumnDef, ...] = ()
+    partition_by: tuple[str, ...] = ()
+    sort_by: tuple[str, ...] = ()
+    version: int | None = None  # None → the server treats it as version 1
+
+    def as_payload(self) -> dict[str, Any]:
+        """The contract JSON, with only the fields that were set."""
+        payload: dict[str, Any] = {}
+        if self.version is not None:
+            payload["version"] = self.version
+        if self.columns:
+            payload["columns"] = [c.as_payload() for c in self.columns]
+        if self.partition_by:
+            payload["partition_by"] = list(self.partition_by)
+        if self.sort_by:
+            payload["sort_by"] = list(self.sort_by)
+        return payload
+
+
+def definition_payload(
+    definition: TableDefinition | Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """The request JSON for ``definition`` (a copy for a mapping), or ``None``."""
+    if definition is None:
+        return None
+    if isinstance(definition, TableDefinition):
+        return definition.as_payload()
+    return dict(definition)
+
+
+@dataclass(frozen=True, slots=True)
+class BeginPlan:
+    """What commit will do, decided at begin (contract v0.8, DI-12.2)."""
+
+    placement: str  # "staged" (editable) | "read_permanent" | "legacy"
+    table_path: str
+    storage_path: str | None
+    action: str  # "create" | "append" | "replace" | "fail"
+    definition_source: str
+    definition_applied: tuple[str, ...] = ()
+    definition_ignored: tuple[str, ...] = ()
+
+    @classmethod
+    def from_json(cls, data: Mapping[str, Any]) -> BeginPlan:
+        return cls(
+            placement=str(data.get("placement", "")),
+            table_path=str(data.get("table_path", "")),
+            storage_path=data.get("storage_path"),
+            action=str(data.get("action", "")),
+            definition_source=str(data.get("definition_source", "")),
+            definition_applied=tuple(str(x) for x in data.get("definition_applied") or ()),
+            definition_ignored=tuple(str(x) for x in data.get("definition_ignored") or ()),
+        )
+
+    def describe(self) -> str:
+        """One sentence on what the ingest will do — the same wording the
+        JupyterLab extension shows (``describeIngestPlan``)."""
+        kind = {
+            "read_permanent": "read-only table",
+            "staged": "editable table",
+        }.get(self.placement, "table")
+        where = (
+            f" (files kept at {self.storage_path})"
+            if self.placement == "read_permanent" and self.storage_path
+            else ""
+        )
+        if self.action == "create":
+            return f"Importing as a new {kind} at {self.table_path}{where}."
+        if self.action == "append":
+            return f"Appending to the existing {kind} at {self.table_path}{where}."
+        if self.action == "replace":
+            return f"Replacing the existing {kind} at {self.table_path}{where}."
+        return f"Importing into {self.table_path} ({self.action})."
+
+
+@dataclass(frozen=True, slots=True)
 class BeginResult:
     """Response from ``POST /api/v1/ingest/begin``."""
 
@@ -105,16 +209,30 @@ class BeginResult:
     # presigned, then the proxy on a network failure. Absent on older servers,
     # which never offered a choice: ``direct``.
     upload_mode: str = "direct"
+    # What commit will do (DI-12.2). ``None`` from a server predating it — which
+    # is also how a client knows that server ignored a definition sent on begin.
+    plan: BeginPlan | None = None
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> BeginResult:
+        plan = data.get("plan")
         return cls(
             session_id=data["session_id"],
             status=data["status"],
             s3=S3Plan.from_json(data["s3"]),
             collision=data.get("collision"),
             upload_mode=str(data.get("upload_mode") or "direct"),
+            plan=BeginPlan.from_json(plan) if isinstance(plan, Mapping) else None,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class DryRunResult:
+    """Response of a dry-run begin (DI-12.3): every check ran, nothing was created."""
+
+    plan: BeginPlan
+    key_prefix: str
+    collision: Any = None
 
 
 @dataclass(frozen=True, slots=True)

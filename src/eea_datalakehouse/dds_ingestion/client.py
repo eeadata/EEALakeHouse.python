@@ -29,6 +29,8 @@ header dict and is never logged by this module.
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Mapping
 from types import TracebackType
 from typing import Any
 
@@ -36,15 +38,19 @@ import httpx
 
 from .credentials import DremioCreds
 from .models import (
+    BeginPlan,
     BeginResult,
     CommitResult,
     DataFormat,
+    DryRunResult,
     EstimateResult,
     FileSpec,
     Intent,
     StageResult,
     StatusResult,
+    TableDefinition,
     UploadTarget,
+    definition_payload,
 )
 
 DEFAULT_TIMEOUT = 60.0
@@ -95,6 +101,14 @@ class StorageUnavailableError(IngestApiError):
         self.status_code = status_code
         self.message = message
         self.where = where
+
+
+class UnsupportedByServerError(IngestApiError):
+    """The DDS server is older than the feature this call needs (e.g. dry runs).
+
+    A subclass of :class:`IngestApiError`, so code that already catches that
+    keeps working.
+    """
 
 
 class S3UploadError(IngestApiError):
@@ -179,7 +193,96 @@ class IngestClient:
         sub_path: str | None = None,
         idempotency_key: str | None = None,
         multipart: bool | None = None,
+        definition: TableDefinition | Mapping[str, Any] | None = None,
     ) -> BeginResult:
+        """Open a transfer (``POST /api/v1/ingest/begin``).
+
+        ``definition`` (contract v0.8) is sent here when given; a server that took
+        it returns a :attr:`BeginResult.plan`. An older server ignores it, and the
+        caller then sends it on :meth:`commit` instead.
+        """
+        body = self._begin_body(
+            target_catalog_path=target_catalog_path,
+            intent=intent,
+            data_format=data_format,
+            conflict_mode=conflict_mode,
+            files=files,
+            table_name=table_name,
+            sub_path=sub_path,
+            idempotency_key=idempotency_key,
+            multipart=multipart,
+            definition=definition,
+        )
+        data = self._post("/api/v1/ingest/begin", body)
+        return BeginResult.from_json(data)
+
+    def dry_run(
+        self,
+        *,
+        target_catalog_path: str,
+        intent: Intent,
+        data_format: DataFormat,
+        conflict_mode: str,
+        files: list[FileSpec],
+        table_name: str | None = None,
+        sub_path: str | None = None,
+        definition: TableDefinition | Mapping[str, Any] | None = None,
+    ) -> DryRunResult:
+        """Run every begin check and return the plan, creating nothing (DI-12.3).
+
+        Raises the same errors a real :meth:`begin` would. A server predating
+        dry runs ignores the flag and opens a real session; that session is
+        cancelled straight away and :class:`UnsupportedByServerError` is raised,
+        so a dry run can never leave a transfer behind.
+        """
+        body = self._begin_body(
+            target_catalog_path=target_catalog_path,
+            intent=intent,
+            data_format=data_format,
+            conflict_mode=conflict_mode,
+            files=files,
+            table_name=table_name,
+            sub_path=sub_path,
+            idempotency_key=None,
+            multipart=None,
+            definition=definition,
+        )
+        body["dry_run"] = True
+        data = self._post("/api/v1/ingest/begin", body)
+        plan = data.get("plan")
+        if data.get("status") == "dry_run" and isinstance(plan, Mapping):
+            return DryRunResult(
+                plan=BeginPlan.from_json(plan),
+                key_prefix=str((data.get("s3") or {}).get("key_prefix", "")),
+                collision=data.get("collision"),
+            )
+        session_id = data.get("session_id")
+        if session_id:
+            # Best-effort: the server's TTL sweep collects an empty session.
+            with contextlib.suppress(IngestApiError):
+                self.cancel(str(session_id))
+        raise UnsupportedByServerError(
+            0,
+            "this DDS server does not support dry runs (contract v0.8); the session "
+            "it opened instead was cancelled",
+            where="POST /api/v1/ingest/begin",
+        )
+
+    @staticmethod
+    def _begin_body(
+        *,
+        target_catalog_path: str,
+        intent: Intent,
+        data_format: DataFormat,
+        conflict_mode: str,
+        files: list[FileSpec],
+        table_name: str | None,
+        sub_path: str | None,
+        idempotency_key: str | None,
+        multipart: bool | None,
+        definition: TableDefinition | Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """The begin request body; only the fields that were set are sent."""
         body: dict[str, Any] = {
             "target_catalog_path": target_catalog_path,
             "intent": intent,
@@ -196,19 +299,22 @@ class IngestClient:
             body["idempotency_key"] = idempotency_key
         if multipart is not None:
             body["multipart"] = multipart
-        data = self._post("/api/v1/ingest/begin", body)
-        return BeginResult.from_json(data)
+        payload = definition_payload(definition)
+        if payload is not None:
+            body["definition"] = payload
+        return body
 
     def commit(
         self,
         *,
         session_id: str,
-        definition: dict[str, Any] | None = None,
+        definition: TableDefinition | Mapping[str, Any] | None = None,
         multipart_etags: list[dict[str, Any]] | None = None,
     ) -> CommitResult:
         body: dict[str, Any] = {"session_id": session_id}
-        if definition is not None:
-            body["definition"] = definition
+        payload = definition_payload(definition)
+        if payload is not None:
+            body["definition"] = payload
         if multipart_etags:
             # DI-7.2 commit shape: [{rel_path, upload_id, parts:[{part_number, etag}]}]
             body["multipart_etags"] = multipart_etags

@@ -17,6 +17,7 @@ layer can be mocked or swapped in tests.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,13 +28,16 @@ import httpx
 from .client import IngestClient
 from .credentials import DremioCreds, load_base_url, load_creds
 from .models import (
+    BeginPlan,
     BeginResult,
     CommitResult,
     DataFormat,
+    DryRunResult,
     EstimateResult,
     FileSpec,
     Intent,
     StatusResult,
+    TableDefinition,
     UploadTarget,
 )
 from .progress import make_progress_bar
@@ -139,6 +143,7 @@ class FolderIngest:
         parallelism: int = DEFAULT_PARALLELISM,
         idempotency_key: str | None = None,
         multipart: bool | None = None,
+        table_definition: TableDefinition | Mapping[str, Any] | None = None,
         show_progress: bool = True,
         client: IngestClient | None = None,
         base_url: str | None = None,
@@ -158,6 +163,10 @@ class FolderIngest:
         self.parallelism = parallelism
         self.idempotency_key = idempotency_key
         self.multipart = multipart
+        # Optional table definition (contract v0.8): column types for CSV/JSON
+        # into an editable table, and room for what later servers apply. Sent on
+        # begin; the begin plan says which parts this server uses.
+        self.table_definition = table_definition
         self.show_progress = show_progress
 
         # Set once ``begin`` runs (or by ``attach``); the handle every session
@@ -260,10 +269,50 @@ class FolderIngest:
             sub_path=self.sub_path,
             idempotency_key=self.idempotency_key,
             multipart=self.multipart,
+            definition=self.table_definition,
         )
         self._session_id = begin.session_id
         self._begin = begin
+        if begin.plan is not None:
+            self._report_plan(begin.plan)
         return begin
+
+    def dry_run(self) -> DryRunResult:
+        """Check this transfer without starting it (DI-12.3).
+
+        Runs every check ``begin`` runs — privileges, the target folder, storage,
+        collisions, the table definition — and returns (and shows) what commit
+        would do. Nothing is uploaded and no session is created. Raises what a
+        real begin would raise, or :class:`UnsupportedByServerError` against a
+        DDS server that predates dry runs.
+        """
+        files = scan_folder(self.folder, self.data_format)
+        if not files:
+            raise FileNotFoundError(
+                f"no {self.data_format} files found under {self.folder}"
+            )
+        result = self._client.dry_run(
+            target_catalog_path=self.target_catalog_path,
+            intent=self.intent,
+            data_format=self.data_format,
+            conflict_mode=self.conflict_mode,
+            files=files,
+            table_name=self.table_name,
+            sub_path=self.sub_path,
+            definition=self.table_definition,
+        )
+        self._report_plan(result.plan)
+        return result
+
+    def _report_plan(self, plan: BeginPlan) -> None:
+        """Show what commit will do: printed when ``show_progress`` (the same
+        switch as the progress bar), always logged; the parts of the table
+        definition this server will not apply are a warning, never silent."""
+        logger.info("ingest plan: %s", plan.describe())
+        if self.show_progress:
+            print(plan.describe())
+        for line in plan.definition_ignored:
+            logger.warning("table definition not applied — %s", line)
 
     def commit(
         self, *, multipart_etags: list[dict[str, object]] | None = None
@@ -276,8 +325,13 @@ class FolderIngest:
         """
         if self._session_id is None:
             raise IngestStateError("no session to commit — call begin() or run() first")
+        # A server that returned a plan took the definition on begin; an older
+        # one (or an attached session, whose begin we did not see) gets it here.
+        resend = self._begin is None or self._begin.plan is None
         return self._client.commit(
-            session_id=self._session_id, multipart_etags=multipart_etags
+            session_id=self._session_id,
+            multipart_etags=multipart_etags,
+            definition=self.table_definition if resend else None,
         )
 
     # -- session management -----------------------------------------------

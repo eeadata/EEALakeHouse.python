@@ -32,6 +32,7 @@ from .client import (
     IngestClient,
     S3UploadError,
     StorageUnavailableError,
+    UnsupportedByServerError,
 )
 from .credentials import (
     DremioCreds,
@@ -48,9 +49,12 @@ from .folder import (
     scan_folder,
 )
 from .models import (
+    BeginPlan,
     BeginResult,
+    ColumnDef,
     CommitResult,
     DataFormat,
+    DryRunResult,
     EstimateResult,
     FileSpec,
     Intent,
@@ -58,16 +62,20 @@ from .models import (
     S3Plan,
     StageResult,
     StatusResult,
+    TableDefinition,
     UploadPart,
     UploadTarget,
 )
 
 __all__ = [
     "DEFAULT_PARALLELISM",
+    "BeginPlan",
     "BeginResult",
+    "ColumnDef",
     "CommitResult",
     "DataFormat",
     "DremioCreds",
+    "DryRunResult",
     "EstimateResult",
     "FileSpec",
     "FolderIngest",
@@ -83,6 +91,8 @@ __all__ = [
     "StageResult",
     "StatusResult",
     "StorageUnavailableError",
+    "TableDefinition",
+    "UnsupportedByServerError",
     "UploadPart",
     "UploadTarget",
     "ingest_folder",
