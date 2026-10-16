@@ -296,10 +296,13 @@ class IngestClient:
     def upload_file(self, target: UploadTarget, data: bytes) -> str | None:
         """Upload one file's bytes to its presigned target.
 
-        For a pre-signed **POST policy** (the default, ``method == "POST"``) this
-        submits the form ``fields`` plus a ``file`` part as multipart/form-data;
-        for a legacy pre-signed PUT it streams the body. Returns the ETag header
-        if supplied, else ``None``; raises :class:`IngestApiError` on non-2xx.
+        For a pre-signed **PUT** (what DDS issues since contract v0.7) this sends
+        the bytes as the body with the target's signed ``headers``; for a
+        pre-signed **POST policy** (older servers, ``method == "POST"``) it
+        submits the form ``fields`` plus a ``file`` part as multipart/form-data.
+        Returns the ETag header if supplied, else ``None``; raises
+        :class:`S3UploadError` on non-2xx, and lets an ``httpx.TransportError``
+        (unreachable endpoint, TLS, timeout) through unchanged.
 
         Multipart targets (DI-7) are handled by :meth:`upload_file_multipart`,
         which returns the per-part ETags; this method covers the small-file path.
@@ -322,7 +325,7 @@ class IngestClient:
                 data=target.fields,
                 files={"file": (target.rel_path, data)},
             )
-        else:  # legacy pre-signed PUT
+        else:  # pre-signed PUT, the normal path since contract v0.7
             resp = self._http.request(
                 target.method, target.url, content=data, headers=target.headers
             )

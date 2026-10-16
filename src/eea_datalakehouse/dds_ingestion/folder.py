@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from .client import IngestClient
 from .credentials import DremioCreds, load_base_url, load_creds
 from .models import (
@@ -223,7 +225,11 @@ class FolderIngest:
         context manager (or call :meth:`close`) to release it.
         """
         begin = self.begin()
-        etags, multipart_etags, uploaded, skipped = self._upload_all(begin)
+        try:
+            etags, multipart_etags, uploaded, skipped = self._upload_all(begin)
+        except Exception as err:
+            self._cancel_after_failed_upload(err)
+            raise
         commit = self.commit(multipart_etags=multipart_etags or None)
         return IngestOutcome(
             begin=begin,
@@ -369,6 +375,33 @@ class FolderIngest:
 
     # -- upload phase -----------------------------------------------------
 
+    def _cancel_after_failed_upload(self, err: Exception) -> None:
+        """Cancel the session after an upload failed, and say so on ``err``.
+
+        An incomplete client upload cannot be resumed: the server only re-runs
+        the load (:meth:`retry`), and the session stays ``uploading`` until its
+        TTL. Cancelling now deletes whatever did land — for a read-only ingest
+        those files sit in the table's own folder — instead of leaving it for
+        the server's sweep. Best-effort: a failing cancel is noted, not raised,
+        so the upload error stays the one the caller sees.
+        """
+        session_id = self._session_id
+        if session_id is None:
+            return
+        try:
+            self.cancel()
+        except Exception as cancel_err:  # noqa: BLE001 — reported on err instead
+            logger.warning("could not cancel %s after a failed upload: %s", session_id, cancel_err)
+            err.add_note(
+                f"DDS could not cancel session {session_id} ({cancel_err}); the "
+                "server's sweep removes its uploaded files after the session's TTL."
+            )
+        else:
+            err.add_note(
+                f"Session {session_id} was cancelled and the files it had uploaded "
+                "were deleted; run the ingest again."
+            )
+
     def _already_done(self, session_id: str) -> set[str]:
         """Return rel_paths already uploaded for this session (resume support).
 
@@ -418,22 +451,31 @@ class FolderIngest:
             if not pending:
                 return etags, multipart_etags, 0, skipped
             with ThreadPoolExecutor(max_workers=self.parallelism) as pool:
-                futures = {pool.submit(self._upload_one, t): t for t in pending}
-                for future in as_completed(futures):
-                    target = futures[future]
-                    etag, parts = future.result()
-                    if parts is not None:
-                        multipart_etags.append(
-                            {
-                                "rel_path": target.rel_path,
-                                "upload_id": target.upload_id,
-                                "parts": parts,
-                            }
-                        )
-                    elif etag is not None:
-                        etags[target.rel_path] = etag
-                    if bar is not None:
-                        bar.update(1)
+                futures = {
+                    pool.submit(self._upload_one, t, begin): t for t in pending
+                }
+                try:
+                    for future in as_completed(futures):
+                        target = futures[future]
+                        etag, parts = future.result()
+                        if parts is not None:
+                            multipart_etags.append(
+                                {
+                                    "rel_path": target.rel_path,
+                                    "upload_id": target.upload_id,
+                                    "parts": parts,
+                                }
+                            )
+                        elif etag is not None:
+                            etags[target.rel_path] = etag
+                        if bar is not None:
+                            bar.update(1)
+                except BaseException:
+                    # Stop at the first failure: leaving the ``with`` block would
+                    # otherwise still run every queued upload before re-raising.
+                    for queued in futures:
+                        queued.cancel()
+                    raise
         finally:
             if bar is not None:
                 bar.close()
@@ -441,19 +483,49 @@ class FolderIngest:
         return etags, multipart_etags, len(pending), skipped
 
     def _upload_one(
-        self, target: UploadTarget
+        self, target: UploadTarget, begin: BeginResult
     ) -> tuple[str | None, list[dict[str, object]] | None]:
         """Upload one file; return ``(single_etag, multipart_parts)``.
 
-        Exactly one element is non-``None``: a single-shot upload yields the ETag
+        At most one element is non-``None``: a single-shot upload yields the ETag
         (or ``None`` if S3 omitted it); a multipart upload yields the per-part
-        ETag list and the single ETag is ``None``.
+        ETag list; a file sent through DDS (``/stage``) yields neither.
+
+        Honours the server's ``upload_mode`` (contract upload-mode rule, the same
+        one the JupyterLab extension implements): ``proxy`` always goes through
+        DDS; ``direct`` uses the presigned target only; ``auto`` uses it and, if
+        it fails at the **network** layer (unreachable endpoint, DNS, TLS,
+        timeout), sends the file through DDS instead. An HTTP error from S3 is
+        not retried through DDS: that is a signing or permission problem the
+        proxy would not fix.
         """
         data = (self.folder / target.rel_path).read_bytes()
-        if target.is_multipart:
-            parts = self._client.upload_file_multipart(target, data)
-            return None, [dict(p) for p in parts]
-        return self._client.upload_file(target, data), None
+        if begin.upload_mode == "proxy":
+            return self._stage(begin.session_id, target, data)
+        try:
+            if target.is_multipart:
+                parts = self._client.upload_file_multipart(target, data)
+                return None, [dict(p) for p in parts]
+            return self._client.upload_file(target, data), None
+        except httpx.TransportError as exc:
+            if begin.upload_mode != "auto":
+                raise
+            logger.warning(
+                "presigned upload of %s failed at the network layer (%s); "
+                "sending it through DDS instead",
+                target.rel_path,
+                exc,
+            )
+            return self._stage(begin.session_id, target, data)
+
+    def _stage(
+        self, session_id: str, target: UploadTarget, data: bytes
+    ) -> tuple[None, None]:
+        """Send one file through DDS (``POST /ingest/stage``), which writes it to
+        S3 with its own credentials. A file the server planned as multipart goes
+        through whole; DDS accepts that at commit (DI-12.10a)."""
+        self._client.stage(session_id, target.rel_path, data)
+        return None, None
 
 
 def ingest_folder(

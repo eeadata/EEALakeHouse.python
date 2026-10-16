@@ -100,6 +100,11 @@ class BeginResult:
     status: str
     s3: S3Plan
     collision: Any = None
+    # How the server wants the bytes sent (DDS_INGEST_UPLOAD_MODE): ``direct`` —
+    # presigned only; ``proxy`` — through ``POST /ingest/stage``; ``auto`` —
+    # presigned, then the proxy on a network failure. Absent on older servers,
+    # which never offered a choice: ``direct``.
+    upload_mode: str = "direct"
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> BeginResult:
@@ -108,6 +113,7 @@ class BeginResult:
             status=data["status"],
             s3=S3Plan.from_json(data["s3"]),
             collision=data.get("collision"),
+            upload_mode=str(data.get("upload_mode") or "direct"),
         )
 
 
