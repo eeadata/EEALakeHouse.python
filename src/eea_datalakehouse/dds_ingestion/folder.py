@@ -41,6 +41,7 @@ from .models import (
     Intent,
     StatusResult,
     TableDefinition,
+    UploadMode,
     UploadTarget,
     definition_payload,
 )
@@ -275,13 +276,19 @@ class FolderIngest:
             upload_mode="proxy" if self._uses_proxy(begin) else "direct",
         )
 
+    def _effective_upload_mode(self, begin: BeginResult) -> str:
+        """How the files go: this ingest's own ``upload_mode`` when it forces one
+        (``"direct"`` or ``"proxy"``), else — with ``"auto"`` — the server's
+        ``begin.upload_mode`` (``direct``, ``proxy`` or ``auto``)."""
+        if self.upload_mode in ("direct", "proxy"):
+            return self.upload_mode
+        return begin.upload_mode
+
     def _uses_proxy(self, begin: BeginResult) -> bool:
-        """Whether to send the files through DDS rather than to S3 directly:
+        """Whether every file goes through DDS rather than to S3 directly:
         always with ``upload_mode="proxy"``, never with ``"direct"``, and with
         ``"auto"`` when ``begin`` says ``upload_mode: "proxy"``."""
-        if self.upload_mode == "auto":
-            return begin.upload_mode == "proxy"
-        return self.upload_mode == "proxy"
+        return self._effective_upload_mode(begin) == "proxy"
 
     def begin(self) -> BeginResult:
         """Open the transfer and get the presigned upload targets (step 1 of 3).
@@ -667,8 +674,10 @@ class FolderIngest:
         (or ``None`` if S3 omitted it); a multipart upload yields the per-part
         ETag list; a file sent through DDS (``/stage``) yields neither.
 
-        Honours the server's ``upload_mode`` (contract upload-mode rule, the same
-        one the JupyterLab extension implements): ``proxy`` always goes through
+        Honours the effective upload mode — this ingest's own ``upload_mode``
+        when it forces ``direct`` or ``proxy``, else the server's (contract
+        upload-mode rule, the same one the JupyterLab extension implements):
+        ``proxy`` always goes through
         DDS; ``direct`` uses the presigned target only; ``auto`` uses it and, if
         it fails at the **network** layer (unreachable endpoint, DNS, TLS,
         timeout), sends the file through DDS instead. An HTTP error from S3 is
@@ -676,7 +685,8 @@ class FolderIngest:
         proxy would not fix.
         """
         data = (self.folder / target.rel_path).read_bytes()
-        if begin.upload_mode == "proxy":
+        mode = self._effective_upload_mode(begin)
+        if mode == "proxy":
             return self._stage(begin.session_id, target, data)
         try:
             if target.is_multipart:
@@ -684,7 +694,7 @@ class FolderIngest:
                 return None, [dict(p) for p in parts]
             return self._client.upload_file(target, data), None
         except httpx.TransportError as exc:
-            if begin.upload_mode != "auto":
+            if mode != "auto":
                 raise
             logger.warning(
                 "presigned upload of %s failed at the network layer (%s); "
