@@ -111,6 +111,7 @@ class GpkgSession:
             "srid": srid,
             "overwrite": overwrite,
             "workers": workers,
+            "progress": _print_now,  # a line per table as it finishes, or fails
         }
         if self._controller is not None:
             return self._controller.export(catalog_path, output, **options)  # type: ignore[arg-type]
@@ -134,6 +135,10 @@ class GpkgSession:
                 "pick one with %catalog use(...) or pass its path"
             )
         return resolved
+
+
+def _print_now(line: str) -> None:
+    print(line, flush=True)
 
 
 def output_file(catalog_path: str, filename: str | None, output_dir: str | None) -> Path:
