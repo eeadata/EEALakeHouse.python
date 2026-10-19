@@ -86,7 +86,7 @@ def ip(shell: Any) -> Any:
     instance._catalog_session = None
     instance._ingest_session = None
     instance._sdi_session = None
-    instance._metadata_session = None
+    instance._dds_session = None
     return shell
 
 
@@ -271,6 +271,11 @@ def test_ingest_magic_queues_onto_one_shared_session(ip: Any) -> None:
     assert repr(session) == "IngestSession(pending=1)"
 
 
+def test_ingest_diagnose_with_nothing_queued(ip: Any, capsys: pytest.CaptureFixture[str]) -> None:
+    ip.run_line_magic("ingest", "diagnose")  # bare name, like commit
+    assert "nothing queued" in capsys.readouterr().out
+
+
 def test_empty_line_prints_usage(ip: Any, capsys: pytest.CaptureFixture[str]) -> None:
     # No credentials needed to reach the usage message — it's printed before
     # a session is ever built.
@@ -397,8 +402,12 @@ def test_ingest_help_lists_methods(
     table_html = displayed[0].data
     assert "Command" in table_html and "Parameters" in table_html and "Description" in table_html
     assert ">ingest<" in table_html and ">commit<" in table_html
+    assert ">diagnose<" in table_html
     assert "folder, target_catalog_path" in table_html
     assert "retry=False, max_retries=3" in table_html
+    # PY-11: the one-line options show, with their defaults.
+    assert "csv_options=None" in table_html and "upload_mode=&#x27;auto&#x27;" in table_html
+    assert "cleanup_on_failure=False" in table_html
     assert "str | None" not in table_html  # no Python type-hint syntax leaking into the table
     assert _magics_instance(ip)._ingest_session is None
 
@@ -433,44 +442,94 @@ def test_sdi_session_error_is_printed_not_raised(
     assert "sdi error: uuid must not be empty" in capsys.readouterr().out
 
 
-def test_metadata_push_before_sdi_get_xml_is_printed_not_raised(
+def test_dds_push_without_a_context_is_printed_not_raised(
     ip: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert ip.run_line_magic("metadata", 'push_to_dds("a/b")') is None
+    assert ip.run_line_magic("dds", 'push(METADATA, "x.xml")') is None
 
-    assert "metadata error: nothing to push yet — run %sdi get_xml" in capsys.readouterr().out
+    assert "dds error: no DDS target path" in capsys.readouterr().out
 
 
-def test_metadata_pushes_the_record_sdi_fetched_last(
+class _FakeDdsSession:
+    """Records what `%dds push` receives; the target comes from `resolve_path`."""
+
+    def __init__(self, resolve_path: Any) -> None:
+        self._resolve_path = resolve_path
+        self.calls: list[tuple[object, object, str | None, bool]] = []
+
+    def push(
+        self, folder: object, *files: object, path: str | None = None, overwrite: bool = True
+    ) -> object:
+        target = self._resolve_path(path)
+        self.calls.append((folder, files, target, overwrite))
+        return magics_module.PushReport(
+            f"{target}/x", (f"{target}/x/a.pdf", f"{target}/x/b.pdf"), overwrite
+        )
+
+
+def test_dds_pushes_to_the_catalog_context_with_bare_folder_names(
     ip: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    pushed: list[object] = []
+    fake = _FakeCatalogSession()
+    monkeypatch.setattr(magics_module, "_build_catalog_session", lambda: fake)
+    monkeypatch.setattr(magics_module, "_build_dds_session", _FakeDdsSession)
+    notified: list[str] = []
+    monkeypatch.setattr(
+        magics_module, "_notify_dds_pushed", lambda shell, path: notified.append(path)
+    )
 
-    class _FakeSdiSession:
-        last: object = None
+    # %dds built first: the context is still looked up at push time.
+    ip.run_line_magic("dds", "help")
+    ip.run_line_magic("catalog", 'use("catalog.water.bwd")')
+    report = ip.run_line_magic("dds", 'push(DELIVERABLES, "a.pdf", "b.pdf", overwrite=False)')
 
-        def get_xml(self, uuid: str) -> str:
-            self.last = f"record {uuid}"
-            return self.last
+    session = _magics_instance(ip)._dds_session
+    assert session.calls == [
+        (magics_module.DdsFolder.DELIVERABLES, ("a.pdf", "b.pdf"), "catalog.water.bwd", False)
+    ]
+    assert report.paths == ("catalog.water.bwd/x/a.pdf", "catalog.water.bwd/x/b.pdf")
+    assert notified == list(report.paths)
 
-    class _FakeMetadataSession:
-        def __init__(self, last: Any) -> None:
-            self._last = last
 
-        def push_to_dds(self, dds_path: str) -> str:
-            pushed.append(self._last())
-            return f"pushed to {dds_path}"
+def test_dds_folder_names_win_over_notebook_variables(
+    ip: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(magics_module, "_build_dds_session", _FakeDdsSession)
+    _magics_instance(ip)._pending_context = "catalog.air"
+    ip.user_ns["METADATA"] = "assessments"
+    try:
+        ip.run_line_magic("dds", 'push(METADATA, "a.pdf")')
+        ip.run_line_magic("dds", 'push(DdsFolder.OTHERS, "a.pdf")')
+    finally:
+        del ip.user_ns["METADATA"]
 
-    monkeypatch.setattr(magics_module, "_build_sdi_session", _FakeSdiSession)
-    monkeypatch.setattr(magics_module, "_build_metadata_session", _FakeMetadataSession)
+    calls = _magics_instance(ip)._dds_session.calls
+    assert [call[0] for call in calls] == [
+        magics_module.DdsFolder.METADATA,
+        magics_module.DdsFolder.OTHERS,
+    ]
 
-    # %metadata built first: the record is still looked up at push time.
-    ip.run_line_magic("metadata", "help")
-    assert ip.run_line_magic("metadata", 'push_to_dds("a/b")') == "pushed to a/b"
-    ip.run_line_magic("sdi", 'get_xml("u-1")')
-    ip.run_line_magic("metadata", 'push_to_dds("a/b")')
 
-    assert pushed == [None, "record u-1"]
+def test_dds_target_resolves_path_like_catalog(ip: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    from eea_datalakehouse.catalog.session import CatalogSession
+
+    real = CatalogSession.__new__(CatalogSession)
+    real._context = "catalog.water.bwd"
+    monkeypatch.setattr(magics_module, "_build_catalog_session", lambda: real)
+    instance = _magics_instance(ip)
+    instance._catalog_session = real
+
+    assert instance._dds_target(None) == "catalog.water.bwd"
+    assert instance._dds_target("../other") == "catalog.water.other"
+    assert instance._dds_target("catalog/air/aq") == "catalog.air.aq"
+
+
+def test_dds_target_before_any_catalog_session(ip: Any) -> None:
+    instance = _magics_instance(ip)
+    instance._pending_context = "catalog.from.tree"
+
+    assert instance._dds_target(None) == "catalog.from.tree"
+    assert instance._dds_target("catalog.x") == "catalog.x"
 
 
 def test_sdi_empty_line_prints_usage(ip: Any, capsys: pytest.CaptureFixture[str]) -> None:
@@ -493,67 +552,64 @@ def test_sdi_help_lists_methods_without_building_a_session(
     assert "SDI_API_URL" in out
     table_html = displayed[0].data
     assert ">get_xml<" in table_html and ">resolve_series<" in table_html
-    assert ">push_to_dds<" not in table_html  # moved to %metadata
+    assert ">push_to_dds<" not in table_html  # pushing is %dds's job
     assert _magics_instance(ip)._sdi_session is None
 
 
 @pytest.mark.parametrize("line", ["help", "help()"])
-def test_metadata_help_lists_methods_without_building_a_session(
+def test_dds_help_lists_methods_without_building_a_session(
     ip: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], line: str
 ) -> None:
     displayed = []
     monkeypatch.setattr(magics_module, "display", displayed.append)
 
-    ip.run_line_magic("metadata", line)
+    ip.run_line_magic("dds", line)
 
     out = capsys.readouterr().out
-    assert "%metadata methods" in out
+    assert "%dds methods" in out
     assert "DDS_BASE_URL" in out
+    assert "deliverables/report.pdf" in out
+    examples = [line.strip() for line in out.splitlines() if line.strip().startswith("%dds push(")]
+    for option in ("path=", "overwrite=False", 'target_name="', "target_name={", '"*.csv"'):
+        assert any(option in line or option.strip('"') in line for line in examples), option
+    assert all(line.count("(") == line.count(")") for line in examples)  # each fits on one line
     table_html = displayed[0].data
-    assert ">push_to_dds<" in table_html and ">check_catalog_path<" in table_html
-    assert ">dds_base_url<" not in table_html and ">dremio_base_url<" not in table_html
-    assert "separated with either '.' or '/'" in out
-    assert "dds_path, target_name=None, metadata=None, folder=&#x27;metadata&#x27;" in table_html
-    assert _magics_instance(ip)._metadata_session is None
+    for name in ("push", "target", "folders", "dds_base_url"):
+        assert f">{name}<" in table_html
+    assert "folder, files..., path=None, overwrite=True, target_name=&#x27;&#x27;" in table_html
+    assert "DERIVED, METADATA, METHODOLOGY, ASSESSMENTS, ANALYSES" in table_html
+    assert _magics_instance(ip)._dds_session is None
+
+
+def test_metadata_magic_is_gone(ip: Any) -> None:
+    assert "metadata" not in ip.magics_manager.magics["line"]
 
 
 class _FakePushSession:
-    """Just the signature `%metadata push_to_dds` exposes — never pushes."""
+    """Just the signature `%dds push` exposes — never pushes."""
 
-    def push_to_dds(
-        self,
-        dds_path: str,
-        target_name: str | None = None,
-        metadata: object | None = None,
-        folder: str = "metadata",
-        force: bool = False,
-        check_catalog: bool = True,
+    def push(
+        self, folder: str, *files: object, path: str | None = None, overwrite: bool = True
     ) -> str:
         return "pushed"
 
 
-USAGE = (
-    "usage: push_to_dds(dds_path, target_name=None, metadata=None, folder='metadata', "
-    "force=False, check_catalog=True)"
-)
+USAGE = "usage: push(folder, files..., path=None, overwrite=True)"
 
 
 @pytest.mark.parametrize(
     ("line", "expected"),
     [
         (
-            "push_to_dds(P, metadata=m, True)",
-            "argument 3 (True) has no name, but comes after metadata=m — once an argument is "
-            "given by name, every argument after it needs a name too. Did you mean force=True "
-            "or check_catalog=True?",
+            "push(F, x, path=p, True)",
+            "argument 4 (True) has no name, but comes after path=p — once an argument is "
+            "given by name, every argument after it needs a name too. Did you mean "
+            "overwrite=True?",
         ),
-        (
-            'push_to_dds(P, metadata=m, "x.xml")',
-            'Did you mean target_name="x.xml" or folder="x.xml"?',
-        ),
-        ("push_to_dds(P, metadata=m, flag)", "Did you mean target_name=flag or folder=flag"),
-        ('push_to_dds("a, b", force=True, "c(,)")', 'argument 3 ("c(,)") has no name'),
-        ("push_to_dds(P,", "invalid syntax:"),
+        ('push(F, x, overwrite=False, "catalog.a")', 'Did you mean path="catalog.a"?'),
+        ("push(F, x, path=p, flag)", "Did you mean overwrite=flag"),
+        ('push("a, b", x, path=p, "c(,)")', 'argument 4 ("c(,)") has no name'),
+        ("push(F,", "invalid syntax:"),
     ],
 )
 def test_syntax_error_names_the_argument_and_shows_the_signature(
@@ -563,12 +619,12 @@ def test_syntax_error_names_the_argument_and_shows_the_signature(
     line: str,
     expected: str,
 ) -> None:
-    monkeypatch.setattr(magics_module, "_build_metadata_session", lambda last: _FakePushSession())
+    monkeypatch.setattr(magics_module, "_build_dds_session", lambda resolve: _FakePushSession())
 
-    assert ip.run_line_magic("metadata", line) is None
+    assert ip.run_line_magic("dds", line) is None
 
     out = capsys.readouterr().out
-    assert out.startswith("metadata error: ")
+    assert out.startswith("dds error: ")
     assert expected in out
     assert USAGE in out
 
@@ -576,12 +632,12 @@ def test_syntax_error_names_the_argument_and_shows_the_signature(
 def test_syntax_error_on_an_unknown_method_has_no_usage(
     ip: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(magics_module, "_build_metadata_session", lambda last: _FakePushSession())
+    monkeypatch.setattr(magics_module, "_build_dds_session", lambda resolve: _FakePushSession())
 
-    ip.run_line_magic("metadata", "nope(a=1, 2)")
+    ip.run_line_magic("dds", "nope(a=1, 2)")
 
     out = capsys.readouterr().out
-    assert out.startswith("metadata error: invalid syntax:")
+    assert out.startswith("dds error: invalid syntax:")
     assert "usage:" not in out
 
 

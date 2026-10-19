@@ -1437,3 +1437,126 @@ def test_deletefolder_engine_starting_is_remembered_and_retryable(executor) -> N
     fake_rest._raise_on_delete_folder = None
     operations.retry_pending(executor, "k", catalog_rest=fake_rest)
     assert fake_rest.deleted == ["a.b"]
+
+
+# --- getentriesfrom / entryexists / getviewsql / createviewas / deletetable ---
+# --- getfoldersfrom ----------------------------------------------------------
+
+
+def test_getentriesfrom_returns_each_path_with_its_kind() -> None:
+    fake = FakeExecutor(
+        rows=[
+            {"TABLE_SCHEMA": "bwd.draft", "TABLE_NAME": "v", "TABLE_TYPE": "VIEW"},
+            {"TABLE_SCHEMA": "bwd.draft.raw", "TABLE_NAME": "t", "TABLE_TYPE": "TABLE"},
+        ]
+    )
+
+    entries = operations.getentriesfrom(fake, "bwd.draft", idempotency_key="k")
+
+    assert [(entry.path, entry.kind) for entry in entries] == [
+        ("bwd.draft.raw.t", "TABLE"),
+        ("bwd.draft.v", "VIEW"),
+    ]
+    assert '"TABLE_TYPE"' in fake.statements[0]
+    assert "LIKE 'bwd.draft.%' ESCAPE" in fake.statements[0]
+
+
+def test_getentriesfrom_reads_anything_that_is_not_a_view_as_a_table() -> None:
+    fake = FakeExecutor(
+        rows=[{"TABLE_SCHEMA": "a", "TABLE_NAME": "t", "TABLE_TYPE": "SYSTEM_TABLE"}]
+    )
+
+    assert operations.getentriesfrom(fake, "a", idempotency_key="k")[0].kind == "TABLE"
+
+
+def test_entryexists_answers_from_information_schema() -> None:
+    assert operations.entryexists(
+        FakeExecutor(rows=[{"TABLE_NAME": "t"}]), "a.t", idempotency_key="k"
+    )
+    assert not operations.entryexists(FakeExecutor(rows=[]), "a.t", idempotency_key="k")
+
+
+def test_getviewsql_prefers_the_catalog_entity_and_keeps_its_context() -> None:
+    fake = FakeExecutor()
+    catalog_rest = FakeCatalogRest(existing={"a", "a.v"})
+    catalog_rest.view_definitions = {"a.v": ("SELECT 1", ["a"])}  # type: ignore[attr-defined]
+
+    definition = operations.getviewsql(fake, "a.v", catalog_rest=catalog_rest, idempotency_key="k")
+
+    assert definition.sql == "SELECT 1"
+    assert definition.context == ("a",)
+    assert fake.statements == []  # never had to ask INFORMATION_SCHEMA
+
+
+def test_getviewsql_falls_back_to_information_schema_without_a_context() -> None:
+    fake = FakeExecutor(rows=[{"VIEW_DEFINITION": "SELECT * FROM t"}])
+
+    definition = operations.getviewsql(fake, "a.v", idempotency_key="k")
+
+    assert definition.sql == "SELECT * FROM t"
+    assert definition.context == ()
+    assert 'INFORMATION_SCHEMA."VIEWS"' in fake.statements[0]
+
+
+def test_getviewsql_raises_rather_than_guessing_a_definition() -> None:
+    with pytest.raises(CatalogOperationError, match="could not read the view definition"):
+        operations.getviewsql(FakeExecutor(rows=[]), "a.v", idempotency_key="k")
+
+
+def test_createviewas_sends_the_query_body_through_unchanged(catalog_rest) -> None:
+    fake = FakeExecutor(rows=[])  # nothing at the target yet
+
+    operations.createviewas(
+        fake, "a.v", 'SELECT * FROM "b"."t"', catalog_rest=catalog_rest, idempotency_key="k"
+    )
+
+    assert fake.statements[-1] == 'CREATE VIEW "a"."v" AS SELECT * FROM "b"."t"'
+
+
+def test_createviewas_refuses_an_occupied_target_unless_told_to_overwrite(catalog_rest) -> None:
+    fake = FakeExecutor(rows=[{"TABLE_NAME": "v"}])
+
+    with pytest.raises(CatalogOperationError, match="overwrite=True"):
+        operations.createviewas(
+            fake, "a.v", "SELECT 1", catalog_rest=catalog_rest, idempotency_key="k"
+        )
+
+
+def test_createviewas_drops_whatever_kind_is_actually_there_first(catalog_rest) -> None:
+    fake = FakeExecutor(
+        rows_sequence=[[{"TABLE_NAME": "v"}], [{"TABLE_TYPE": "BASE TABLE"}]]
+    )
+
+    operations.createviewas(
+        fake,
+        "a.v",
+        "SELECT 1",
+        overwrite=True,
+        catalog_rest=catalog_rest,
+        idempotency_key="k",
+    )
+
+    assert fake.statements[-2:] == [
+        'DROP TABLE IF EXISTS "a"."v"',
+        'CREATE VIEW "a"."v" AS SELECT 1',
+    ]
+
+
+def test_deletetable_is_the_counterpart_of_deleteview() -> None:
+    fake = FakeExecutor()
+
+    operations.deletetable(fake, "a.t", idempotency_key="k")
+
+    assert fake.statements == ['DROP TABLE IF EXISTS "a"."t"']
+
+
+def test_getfoldersfrom_delegates_to_the_rest_catalog() -> None:
+    catalog_rest = FakeCatalogRest(existing={"a"})
+    catalog_rest.folder_listing = ["a.b", "a.b.c"]  # type: ignore[attr-defined]
+
+    assert operations.getfoldersfrom(catalog_rest, "a", idempotency_key="k") == ["a.b", "a.b.c"]
+
+
+def test_the_new_operations_can_be_replayed_by_retry_pending() -> None:
+    for name in ("getentriesfrom", "entryexists", "getviewsql", "createviewas", "deletetable"):
+        assert name in operations._OPERATIONS

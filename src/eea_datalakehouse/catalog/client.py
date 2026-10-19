@@ -34,8 +34,9 @@ import threading
 import weakref
 from typing import Any, Literal
 
-from . import operations, retry_state
-from .operations import TableInfo, VersionResult
+from . import foldertree, operations, retry_state
+from .foldertree import FolderTransferReport, FolderTree, ProgressCallback
+from .operations import CatalogEntry, TableInfo, VersionResult, ViewDefinition
 from .rest import CatalogRestClient
 from .sql import (
     DEFAULT_TIMEOUT,
@@ -306,6 +307,48 @@ class Catalog:
             self._executor, table_path, idempotency_key=idempotency_key
         )
 
+    def getentriesfrom(self, schema_path: str, *, idempotency_key: str) -> list[CatalogEntry]:
+        return operations.getentriesfrom(
+            self._executor, schema_path, idempotency_key=idempotency_key
+        )
+
+    def entryexists(self, path: str, *, idempotency_key: str) -> bool:
+        return operations.entryexists(self._executor, path, idempotency_key=idempotency_key)
+
+    def getviewsql(self, view_path: str, *, idempotency_key: str) -> ViewDefinition:
+        return operations.getviewsql(
+            self._executor,
+            view_path,
+            catalog_rest=self._catalog_rest,
+            idempotency_key=idempotency_key,
+        )
+
+    def createviewas(
+        self,
+        view_path: str,
+        sql: str,
+        *,
+        overwrite: bool = False,
+        create_target_folder: bool = True,
+        idempotency_key: str,
+    ) -> SqlResult:
+        return operations.createviewas(
+            self._executor,
+            view_path,
+            sql,
+            overwrite=overwrite,
+            create_target_folder=create_target_folder,
+            catalog_rest=self._catalog_rest,
+            idempotency_key=idempotency_key,
+        )
+
+    def getfoldersfrom(
+        self, path: str, *, recursive: bool = True, idempotency_key: str
+    ) -> list[str]:
+        return operations.getfoldersfrom(
+            self._catalog_rest, path, recursive=recursive, idempotency_key=idempotency_key
+        )
+
     def getwikifrom(self, path: str, *, idempotency_key: str) -> str:
         return operations.getwikifrom(self._catalog_rest, path, idempotency_key=idempotency_key)
 
@@ -375,6 +418,92 @@ class Catalog:
             path,
             cascade=cascade,
             idempotency_key=idempotency_key,
+        )
+
+    # --- whole folders: scan / copy / move -------------------------------
+    # These are orchestration over the operations above rather than one SQL
+    # statement each, so they live in `foldertree` and are exposed here for
+    # a caller who already has a Catalog. See that module's docstring for
+    # what a move actually does, and in what order.
+
+    def folderscan(
+        self,
+        source_path: str,
+        target_path: str,
+        *,
+        idempotency_key: str,
+        qualify_external: bool = True,
+        on_progress: ProgressCallback | None = None,
+    ) -> FolderTree:
+        return foldertree.folderscan(
+            self,
+            source_path,
+            target_path,
+            idempotency_key=idempotency_key,
+            qualify_external=qualify_external,
+            on_progress=on_progress,
+        )
+
+    def foldercopy(
+        self,
+        source_path: str,
+        target_path: str,
+        *,
+        idempotency_key: str,
+        dry_run: bool = False,
+        overwrite: bool = False,
+        skip_existing: bool = True,
+        verify_views: bool = True,
+        copy_metadata: bool = True,
+        qualify_external: bool = True,
+        tree: FolderTree | None = None,
+        on_progress: ProgressCallback | None = None,
+    ) -> FolderTransferReport:
+        return foldertree.foldercopy(
+            self,
+            source_path,
+            target_path,
+            idempotency_key=idempotency_key,
+            dry_run=dry_run,
+            overwrite=overwrite,
+            skip_existing=skip_existing,
+            verify_views=verify_views,
+            copy_metadata=copy_metadata,
+            qualify_external=qualify_external,
+            tree=tree,
+            on_progress=on_progress,
+        )
+
+    def foldermove(
+        self,
+        source_path: str,
+        target_path: str,
+        *,
+        idempotency_key: str,
+        dry_run: bool = False,
+        overwrite: bool = False,
+        skip_existing: bool = True,
+        verify_views: bool = True,
+        copy_metadata: bool = True,
+        qualify_external: bool = True,
+        delete_source_root: bool = True,
+        tree: FolderTree | None = None,
+        on_progress: ProgressCallback | None = None,
+    ) -> FolderTransferReport:
+        return foldertree.foldermove(
+            self,
+            source_path,
+            target_path,
+            idempotency_key=idempotency_key,
+            dry_run=dry_run,
+            overwrite=overwrite,
+            skip_existing=skip_existing,
+            verify_views=verify_views,
+            copy_metadata=copy_metadata,
+            qualify_external=qualify_external,
+            delete_source_root=delete_source_root,
+            tree=tree,
+            on_progress=on_progress,
         )
 
     def retry_pending(self, idempotency_key: str) -> SqlResult | list[Any]:

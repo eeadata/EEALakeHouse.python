@@ -30,6 +30,7 @@ ingest; this is a client-side queue of possibly many.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -37,7 +38,7 @@ from typing import Any
 from .client import IngestClient
 from .credentials import DremioCreds
 from .folder import DEFAULT_PARALLELISM, FolderIngest, IngestOutcome, IngestStateError
-from .models import DataFormat, Intent
+from .models import DataFormat, Intent, TableDefinition, UploadMode
 
 
 class IngestSessionError(RuntimeError):
@@ -124,12 +125,32 @@ class IngestSession:
         parallelism: int = DEFAULT_PARALLELISM,
         multipart: bool | None = None,
         show_progress: bool = True,
+        table_definition: TableDefinition | Mapping[str, Any] | None = None,
+        cleanup_on_failure: bool = False,
+        csv_options: Mapping[str, Any] | None = None,
+        json_options: Mapping[str, Any] | None = None,
+        upload_mode: UploadMode = "auto",
     ) -> IngestSession:
         """Queue one folder ingest — see `FolderIngest` for what each argument
         means. No `idempotency_key` here: unlike the catalog side, a queued
         ingest's own key would only ever be used once per `commit()`, so
         there is nothing to encapsulate — `FolderIngest` already defaults
-        it to `None` (a fresh session every run)."""
+        it to `None` (a fresh session every run).
+
+        Each of the last five still fits on the one `%ingest` line that queues
+        the ingest::
+
+            upload_mode="proxy"                   # S3 is unreachable from this kernel
+            csv_options={"delimiter": ";"}        # CSV parsing hints
+            json_options={"format": "array"}      # a JSON array rather than JSON lines
+            table_definition={"columns": [{"name": "value", "type": "DOUBLE"}]}
+            cleanup_on_failure=True               # a failed commit leaves nothing behind
+
+        With `cleanup_on_failure=True`, `commit(retry=True)` uploads a cleaned-up
+        ingest again under a new session (see `FolderIngest.retry`).
+        `FolderIngest`'s `infer_schema` is left out on purpose: turning
+        inference off only makes DDS ask for the columns, which
+        `table_definition` gives anyway."""
         self._pending.append(
             _QueuedIngest(
                 folder=folder,
@@ -143,10 +164,45 @@ class IngestSession:
                     "parallelism": parallelism,
                     "multipart": multipart,
                     "show_progress": show_progress,
+                    "table_definition": table_definition,
+                    "cleanup_on_failure": cleanup_on_failure,
+                    "csv_options": csv_options,
+                    "json_options": json_options,
+                    "upload_mode": upload_mode,
                 },
             )
         )
         return self
+
+    def diagnose(self) -> None:
+        """Check every queued ingest without running it — `FolderIngest.diagnose`
+        for each, one printed line per check: DDS reachable, the credential, the
+        file sizes, DDS's storage, and a dry run of that folder into its target.
+        Nothing is uploaded and the queue is kept, so a `commit()` afterwards
+        runs exactly these ingests."""
+        if not self._pending:
+            print("nothing queued — queue an ingest(...) first, then diagnose")
+            return
+        for item in self._pending:
+            print(f"{item.describe()}:")
+            try:
+                job = FolderIngest(
+                    item.folder,
+                    item.target_catalog_path,
+                    data_format=item.data_format,
+                    client=self._client,
+                    base_url=self._base_url,
+                    creds=self._creds,
+                    **{**item.kwargs, "show_progress": True},  # the lines are the point
+                )
+            except (OSError, ValueError, RuntimeError) as exc:
+                # A missing folder or credential is itself the finding.
+                print(f"✗ cannot check it: {exc}")
+                continue
+            try:
+                job.diagnose()
+            finally:
+                job.close()
 
     def commit(self, *, retry: bool = False, max_retries: int = 3) -> IngestCommitReport:
         """Run every queued ingest, in order. Stops at the first failure —
