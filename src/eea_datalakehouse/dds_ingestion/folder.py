@@ -17,6 +17,7 @@ layer can be mocked or swapped in tests.
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -26,9 +27,9 @@ from typing import Any
 import httpx
 import pyarrow as pa
 
-from .client import IngestApiError, IngestClient
+from .client import IngestApiError, IngestClient, UnsupportedByServerError
 from .credentials import DremioCreds, load_base_url, load_creds
-from .formats import FORMATS, compare_columns, local_columns
+from .formats import FORMATS, compare_columns, first_non_utf8, is_utf8, local_columns
 from .models import (
     BeginPlan,
     BeginResult,
@@ -60,6 +61,27 @@ class IngestStateError(RuntimeError):
     """
 
 
+@dataclass(frozen=True, slots=True)
+class DiagnosisStep:
+    """One check of :meth:`FolderIngest.diagnose`; ``ok`` is ``None`` when skipped."""
+
+    name: str
+    ok: bool | None
+    detail: str
+
+
+@dataclass(slots=True)
+class Diagnosis:
+    """What :meth:`FolderIngest.diagnose` found, one step per check, in order."""
+
+    steps: list[DiagnosisStep] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """Whether every check that ran passed."""
+        return all(step.ok is not False for step in self.steps)
+
+
 @dataclass(slots=True)
 class IngestOutcome:
     """Summary returned by :meth:`FolderIngest.run` and :meth:`FolderIngest.retry`.
@@ -76,6 +98,34 @@ class IngestOutcome:
     etags: dict[str, str] = field(default_factory=dict)
     resumed: bool = False
     upload_mode: str = "direct"  # how the files went: "direct" (presigned S3) or "proxy" (DDS)
+    # How many of files_uploaded went through DDS (/stage): all of them with
+    # "proxy", the network-error fallbacks with "direct" (PY-13).
+    files_staged: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _FailedRun:
+    """Why the last :meth:`FolderIngest.run` stopped and cancelled its session —
+    an upload failure (PY-2), or a commit failure with ``cleanup_on_failure`` —
+    kept for :meth:`FolderIngest.retry` (PY-8)."""
+
+    stage: str  # "upload" | "commit"
+    error: Exception
+    session_id: str
+    cancelled: bool  # whether the cancel went through
+
+
+def _may_succeed_on_retry(err: Exception) -> bool:
+    """Whether a failed upload can succeed unchanged on a second attempt: a
+    network-layer error, or a 5xx from S3 or DDS. DDS's own ``retryable`` flag
+    decides where it gives one."""
+    if isinstance(err, httpx.TransportError):
+        return True
+    if isinstance(err, IngestApiError):
+        if err.retryable is not None:
+            return err.retryable
+        return err.status_code >= 500
+    return False
 
 
 def scan_folder(folder: Path, data_format: DataFormat) -> list[FileSpec]:
@@ -178,7 +228,8 @@ class FolderIngest:
         # begin; the begin plan says which parts this server uses.
         self.table_definition = table_definition
         # DI-12.26: after a commit failure the server could retry, drop the
-        # session (and its uploaded files) instead of keeping it for retry().
+        # session (and its uploaded files) instead of keeping it for retry();
+        # a retry() then uploads again under a new session.
         self.cleanup_on_failure = cleanup_on_failure
         # Parsing hints sent on begin (the server already accepts them).
         self.csv_options = csv_options
@@ -196,6 +247,17 @@ class FolderIngest:
         # command below works from.
         self._session_id: str | None = None
         self._begin: BeginResult | None = None
+        # Set when run() cancelled its session after a failure; what retry()
+        # goes by once there is no session left (PY-8).
+        self._failed_run: _FailedRun | None = None
+        # The files the current run sent through DDS (/stage), by proxy or by
+        # fallback; appended to from the upload threads (list.append is atomic).
+        self._staged: list[str] = []
+        # The largest file POST /ingest/stage accepts (PY-10): asked of DDS at
+        # most once per run, and only when a file may go through it.
+        self._stage_cap: int | None = None
+        self._stage_cap_asked = False
+        self._stage_cap_lock = threading.Lock()
 
         # The client owns the credentials; if the caller did not inject one we
         # build it from the kernel environment. Creds never leave the client.
@@ -256,11 +318,13 @@ class FolderIngest:
         :meth:`status`, :meth:`retry` or :meth:`cancel` the transfer. Use it as a
         context manager (or call :meth:`close`) to release it.
         """
+        self._failed_run = None
         begin = self.begin()
         try:
             etags, multipart_etags, uploaded, skipped = self._upload_all(begin)
         except Exception as err:
-            self._cancel_after_failure(err)
+            cancelled = self._cancel_after_failure(err)
+            self._failed_run = _FailedRun("upload", err, begin.session_id, cancelled)
             raise
         try:
             commit = self.commit(multipart_etags=multipart_etags or None)
@@ -274,6 +338,7 @@ class FolderIngest:
             files_skipped=skipped,
             etags=etags,
             upload_mode="proxy" if self._uses_proxy(begin) else "direct",
+            files_staged=len(self._staged),
         )
 
     def _effective_upload_mode(self, begin: BeginResult) -> str:
@@ -296,6 +361,7 @@ class FolderIngest:
         The server validates the target here — an unauthorised or non-existent
         catalog folder fails now, before a single byte is uploaded.
         """
+        self._check_csv_encoding_option()
         files = scan_folder(self.folder, self.data_format)
         if not files:
             raise FileNotFoundError(
@@ -331,6 +397,7 @@ class FolderIngest:
         real begin would raise, or :class:`UnsupportedByServerError` against a
         DDS server that predates dry runs.
         """
+        self._check_csv_encoding_option()
         files = scan_folder(self.folder, self.data_format)
         if not files:
             raise FileNotFoundError(
@@ -377,6 +444,13 @@ class FolderIngest:
         try:
             columns = local_columns(self.folder, rel_paths, self.data_format, options)
         except (ValueError, pa.ArrowException) as exc:
+            # A file that is not UTF-8 would load garbled, not just untyped: say so.
+            bad = first_non_utf8(self.folder, rel_paths) if self.data_format == "csv" else None
+            if bad is not None:
+                raise self._encoding_error(
+                    f"{bad!r} is not valid UTF-8, and Dremio reads CSV as UTF-8, so its "
+                    "text would load garbled: save it as UTF-8 and run again."
+                ) from exc
             logger.warning(
                 "could not infer the %s columns locally (%s); the server will ask for "
                 "them — pass table_definition=…",
@@ -390,6 +464,26 @@ class FolderIngest:
         if self.show_progress:
             print(f"Inferred columns: {summary}")
         return inferred
+
+    def _check_csv_encoding_option(self) -> None:
+        """Refuse a CSV ``encoding`` other than UTF-8 before anything starts: DDS
+        accepts the option but passes no encoding on to Dremio, which reads CSV as
+        UTF-8, so such a file would load garbled rather than fail."""
+        encoding = (self.csv_options or {}).get("encoding")
+        if self.data_format == "csv" and encoding and not is_utf8(str(encoding)):
+            raise self._encoding_error(
+                f"csv_options asks for encoding {encoding!r}, but DDS ignores it and "
+                "Dremio reads CSV as UTF-8, so the text would load garbled: save the "
+                "files as UTF-8, drop the encoding option, and run again."
+            )
+
+    @staticmethod
+    def _encoding_error(message: str) -> IngestApiError:
+        err = IngestApiError(
+            400, message, where="local CSV encoding check (nothing was uploaded)"
+        )
+        err.retryable = False
+        return err
 
     def _check_parquet_columns(self, rel_paths: list[str], given: list[Mapping[str, Any]]) -> None:
         """Refuse given Parquet columns that contradict the local footers, before
@@ -407,6 +501,108 @@ class FolderIngest:
             err.error_slug = "schema_mismatch"
             err.retryable = False
             raise err
+
+    def diagnose(self) -> Diagnosis:
+        """Check, in plain language, whether this transfer would work — without
+        starting it (PY-7). Nothing is uploaded and no session is created.
+
+        In order: DDS reachable; the credential accepted; the files against DDS's
+        size limits (PY-10); DDS's own S3 write test; and a dry run of this exact
+        folder, which covers the privileges on the target, the target folder,
+        collisions and the table definition. A check that cannot run (DDS
+        unreachable, a server predating it) is reported as skipped, with the
+        reason, instead of failing the ones after it.
+        """
+        result = Diagnosis()
+
+        def add(name: str, ok: bool | None, detail: str) -> None:
+            result.steps.append(DiagnosisStep(name, ok, detail))
+            if self.show_progress:
+                mark = {True: "✓", False: "✗", None: "–"}[ok]
+                print(f"{mark} {name}: {detail}")
+
+        try:
+            self._client.health()
+        except (httpx.HTTPError, IngestApiError) as exc:
+            add("DDS reachable", False, str(exc))
+            for name in (
+                "Credential accepted",
+                "File sizes",
+                "Storage write test",
+                "Dry run of this folder",
+            ):
+                add(name, None, "skipped: DDS is not reachable")
+            return result
+        add("DDS reachable", True, "the service answers")
+
+        limits: dict[str, Any] | None = None
+        try:
+            limits = self._client.limits("notebook")
+            add("Credential accepted", True, "DDS accepts your Dremio credential")
+        except IngestApiError as exc:
+            if exc.status_code == 404:  # a server predating GET /ingest/limits
+                try:
+                    self._client.list_sessions()
+                    add("Credential accepted", True, "DDS accepts your Dremio credential")
+                except IngestApiError as inner:
+                    add("Credential accepted", False, inner.message)
+            else:
+                add("Credential accepted", False, exc.message)
+
+        add("File sizes", *self._check_file_sizes(limits))
+
+        try:
+            verdict = self._client.storage_selftest().get("storage_write_test") or {}
+            if verdict.get("ok"):
+                add("Storage write test", True, "DDS can write to its S3 storage")
+            elif verdict:
+                failures = "; ".join(str(f) for f in verdict.get("failures") or []) or "failed"
+                add("Storage write test", False, failures)
+            else:
+                add("Storage write test", None, "skipped: no verdict reported yet")
+        except IngestApiError as exc:
+            add("Storage write test", None, f"skipped: {exc.message}")
+
+        try:
+            dry = self.dry_run()
+            add("Dry run of this folder", True, dry.plan.describe())
+        except UnsupportedByServerError:
+            add("Dry run of this folder", None, "skipped: this DDS server has no dry run")
+        except (IngestApiError, FileNotFoundError, ValueError) as exc:
+            add("Dry run of this folder", False, str(getattr(exc, "message", exc)))
+        return result
+
+    def _check_file_sizes(self, limits: Mapping[str, Any] | None) -> tuple[bool | None, str]:
+        """:meth:`diagnose`'s size step (PY-10): this folder's files against the
+        caps DDS reports — ``max_bytes`` for any file of this caller, which begin
+        enforces, and ``stage_max_bytes`` for a file sent through DDS."""
+        if limits is None:
+            return None, "skipped: DDS did not report its size limits"
+        files = scan_folder(self.folder, self.data_format)
+        if not files:
+            return None, f"skipped: no {self.data_format} files under {self.folder}"
+
+        def over(cap: object) -> list[str]:
+            if not isinstance(cap, int):
+                return []
+            return [f"{f.rel_path} ({f.size:,} bytes)" for f in files if f.size > cap]
+
+        max_bytes, stage_max = limits.get("max_bytes"), limits.get("stage_max_bytes")
+        if too_big := over(max_bytes):
+            return False, f"larger than DDS accepts ({max_bytes:,} bytes): {', '.join(too_big)}"
+        if too_big_to_stage := over(stage_max):
+            names = ", ".join(too_big_to_stage)
+            if self.upload_mode == "proxy":
+                return False, (
+                    f"larger than DDS accepts through /stage ({stage_max:,} bytes), where "
+                    f"upload_mode='proxy' sends every file: {names}"
+                )
+            return True, (
+                f"fine for a direct upload, but larger than DDS accepts through /stage "
+                f"({stage_max:,} bytes), so these cannot fall back to it: {names}"
+            )
+        largest = max(files, key=lambda f: f.size)
+        return True, f"within DDS's limits (largest: {largest.rel_path}, {largest.size:,} bytes)"
 
     def _report_plan(self, plan: BeginPlan) -> None:
         """Show what commit will do: printed when ``show_progress`` (the same
@@ -463,8 +659,16 @@ class FolderIngest:
         self._client.cancel(self._session_id)
         self._session_id = None
 
-    def retry(self) -> IngestOutcome:
+    def retry(
+        self, *, table_definition: TableDefinition | Mapping[str, Any] | None = None
+    ) -> IngestOutcome:
         """Re-run this transfer from the step that failed.
+
+        ``table_definition`` replaces the one this transfer was given — the fix
+        for a commit that failed on its columns (``schema_required``,
+        ``schema_mismatch``). A resumed load uses it without uploading again
+        (DI-12.6; a server before that ignores it), and a new upload sends it on
+        begin.
 
         Two cases, decided by the server's own report of where it broke:
 
@@ -477,6 +681,12 @@ class FolderIngest:
           staged copy is gone. A fresh session is opened and the folder is
           uploaded again. Any ``idempotency_key`` is dropped for that attempt, or
           the server would just replay the failed session.
+        * **This object's own** :meth:`run` **cancelled its session** — after a
+          failed upload (PY-2), or after a failed commit with
+          ``cleanup_on_failure`` — so there is none left to resume. The folder is
+          uploaded again under a new session if the failure can pass (a network
+          error, a 5xx, DDS saying ``retryable``) and the cancel went through;
+          otherwise this raises :class:`IngestStateError` quoting the error.
 
         **A transfer whose files are stored permanently is never re-uploaded
         blindly.** There the upload landed in the table's own folder and stayed,
@@ -490,6 +700,12 @@ class FolderIngest:
         Raises :class:`IngestStateError` if there is nothing to retry — no
         session, one that is still running, or one that already succeeded.
         """
+        if table_definition is not None:
+            self.table_definition = table_definition
+        if self._failed_run is not None:
+            # That session was cancelled, or never got all its files: the server
+            # has nothing to resume (PY-8).
+            return self._rerun_after_cancel(self._failed_run)
         if self._session_id is None:
             raise IngestStateError("no session to retry — call run() first")
         status = self._client.get_status(self._session_id)
@@ -504,7 +720,12 @@ class FolderIngest:
             )
         if status.is_resumable:
             logger.info("resuming the load step of %s", self._session_id)
-            resumed = self._client.retry(self._session_id)
+            # Without a definition, the call is exactly the one made before DI-12.6.
+            resumed = (
+                self._client.retry(self._session_id, definition=table_definition)
+                if table_definition is not None
+                else self._client.retry(self._session_id)
+            )
             return IngestOutcome(
                 begin=self._begin,
                 commit=CommitResult.from_json(resumed.raw),
@@ -532,6 +753,36 @@ class FolderIngest:
         self.idempotency_key = None
         return self.run()
 
+    def _rerun_after_cancel(self, failure: _FailedRun) -> IngestOutcome:
+        """:meth:`retry` once :meth:`run` cancelled its session after a failure
+        (PY-8). Uploads again only when a second attempt can succeed and nothing
+        of the first is left behind; otherwise raises, quoting the error, so a
+        caller that retries (``IngestSession.commit(retry=True)``) shows the
+        cause instead of "no session"."""
+        if not failure.cancelled:
+            raise IngestStateError(
+                f"the {failure.stage} failed ({failure.error}) and session {failure.session_id} "
+                "could not be cancelled, so files it uploaded may still be in place; "
+                "uploading again could add a second copy. Cancel it with "
+                "FolderIngest.attach(...).cancel(), or wait for the server's sweep, "
+                "then run the ingest again."
+            ) from failure.error
+        if not _may_succeed_on_retry(failure.error):
+            raise IngestStateError(
+                f"the {failure.stage} failed ({failure.error}); its session was "
+                "cancelled, and running it again would fail the same way. Fix the "
+                "cause, then run the ingest again."
+            ) from failure.error
+        logger.info(
+            "the %s of session %s failed (%s); uploading again under a new session",
+            failure.stage,
+            failure.session_id,
+            failure.error,
+        )
+        self._begin = None
+        self.idempotency_key = None
+        return self.run()
+
     # -- upload phase -----------------------------------------------------
 
     def _after_failed_commit(self, err: IngestApiError) -> None:
@@ -539,22 +790,27 @@ class FolderIngest:
         ``cleanup_on_failure``. Best-effort: nothing here replaces ``err``.
 
         The note is the session's own failure text (:meth:`StatusResult.
-        describe_failure`), the same the Transfers panel shows. A failure the
-        server cannot retry was already cleaned up server-side; a retryable one
-        is kept for :meth:`retry` unless ``cleanup_on_failure`` is set.
+        describe_failure`), the same the Transfers panel shows, and
+        ``err.failed_stage`` its stage. A failure the server cannot retry was
+        already cleaned up server-side; a retryable one is kept for :meth:`retry`
+        unless ``cleanup_on_failure`` is set.
         """
         session_id = self._session_id
         if session_id is None:
             return
         try:
-            err.add_note(self._client.get_status(session_id).describe_failure())
+            status = self._client.get_status(session_id)
+            err.failed_stage = status.failed_stage
+            err.add_note(status.describe_failure())
         except Exception:  # noqa: BLE001 — the commit error is what matters
             logger.debug("could not fetch the failed session's status", exc_info=True)
-        if self.cleanup_on_failure and err.retryable is True:
-            self._cancel_after_failure(err)
+        if self.cleanup_on_failure and err.retryable is True and self._cancel_after_failure(err):
+            # The upload is gone with the session, so retry() starts over (PY-8).
+            self._failed_run = _FailedRun("commit", err, session_id, cancelled=True)
 
-    def _cancel_after_failure(self, err: Exception) -> None:
-        """Cancel the session after a failure, and say so on ``err``.
+    def _cancel_after_failure(self, err: Exception) -> bool:
+        """Cancel the session after a failure, say so on ``err``, and return
+        whether the cancel went through.
 
         After a failed upload (PY-2): an incomplete client upload cannot be
         resumed — the server only re-runs the load (:meth:`retry`) — and the
@@ -567,7 +823,7 @@ class FolderIngest:
         """
         session_id = self._session_id
         if session_id is None:
-            return
+            return False
         try:
             self.cancel()
         except Exception as cancel_err:  # noqa: BLE001 — reported on err instead
@@ -576,11 +832,12 @@ class FolderIngest:
                 f"DDS could not cancel session {session_id} ({cancel_err}); the "
                 "server's sweep removes its uploaded files after the session's TTL."
             )
-        else:
-            err.add_note(
-                f"Session {session_id} was cancelled and the files it had uploaded "
-                "were deleted; run the ingest again."
-            )
+            return False
+        err.add_note(
+            f"Session {session_id} was cancelled and the files it had uploaded "
+            "were deleted; run the ingest again."
+        )
+        return True
 
     def _already_done(self, session_id: str) -> set[str]:
         """Return rel_paths already uploaded for this session (resume support).
@@ -615,11 +872,15 @@ class FolderIngest:
     ) -> tuple[dict[str, str], list[dict[str, object]], int, int]:
         targets = list(begin.s3.uploads)
         proxy = self._uses_proxy(begin)
+        self._staged = []
+        self._stage_cap_asked = False
         if proxy:
             logger.info("uploading through DDS (proxy), not to the presigned S3 targets")
         done = self._already_done(begin.session_id)
         pending = [t for t in targets if t.rel_path not in done]
         skipped = len(targets) - len(pending)
+        if proxy:
+            self._refuse_files_over_the_stage_cap(pending)
 
         # Single-shot ETags (rel_path -> ETag) and multipart commit entries
         # ({rel_path, upload_id, parts:[{part_number, etag}]}) are collected
@@ -682,7 +943,7 @@ class FolderIngest:
         it fails at the **network** layer (unreachable endpoint, DNS, TLS,
         timeout), sends the file through DDS instead. An HTTP error from S3 is
         not retried through DDS: that is a signing or permission problem the
-        proxy would not fix.
+        proxy would not fix. Nor is a file larger than ``/stage`` accepts (PY-10).
         """
         data = (self.folder / target.rel_path).read_bytes()
         mode = self._effective_upload_mode(begin)
@@ -695,6 +956,13 @@ class FolderIngest:
             return self._client.upload_file(target, data), None
         except httpx.TransportError as exc:
             if mode != "auto":
+                raise
+            cap = self._stage_limit()
+            if cap is not None and len(data) > cap:
+                exc.add_note(
+                    f"Not sent through DDS instead: {target.rel_path!r} is {len(data):,} "
+                    f"bytes, more than POST /api/v1/ingest/stage accepts ({cap:,} bytes)."
+                )
                 raise
             logger.warning(
                 "presigned upload of %s failed at the network layer (%s); "
@@ -711,7 +979,51 @@ class FolderIngest:
         S3 with its own credentials. A file the server planned as multipart goes
         through whole; DDS accepts that at commit (DI-12.10a)."""
         self._client.stage(session_id, target.rel_path, data)
+        self._staged.append(target.rel_path)
         return None, None
+
+    def _stage_limit(self) -> int | None:
+        """The largest file ``POST /api/v1/ingest/stage`` accepts, from ``GET
+        /api/v1/ingest/limits`` (DI-12.11), asked at most once per run (PY-10).
+
+        ``None`` when DDS does not say — a server before DI-12.11 answers 404 —
+        or the question fails: this is a check ahead of DDS's own, never a
+        reason to fail an upload by itself.
+        """
+        with self._stage_cap_lock:
+            if not self._stage_cap_asked:
+                self._stage_cap_asked = True
+                try:
+                    value = self._client.limits("notebook").get("stage_max_bytes")
+                except Exception:  # noqa: BLE001 — best-effort, see the docstring
+                    logger.debug("could not read the ingest limits", exc_info=True)
+                    value = None
+                self._stage_cap = value if isinstance(value, int) else None
+            return self._stage_cap
+
+    def _refuse_files_over_the_stage_cap(self, targets: list[UploadTarget]) -> None:
+        """With ``proxy`` every file goes through ``POST /ingest/stage``, which DDS
+        caps on its own and checks only when each file arrives (PY-10). Refuse an
+        oversized file before anything is uploaded, rather than after the files
+        ahead of it."""
+        cap = self._stage_limit()
+        if cap is None:
+            return
+        too_big: list[str] = []
+        for target in targets:
+            size = (self.folder / target.rel_path).stat().st_size
+            if size > cap:
+                too_big.append(f"{target.rel_path!r} ({size:,} bytes)")
+        if not too_big:
+            return
+        err = IngestApiError(
+            400,
+            f"DDS accepts files of up to {cap:,} bytes through POST /api/v1/ingest/stage, "
+            f"which this upload goes through; too large: {', '.join(too_big)}",
+            where="local size check against GET /api/v1/ingest/limits (nothing was uploaded)",
+        )
+        err.retryable = False
+        raise err
 
 
 def ingest_folder(
