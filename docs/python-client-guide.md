@@ -791,7 +791,7 @@ FolderIngest(
 | `idempotency_key` | Passed to `begin` so a repeated call replays the same session rather than starting a second one. **Dropped automatically** when `retry()` has to start over, or the server would just replay the failed session. |
 | `multipart` | `True`/`False` forces the server's multipart decision; `None` leaves it to the server. |
 | `table_definition` | The table's column types (and, for later servers, partitioning and sorting) — a `TableDefinition` or a dict in the contract's shape. See [Table definitions](#table-definitions-csvjson-options-inferred-columns). |
-| `cleanup_on_failure` | After a commit failure the server *could* retry, cancel the session — deleting its uploaded files — instead of keeping it for `retry()`. Default `False`: kept. |
+| `cleanup_on_failure` | After a commit failure the server *could* retry, cancel the session — deleting its uploaded files — instead of keeping it for `retry()`. Default `False`: kept. With it, a `retry()` afterwards uploads again under a new session. |
 | `csv_options` / `json_options` | Parsing hints sent on begin, each only for its own format. CSV: `delimiter`, `quote`, `header`, `encoding`. JSON: `format`, `"lines"` or `"array"`. Inference uses them too. |
 | `infer_schema` | For CSV/JSON into an `editable` table without a `table_definition`: infer the columns locally from every file and send them. `False` turns that off. |
 | `show_progress` | `False` suppresses the progress bar, and the plan, inferred columns and `diagnose()` lines that are otherwise printed. |
@@ -1001,7 +1001,7 @@ with FolderIngest(folder="./my_data", target_catalog_path="catalog.theme.sub",
 | failed, not resumable, staged placement | Opens a fresh session and uploads the folder again, dropping any `idempotency_key` first. |
 | `done` | `IngestStateError` — already succeeded, nothing to retry. |
 | `pending` / `uploading` / `committing` | `IngestStateError` — wait for it to finish. |
-| — this object's own `run()` failed **in the upload**, so it cancelled the session | Uploads again under a new session when the failure can pass — a network error, a 5xx, or DDS saying `retryable` — and the cancel went through. Otherwise `IngestStateError`, quoting the upload error. The server is not asked: that session never got all its files. |
+| — this object's own `run()` cancelled the session: after a failed **upload**, or after a failed commit with `cleanup_on_failure=True` | Uploads again under a new session when the failure can pass — a network error, a 5xx, or DDS saying `retryable` — and the cancel went through. Otherwise `IngestStateError`, quoting the error. The server is not asked: that session is gone, or never got all its files. |
 | no session at all | `IngestStateError`. |
 
 **With corrected columns.** `retry(table_definition=…)` replaces the

@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from eea_datalakehouse.dds_ingestion.client import IngestApiError
 from eea_datalakehouse.dds_ingestion.folder import Diagnosis, FolderIngest
 from eea_datalakehouse.dds_ingestion.models import (
     BeginResult,
@@ -256,3 +257,34 @@ def test_diagnose_reports_a_missing_folder_and_goes_on(
 def test_diagnose_with_nothing_queued_says_so(capsys: pytest.CaptureFixture[str]) -> None:
     IngestSession(client=_StubClient()).diagnose()  # type: ignore[arg-type]
     assert "nothing queued" in capsys.readouterr().out
+
+
+def test_cleanup_on_failure_with_retry_uploads_again(tmp_path: Path) -> None:
+    class FailsOnceClient(_StubClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancelled: list[str] = []
+
+        def commit(self, *, session_id: str, **kwargs: Any) -> CommitResult:
+            if not self.commit_calls:
+                self.commit_calls.append(session_id)
+                err = IngestApiError(503, "Dremio is busy", where="POST commit")
+                err.retryable = True
+                raise err
+            return super().commit(session_id=session_id, **kwargs)
+
+        def cancel(self, session_id: str) -> None:
+            self.cancelled.append(session_id)
+
+    client = FailsOnceClient()
+    session = IngestSession(client=client)  # type: ignore[arg-type]
+    session.ingest(
+        _make_folder(tmp_path, "a"), "bio.uploads", data_format="parquet",
+        show_progress=False, cleanup_on_failure=True,
+    )
+
+    report = session.commit(retry=True)
+
+    assert [o.commit.status for o in report.outcomes] == ["done"]
+    assert client.cancelled == ["sess-1"]  # the failed commit left nothing behind
+    assert client.begin_calls == 2  # and the retry uploaded again

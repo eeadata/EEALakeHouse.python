@@ -407,6 +407,7 @@ def test_ingest_help_lists_methods(
     assert "retry=False, max_retries=3" in table_html
     # PY-11: the one-line options show, with their defaults.
     assert "csv_options=None" in table_html and "upload_mode=&#x27;auto&#x27;" in table_html
+    assert "cleanup_on_failure=False" in table_html
     assert "str | None" not in table_html  # no Python type-hint syntax leaking into the table
     assert _magics_instance(ip)._ingest_session is None
 

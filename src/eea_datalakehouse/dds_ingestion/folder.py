@@ -104,13 +104,15 @@ class IngestOutcome:
 
 
 @dataclass(frozen=True, slots=True)
-class _UploadFailure:
-    """Why the last :meth:`FolderIngest.run` stopped in the upload phase, kept for
-    :meth:`FolderIngest.retry` (PY-8)."""
+class _FailedRun:
+    """Why the last :meth:`FolderIngest.run` stopped and cancelled its session —
+    an upload failure (PY-2), or a commit failure with ``cleanup_on_failure`` —
+    kept for :meth:`FolderIngest.retry` (PY-8)."""
 
+    stage: str  # "upload" | "commit"
     error: Exception
     session_id: str
-    cancelled: bool  # whether PY-2's cancel went through
+    cancelled: bool  # whether the cancel went through
 
 
 def _may_succeed_on_retry(err: Exception) -> bool:
@@ -226,7 +228,8 @@ class FolderIngest:
         # begin; the begin plan says which parts this server uses.
         self.table_definition = table_definition
         # DI-12.26: after a commit failure the server could retry, drop the
-        # session (and its uploaded files) instead of keeping it for retry().
+        # session (and its uploaded files) instead of keeping it for retry();
+        # a retry() then uploads again under a new session.
         self.cleanup_on_failure = cleanup_on_failure
         # Parsing hints sent on begin (the server already accepts them).
         self.csv_options = csv_options
@@ -244,9 +247,9 @@ class FolderIngest:
         # command below works from.
         self._session_id: str | None = None
         self._begin: BeginResult | None = None
-        # Set when run() cancelled its session after a failed upload; what
-        # retry() goes by once there is no session left (PY-8).
-        self._upload_failure: _UploadFailure | None = None
+        # Set when run() cancelled its session after a failure; what retry()
+        # goes by once there is no session left (PY-8).
+        self._failed_run: _FailedRun | None = None
         # The files the current run sent through DDS after a network error;
         # appended to from the upload threads (list.append is atomic).
         self._staged_by_fallback: list[str] = []
@@ -315,13 +318,13 @@ class FolderIngest:
         :meth:`status`, :meth:`retry` or :meth:`cancel` the transfer. Use it as a
         context manager (or call :meth:`close`) to release it.
         """
-        self._upload_failure = None
+        self._failed_run = None
         begin = self.begin()
         try:
             etags, multipart_etags, uploaded, skipped = self._upload_all(begin)
         except Exception as err:
             cancelled = self._cancel_after_failure(err)
-            self._upload_failure = _UploadFailure(err, begin.session_id, cancelled)
+            self._failed_run = _FailedRun("upload", err, begin.session_id, cancelled)
             raise
         try:
             commit = self.commit(multipart_etags=multipart_etags or None)
@@ -649,11 +652,12 @@ class FolderIngest:
           staged copy is gone. A fresh session is opened and the folder is
           uploaded again. Any ``idempotency_key`` is dropped for that attempt, or
           the server would just replay the failed session.
-        * **An upload of this object's own** :meth:`run` **failed**, so that run
-          cancelled its session (PY-2) and there is none left to resume. The
-          folder is uploaded again under a new session if the failure can pass
-          (a network error, a 5xx) and the cancel went through; otherwise this
-          raises :class:`IngestStateError` quoting the upload error.
+        * **This object's own** :meth:`run` **cancelled its session** — after a
+          failed upload (PY-2), or after a failed commit with
+          ``cleanup_on_failure`` — so there is none left to resume. The folder is
+          uploaded again under a new session if the failure can pass (a network
+          error, a 5xx, DDS saying ``retryable``) and the cancel went through;
+          otherwise this raises :class:`IngestStateError` quoting the error.
 
         **A transfer whose files are stored permanently is never re-uploaded
         blindly.** There the upload landed in the table's own folder and stayed,
@@ -669,10 +673,10 @@ class FolderIngest:
         """
         if table_definition is not None:
             self.table_definition = table_definition
-        if self._upload_failure is not None:
-            # Whether or not its cancel went through, that session never got all
-            # its files: the server has nothing to resume (PY-8).
-            return self._rerun_after_failed_upload(self._upload_failure)
+        if self._failed_run is not None:
+            # That session was cancelled, or never got all its files: the server
+            # has nothing to resume (PY-8).
+            return self._rerun_after_cancel(self._failed_run)
         if self._session_id is None:
             raise IngestStateError("no session to retry — call run() first")
         status = self._client.get_status(self._session_id)
@@ -720,15 +724,15 @@ class FolderIngest:
         self.idempotency_key = None
         return self.run()
 
-    def _rerun_after_failed_upload(self, failure: _UploadFailure) -> IngestOutcome:
-        """:meth:`retry` once :meth:`run` cancelled its session after a failed
-        upload (PY-8). Uploads again only when a second attempt can succeed and
-        nothing of the first is left behind; otherwise raises, quoting the upload
-        error, so a caller that retries (``IngestSession.commit(retry=True)``)
-        shows the cause instead of "no session"."""
+    def _rerun_after_cancel(self, failure: _FailedRun) -> IngestOutcome:
+        """:meth:`retry` once :meth:`run` cancelled its session after a failure
+        (PY-8). Uploads again only when a second attempt can succeed and nothing
+        of the first is left behind; otherwise raises, quoting the error, so a
+        caller that retries (``IngestSession.commit(retry=True)``) shows the
+        cause instead of "no session"."""
         if not failure.cancelled:
             raise IngestStateError(
-                f"the upload failed ({failure.error}) and session {failure.session_id} "
+                f"the {failure.stage} failed ({failure.error}) and session {failure.session_id} "
                 "could not be cancelled, so files it uploaded may still be in place; "
                 "uploading again could add a second copy. Cancel it with "
                 "FolderIngest.attach(...).cancel(), or wait for the server's sweep, "
@@ -736,12 +740,13 @@ class FolderIngest:
             ) from failure.error
         if not _may_succeed_on_retry(failure.error):
             raise IngestStateError(
-                f"the upload failed ({failure.error}); its session was cancelled, and "
-                "uploading again would fail the same way. Fix the cause, then run the "
-                "ingest again."
+                f"the {failure.stage} failed ({failure.error}); its session was "
+                "cancelled, and running it again would fail the same way. Fix the "
+                "cause, then run the ingest again."
             ) from failure.error
         logger.info(
-            "the upload of session %s failed (%s); uploading again under a new session",
+            "the %s of session %s failed (%s); uploading again under a new session",
+            failure.stage,
             failure.session_id,
             failure.error,
         )
@@ -770,8 +775,9 @@ class FolderIngest:
             err.add_note(status.describe_failure())
         except Exception:  # noqa: BLE001 — the commit error is what matters
             logger.debug("could not fetch the failed session's status", exc_info=True)
-        if self.cleanup_on_failure and err.retryable is True:
-            self._cancel_after_failure(err)
+        if self.cleanup_on_failure and err.retryable is True and self._cancel_after_failure(err):
+            # The upload is gone with the session, so retry() starts over (PY-8).
+            self._failed_run = _FailedRun("commit", err, session_id, cancelled=True)
 
     def _cancel_after_failure(self, err: Exception) -> bool:
         """Cancel the session after a failure, say so on ``err``, and return

@@ -310,7 +310,9 @@ done).
 > is left, because that session never got all its files and asking the server
 > about it would only say "uploading". "Can pass" (`_may_succeed_on_retry`) is a
 > network error, or an `IngestApiError` whose `retryable` is true or, without
-> one, whose status is 5xx.
+> one, whose status is 5xx. Since PY-11, a commit that `cleanup_on_failure` cancelled is
+> recorded the same way, so a retry after a cleanup uploads again instead of
+> finding no session.
 
 #### PY-9 `retry` with a corrected table definition (rest of PY-3) — **DONE**
 
@@ -371,11 +373,13 @@ done).
 > Landed `e1c262d` and `a02a561`. Scope set on 2026-10-19 after talking to Oskar:
 > keep `IngestSession`'s logic and queue-then-commit concept, and add only what a
 > one-off user can give on the **one** `%ingest` line — what cannot be, stays out.
-> As built: `upload_mode`, `csv_options`, `json_options` and `table_definition` (a
-> dict on that line) are forwarded. `infer_schema` and `cleanup_on_failure` are
-> left out: turning inference off only makes DDS ask for the columns, which
-> `table_definition` gives anyway, and a cleanup after a failed commit would leave
-> `commit(retry=True)` nothing to retry. One verb, `%ingest diagnose`, runs
+> As built: `upload_mode`, `csv_options`, `json_options`, `table_definition` (a
+> dict on that line) and `cleanup_on_failure` are forwarded — the last at the
+> user's request, since for most one-off ingests a retry will not help and a failed
+> commit should leave nothing behind; `commit(retry=True)` then uploads a
+> cleaned-up ingest again (PY-8). `infer_schema` is left out: turning inference off
+> only makes DDS ask for the columns, which `table_definition` gives anyway. One
+> verb, `%ingest diagnose`, runs
 > `FolderIngest.diagnose()` for every queued ingest and keeps the queue; no
 > `dry_run` verb, since `diagnose` ends with one.
 

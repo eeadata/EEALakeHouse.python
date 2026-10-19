@@ -126,6 +126,7 @@ class IngestSession:
         multipart: bool | None = None,
         show_progress: bool = True,
         table_definition: TableDefinition | Mapping[str, Any] | None = None,
+        cleanup_on_failure: bool = False,
         csv_options: Mapping[str, Any] | None = None,
         json_options: Mapping[str, Any] | None = None,
         upload_mode: UploadMode = "auto",
@@ -136,18 +137,20 @@ class IngestSession:
         there is nothing to encapsulate — `FolderIngest` already defaults
         it to `None` (a fresh session every run).
 
-        Each of the last four still fits on the one `%ingest` line that queues
+        Each of the last five still fits on the one `%ingest` line that queues
         the ingest::
 
             upload_mode="proxy"                   # S3 is unreachable from this kernel
             csv_options={"delimiter": ";"}        # CSV parsing hints
             json_options={"format": "array"}      # a JSON array rather than JSON lines
             table_definition={"columns": [{"name": "value", "type": "DOUBLE"}]}
+            cleanup_on_failure=True               # a failed commit leaves nothing behind
 
-        `FolderIngest`'s `infer_schema` and `cleanup_on_failure` are left out on
-        purpose: turning inference off only makes DDS ask for the columns, which
-        `table_definition` gives anyway, and a cleanup after a failed commit
-        would leave `commit(retry=True)` nothing to retry."""
+        With `cleanup_on_failure=True`, `commit(retry=True)` uploads a cleaned-up
+        ingest again under a new session (see `FolderIngest.retry`).
+        `FolderIngest`'s `infer_schema` is left out on purpose: turning
+        inference off only makes DDS ask for the columns, which
+        `table_definition` gives anyway."""
         self._pending.append(
             _QueuedIngest(
                 folder=folder,
@@ -162,6 +165,7 @@ class IngestSession:
                     "multipart": multipart,
                     "show_progress": show_progress,
                     "table_definition": table_definition,
+                    "cleanup_on_failure": cleanup_on_failure,
                     "csv_options": csv_options,
                     "json_options": json_options,
                     "upload_mode": upload_mode,

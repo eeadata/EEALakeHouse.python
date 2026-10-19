@@ -327,8 +327,9 @@ custodian, not necessarily a developer. `%ingest help` does the same for `Ingest
 
 `%ingest ingest(...)` also takes what a one-off ingest may need, each on that same line:
 `upload_mode="proxy"` when S3 is unreachable from the kernel, `csv_options={"delimiter": ";"}`,
-`json_options={"format": "array"}`, and `table_definition={"columns": [{"name": "value",
-"type": "DOUBLE"}]}` for the column types of a CSV or JSON table.
+`json_options={"format": "array"}`, `table_definition={"columns": [{"name": "value",
+"type": "DOUBLE"}]}` for the column types of a CSV or JSON table, and `cleanup_on_failure=True`
+so a failed commit deletes its upload instead of leaving it for a retry.
 
 A freshly created session already has a context — it starts at `"catalog"` (the catalog
 root), not empty — so a relative path works even before the first `use()` call.
