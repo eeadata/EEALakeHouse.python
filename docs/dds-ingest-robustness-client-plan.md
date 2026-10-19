@@ -1,8 +1,9 @@
 # DDS ingest robustness — the client half (DI-12) — plan
 
 > Status: **PY-1 … PY-7 implemented** (2026-10-16). Reviewed against the code on
-> 2026-10-19: what is still open, and the follow-up tasks PY-8 … PY-13, are in §5.
-> Date: 2026-10-16.
+> 2026-10-19 (§5); the follow-up tasks **PY-8, PY-9, PY-10, PY-12 and PY-13
+> implemented** the same day. Open: the §5.1 repair reaching `main`, and PY-11,
+> which is Oskar's decision. Date: 2026-10-16.
 
 Companion plan for **this** repository. The design, the server work and the
 release schedule live with DDS:
@@ -73,8 +74,8 @@ missing was the automatic fallback (G10 in `Documentation/data-digestion.md`).
 > decides, and its default `"auto"` follows the server. The fallback is added on
 > top: only when both `FolderIngest` and the server say `"auto"`
 > (`_falls_back_to_proxy`). DDS sends `upload_mode` on every begin, `"auto"` unless
-> configured, so the fallback is on by default. Open: the `/stage` size cap is not
-> checked before uploading (PY-10).
+> configured, so the fallback is on by default. The `/stage` size cap is checked
+> before uploading since PY-10.
 
 ### PY-2 Cancel when an upload fails; small fixes — R1 — **DONE**
 
@@ -93,9 +94,9 @@ missing was the automatic fallback (G10 in `Documentation/data-digestion.md`).
 
 > Landed `9d924f7`. As built: any upload failure cancels the session, and the
 > uploads still queued are cancelled at the first failure; the PUT comment is fixed;
-> `.ndjson` is in the format table (`formats.py`). Open: under
-> `IngestSession(retry=True)` the cancel hides the upload error (PY-8); the client
-> guide does not describe it yet (PY-12).
+> `.ndjson` is in the format table (`formats.py`). Under
+> `IngestSession(retry=True)` the cancel hid the upload error until PY-8; the
+> client guide describes it since PY-12.
 
 ### PY-3 Optional table definition — R2 — **DONE**
 
@@ -119,8 +120,8 @@ missing was the automatic fallback (G10 in `Documentation/data-digestion.md`).
   definition → only set fields sent; against a server without `definition_applied`
   → the definition goes on commit.
 
-> Landed `6a4faaf`. Open: `IngestClient.retry(definition=…)` for DI-12.6 was not
-> built (PY-9).
+> Landed `6a4faaf`. `IngestClient.retry(definition=…)` for DI-12.6 followed in
+> PY-9.
 
 ### PY-4 Show the plan, and `dry_run` — R2 — **DONE**
 
@@ -157,8 +158,8 @@ missing was the automatic fallback (G10 in `Documentation/data-digestion.md`).
 
 > Landed `a7f99e9`. As built: `IngestApiError.error_slug` and `.retryable`; a failed
 > commit carries the session's own failure text (`StatusResult.describe_failure`) as
-> an exception note; `cleanup_on_failure` as planned. `failed_stage` is in that note
-> but is not an attribute (PY-13).
+> an exception note; `cleanup_on_failure` as planned. `failed_stage` became an
+> attribute in PY-13.
 
 ### PY-6 CSV/JSON options, inferred columns, local Parquet check — R3/R4 — **DONE**
 
@@ -231,9 +232,9 @@ The follow-up tasks from the 2026-10-19 review are ordered in §5.5.
 - `docs/python-client-guide.md` describes each new option, with one example with
   and one without a table definition. mypy clean; the test suite passes.
 
-> 2026-10-19: met except the client guide (PY-12). `dry_run` is a method rather
-> than an option (PY-4). mypy is clean for the code these tasks touched; the
-> remaining errors are in `dds_ingestion/common/dremio_identity.py`.
+> 2026-10-19: met — the client guide since PY-12 (`f512d2f`). `dry_run` is a
+> method rather than an option (PY-4). mypy is clean for the code these tasks
+> touched; the remaining errors are in `dds_ingestion/common/dremio_identity.py`.
 
 ---
 
@@ -264,23 +265,24 @@ the server sends none, as in `774691a`). The whole suite passes. This has to rea
 
 ### 5.2 Where each task stands
 
-| Task | State | Open |
-|---|---|---|
-| PY-1 | done; built on `774691a` | `/stage` size cap not checked (PY-10); not in the client guide (PY-12) |
-| PY-2 | done | hides the upload error under `IngestSession(retry=True)` (PY-8); not in the guide (PY-12) |
-| PY-3 | done | `retry` cannot send a corrected definition (PY-9) |
-| PY-4 | done, as a method | — |
-| PY-5 | done | `failed_stage` only in the note text (PY-13) |
-| PY-6 | done | end-to-end editable CSV run against `local-stack` not done (§5.7) |
-| PY-7 | done | — |
-| §4 | met except the guide | `docs/python-client-guide.md` describes none of the new options (PY-12) |
+| Task | State | Found in the review | Follow-up |
+|---|---|---|---|
+| PY-1 | done; built on `774691a` | `/stage` size cap not checked; not in the client guide | PY-10, PY-12 — done |
+| PY-2 | done | hides the upload error under `IngestSession(retry=True)`; not in the guide | PY-8, PY-12 — done |
+| PY-3 | done | `retry` cannot send a corrected definition | PY-9 — done |
+| PY-4 | done, as a method | — | — |
+| PY-5 | done | `failed_stage` only in the note text | PY-13 — done |
+| PY-6 | done | end-to-end editable CSV run against `local-stack` not done | §5.7 — open |
+| PY-7 | done | — | — |
+| §4 | met | `docs/python-client-guide.md` described none of the new options | PY-12 — done |
 
 Beyond the tasks: `IngestSession.ingest`, behind `%ingest`, passes `FolderIngest` a
-fixed set of options, so none of the options above reaches a notebook user (PY-11).
+fixed set of options, so none of the options above reaches a notebook user (PY-11,
+open).
 
 ### 5.3 Follow-up tasks
 
-#### PY-8 `retry()` after a cancelled upload
+#### PY-8 `retry()` after a cancelled upload — **DONE**
 
 - **Today:** PY-2 cancels the session after a failed upload, and
   `FolderIngest.retry()` then raises `IngestStateError("no session to retry — call
@@ -303,7 +305,14 @@ fixed set of options, so none of the options above reaches a notebook user (PY-1
   network error in `direct` mode the next attempt uploads and commits; after a
   failed cancel nothing is re-uploaded.
 
-#### PY-9 `retry` with a corrected table definition (rest of PY-3)
+> Landed `7dad450`. As built: `run()` records the upload failure, and `retry()`
+> looks at it before anything else — also when the cancel failed and a session id
+> is left, because that session never got all its files and asking the server
+> about it would only say "uploading". "Can pass" (`_may_succeed_on_retry`) is a
+> network error, or an `IngestApiError` whose `retryable` is true or, without
+> one, whose status is 5xx.
+
+#### PY-9 `retry` with a corrected table definition (rest of PY-3) — **DONE**
 
 - `IngestClient.retry(session_id, *, definition=None)` and
   `FolderIngest.retry(*, table_definition=None)`: with a definition, the resumed
@@ -316,7 +325,13 @@ fixed set of options, so none of the options above reaches a notebook user (PY-1
   without a definition is unchanged; against a server before DI-12.6 the retry
   behaves as today.
 
-#### PY-10 Check file sizes against the server's limits (rest of PY-1)
+> Landed `9b4f429`. As built: without a definition, `FolderIngest.retry()` still
+> calls `client.retry(session_id)` with no keyword, so a client written against
+> the old signature — two test fakes in `IngestSession`'s tests are — keeps
+> working. The behaviour against a server before DI-12.6 is from that server's
+> code (its endpoint takes no body), not a test.
+
+#### PY-10 Check file sizes against the server's limits (rest of PY-1) — **DONE**
 
 - DDS has two caps. `begin` refuses a file over the caller's cap (DI-12.13), but
   `POST /ingest/stage` has its own `stage_max_bytes` and refuses a file only when
@@ -332,6 +347,13 @@ fixed set of options, so none of the options above reaches a notebook user (PY-1
 - **Verify:** proxy mode with one file over the stage cap uploads nothing; the
   fallback is not attempted for such a file; an older server is unchanged.
 
+> Landed `2a554b2`. As built: proxy mode asks for the limits before uploading; the
+> fallback asks only when a file actually falls back, so a plain direct upload
+> makes no extra request. Best-effort: a 404, or any failure of the limits
+> request, leaves DDS's own check as the only one. `diagnose()` gained a "File
+> sizes" step after the credential step: a file over `max_bytes` fails it, one
+> over `stage_max_bytes` fails it only with `upload_mode="proxy"`.
+
 #### PY-11 The new options in `%ingest` — Oskar's decision
 
 - `IngestSession.ingest` (`dds_ingestion/session.py`) passes `FolderIngest` seven
@@ -346,7 +368,7 @@ fixed set of options, so none of the options above reaches a notebook user (PY-1
 - **Owner:** Oskar Esparza — it is his module; nothing changes there without him.
 - **Server:** none.
 
-#### PY-12 Client guide — the open part of §4
+#### PY-12 Client guide — the open part of §4 — **DONE**
 
 - `docs/python-client-guide.md` describes: `upload_mode` (`FolderIngest`'s choice,
   the server's hint, the fallback); cancel on upload failure; `table_definition`,
@@ -355,12 +377,19 @@ fixed set of options, so none of the options above reaches a notebook user (PY-1
   `error_slug`, `retryable` and the failure note.
 - The DI-12 plan (§7.2) lists the `upload_mode` and cancel parts as open since R1.
 
-#### PY-13 Small fixes
+> Landed `f512d2f`, covering PY-8, PY-9, PY-10 and PY-13 as well. As built: Part 1's
+> reference tables also caught up with PY-3 … PY-7 (models, `IngestClient`
+> endpoints, errors), and the "S3 is unreachable" recipe uses
+> `upload_mode="proxy"` instead of driving `/stage` by hand.
+
+#### PY-13 Small fixes — **DONE**
 
 - `failed_stage` as an attribute on the exception from a failed commit (PY-5 named
   it; today it is only in the note).
 - `IngestOutcome.files_staged`: how many files went through DDS, so a fallback is
   visible. `IngestOutcome.upload_mode` stays as it is.
+
+> Landed `a5900d8`.
 
 ### 5.4 Not planned yet
 
@@ -374,12 +403,15 @@ fixed set of options, so none of the options above reaches a notebook user (PY-1
 
 ### 5.5 Order
 
-| Step | What | Why first |
-|---|---|---|
-| 1 | §5.1 to `main`, with Oskar | every Python ingest from `@main` fails today |
-| 2 | PY-8, PY-12, PY-13 | fix and document what is already shipped |
-| 3 | PY-9, PY-10 | use server features that are already deployed |
-| 4 | PY-11 | when Oskar agrees |
+| Step | What | Why first | State |
+|---|---|---|---|
+| 1 | §5.1 to `main`, with Oskar | every Python ingest from `@main` fails today | on `eea_bliki` (`60cad54`), not yet on `main` |
+| 2 | PY-8, PY-12, PY-13 | fix and document what is already shipped | done 2026-10-19 |
+| 3 | PY-9, PY-10 | use server features that are already deployed | done 2026-10-19 |
+| 4 | PY-11 | when Oskar agrees | open |
+
+Steps 2 and 3 were built in the order PY-8, PY-13, PY-9, PY-10, PY-12, so the guide
+documents all of them at once.
 
 ### 5.6 Coordination
 
