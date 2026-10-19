@@ -201,6 +201,7 @@ the second call in a session.
 import eea_datalakehouse.notebook
 
 %ingest ingest(folder="./bw_2026", target_catalog_path="bwd.reference", data_format="parquet")
+%ingest diagnose          # optional: check what is queued; uploads nothing, keeps the queue
 %ingest commit(retry=True)
 
 %catalog set_tags(".water_temperature", ["reviewed"])

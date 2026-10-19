@@ -167,3 +167,41 @@ def test_csv_options_reach_begin_only_for_csv(creds: DremioCreds) -> None:
     sent = [json.loads(call.request.read()) for call in route.calls]
     assert sent[0]["csv_options"] == {"delimiter": ";"}
     assert "csv_options" not in sent[1]
+
+
+# --- the CSV encoding: DDS passes none on, and Dremio reads CSV as UTF-8 ----------
+
+LATIN_1_CSV = "navn;by\nJørgen;Århus\n".encode("latin-1")
+
+
+def test_a_non_utf8_encoding_option_is_refused_before_anything_starts(tmp_path: Path) -> None:
+    (tmp_path / "a.csv").write_bytes(LATIN_1_CSV)
+    client = FakeClient()
+    job = _job(
+        tmp_path, "csv", client, intent="editable",
+        csv_options={"delimiter": ";", "encoding": "latin-1"},
+    )
+    with pytest.raises(IngestApiError, match="DDS ignores it") as exc:
+        job.run()
+    assert exc.value.retryable is False
+    assert client.begin_calls == []
+
+
+@pytest.mark.parametrize("spelling", ["utf8", "UTF-8", "utf_8"])
+def test_utf8_however_spelled_is_fine(tmp_path: Path, spelling: str) -> None:
+    (tmp_path / "a.csv").write_text("navn;by\nJørgen;Århus\n", encoding="utf-8")
+    client = FakeClient()
+    options = {"delimiter": ";", "encoding": spelling}
+    _job(tmp_path, "csv", client, intent="editable", csv_options=options).run()
+    assert _sent_columns(client) == [("navn", "VARCHAR"), ("by", "VARCHAR")]
+    assert client.begin_calls[0]["csv_options"] == options  # still sent as given
+
+
+def test_a_csv_that_is_not_utf8_is_named_before_anything_starts(tmp_path: Path) -> None:
+    (tmp_path / "a.csv").write_text("navn;by\nAnna;Oslo\n", encoding="utf-8")
+    (tmp_path / "b.csv").write_bytes(LATIN_1_CSV)
+    client = FakeClient()
+    job = _job(tmp_path, "csv", client, intent="editable", csv_options={"delimiter": ";"})
+    with pytest.raises(IngestApiError, match="'b.csv' is not valid UTF-8"):
+        job.run()
+    assert client.begin_calls == []

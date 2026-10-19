@@ -865,3 +865,101 @@ def test_list_datasets_refused_token_raises_auth_error() -> None:
 
     with pytest.raises(CatalogAuthError):
         CatalogRestClient(BASE_URL, "expired").list_datasets(["s", "top"])
+
+
+# --- children / list_folders / get_view_definition --------------------------
+
+
+def _folder_child(*path: str) -> dict[str, object]:
+    return {
+        "id": "-".join(path),
+        "path": list(path),
+        "type": "CONTAINER",
+        "containerType": "FOLDER",
+    }
+
+
+def _dataset_child(*path: str) -> dict[str, object]:
+    return {"id": "-".join(path), "path": list(path), "type": "DATASET"}
+
+
+@respx.mock
+def test_children_returns_the_entities_directly_inside_a_folder() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "entityType": "folder",
+                "children": [_folder_child("a", "b", "sub"), _dataset_child("a", "b", "t")],
+            },
+        )
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert [child["id"] for child in client.children("a.b")] == ["a-b-sub", "a-b-t"]
+
+
+@respx.mock
+def test_children_raises_rather_than_calling_a_missing_folder_empty() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/gone").mock(return_value=httpx.Response(404))
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    with pytest.raises(CatalogOperationError, match="does not exist"):
+        client.children("a.gone")
+
+
+@respx.mock
+def test_list_folders_walks_the_subtree_shallowest_first() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a").mock(
+        return_value=httpx.Response(
+            200,
+            json={"children": [_folder_child("a", "b"), _dataset_child("a", "t")]},
+        )
+    )
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b").mock(
+        return_value=httpx.Response(200, json={"children": [_folder_child("a", "b", "c")]})
+    )
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/b/c").mock(
+        return_value=httpx.Response(200, json={"children": []})
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert client.list_folders("a") == ["a.b", "a.b.c"]
+
+
+@respx.mock
+def test_list_folders_can_stay_at_the_top_level() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a").mock(
+        return_value=httpx.Response(200, json={"children": [_folder_child("a", "b")]})
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert client.list_folders("a", recursive=False) == ["a.b"]
+
+
+@respx.mock
+def test_get_view_definition_returns_the_sql_and_its_context() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/v").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "entityType": "dataset",
+                "type": "VIRTUAL_DATASET",
+                "sql": "SELECT * FROM t",
+                "sqlContext": ["a", "b"],
+            },
+        )
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert client.get_view_definition("a.v") == ("SELECT * FROM t", ["a", "b"])
+
+
+@respx.mock
+def test_get_view_definition_is_none_for_something_that_is_not_a_view() -> None:
+    respx.get(f"{BASE_URL}/api/v3/catalog/by-path/a/t").mock(
+        return_value=httpx.Response(200, json={"entityType": "dataset", "type": "PHYSICAL_DATASET"})
+    )
+    client = CatalogRestClient(BASE_URL, "pat")
+
+    assert client.get_view_definition("a.t") is None

@@ -450,6 +450,26 @@ rule, destructive operations should echo the fully resolved path before acting.
 
 #### 8. Proposed: `datacopy` should accept a folder and copy everything in it
 
+> **Status: done** — implemented as `catalog/foldertree.py`
+> (`folderscan` / `foldercopy` / `foldermove`), taking §8a's option 1: separate
+> verbs named for the folder, not an overloaded `datacopy`. What §8 left for the
+> team to decide was decided as follows, and each is documented where it lives:
+>
+> | Question | What was built |
+> |---|---|
+> | Views | Recreated **as views**, with every reference into the moved subtree rewritten to the new location (`remap_view_sql`), so the copy is self-contained. Never materialised into tables. `getentriesfrom` adds `TABLE_TYPE` as suggested, as a sibling of `gettablesfrom` rather than a change to its return type. |
+> | Depth | `cp -r`, stated: the whole subtree, empty folders included (found over REST, since `INFORMATION_SCHEMA` cannot see them). |
+> | Partial failure | Per-entry, not per-operation: each entry gets its own derived idempotency key (`"<key>:<op>:<path>"`), a failure is reported rather than raised, and `skip_existing=True` makes a re-run skip what already landed with a matching row count. |
+> | `overwrite=True` at folder scale | Per colliding entry, never "replace the target folder". |
+> | Parallelism | Not done, deliberately — the Flight-client concern in §8 is unresolved, and the module docstring says so. |
+> | Return type | `FolderTransferReport`, per entry, in the spirit of `IngestOutcome`. |
+> | `is_folder` best-effort | A failed REST folder listing degrades to rebuilding the tree from the entry paths, with a note on the report saying empty folders will not be reproduced — rather than failing or silently losing them. |
+> | Should `datamove` get the same treatment? | Yes, and its partial-failure story is answered by never deleting anything until the copy has verified: `foldermove` is `foldercopy` + delete, gated on `report.verified`. |
+>
+> `datacopy`/`datamove` are unchanged, so nothing released is broken. §9 (the
+> naming sweep) is still open — the new verbs follow the existing
+> lowercase-run-together style rather than pre-empting that decision.
+
 **Position to put to the team** (proposed here, not yet discussed with them):
 a custodian should be able to point `datacopy` at a dataset folder and have
 every table inside it copied, rather than making one call per table.

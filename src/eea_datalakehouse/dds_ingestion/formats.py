@@ -15,6 +15,7 @@ so a mismatch found here is the one the server would report.
 
 from __future__ import annotations
 
+import codecs
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -97,7 +98,12 @@ def _csv_schema(path: Path, options: Mapping[str, Any] | None) -> Columns:
         delimiter=opts.get("delimiter") or ",", quote_char=opts.get("quote") or '"'
     )
     read = pa_csv.ReadOptions(autogenerate_column_names=opts.get("header") is False)
-    return _columns(pa_csv.read_csv(path, read_options=read, parse_options=parse).schema)
+    schema = pa_csv.read_csv(path, read_options=read, parse_options=parse).schema
+    # pyarrow reads text that is not valid UTF-8 as binary, and a CSV has no binary
+    # columns: without this, a Latin-1 file would become VARBINARY columns.
+    if any(pa.types.is_binary(f.type) or pa.types.is_large_binary(f.type) for f in schema):
+        raise ValueError(f"{path.name} is not valid UTF-8")
+    return _columns(schema)
 
 
 def _json_schema(path: Path, options: Mapping[str, Any] | None) -> Columns:
@@ -123,6 +129,31 @@ FORMATS: dict[DataFormat, ClientFormat] = {
     "csv": ClientFormat("csv", (".csv",), False, _csv_schema),
     "json": ClientFormat("json", (".json", ".ndjson"), False, _json_schema),
 }
+
+
+def is_utf8(encoding: str) -> bool:
+    """Whether ``encoding`` names UTF-8, however it is spelled (``utf8``,
+    ``UTF-8``, ``utf_8``); an unknown name is not."""
+    try:
+        return codecs.lookup(encoding).name == "utf-8"
+    except LookupError:
+        return False
+
+
+def first_non_utf8(folder: Path, rel_paths: Sequence[str]) -> str | None:
+    """The first of the files that is not valid UTF-8, read in 1 MiB chunks;
+    ``None`` when every one is. Dremio reads CSV as UTF-8, and DDS passes no
+    encoding on to it."""
+    for rel in rel_paths:
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        with (folder / rel).open("rb") as fh:
+            try:
+                while chunk := fh.read(1 << 20):
+                    decoder.decode(chunk)
+                decoder.decode(b"", final=True)
+            except UnicodeDecodeError:
+                return rel
+    return None
 
 
 def local_columns(

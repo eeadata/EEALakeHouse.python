@@ -1,16 +1,11 @@
 from __future__ import annotations
 
-import httpx
 import pytest
 
-from eea_datalakehouse.dds_documents import DocumentsClient
-from eea_datalakehouse.dds_ingestion.credentials import DremioCreds
 from eea_datalakehouse.sdi import SdiCatalogue, SdiConfig, SdiController
 
 SDI_URL = "https://sdi.example.test/catalogue"
 API = f"{SDI_URL}/srv/api"
-DDS_URL = "https://dds.example.test"
-DREMIO_URL = "https://dremio.example.test"
 UUID = "070d9baa-448d-4168-8514-7dadb3ad876d"
 SERIES_UUID = "c3858959-90da-4c1b-b9ca-492db0e514df"
 
@@ -84,31 +79,6 @@ def record_url(uuid: str = UUID) -> str:
     return f"{API}/records/{uuid}/formatters/xml"
 
 
-def catalog_url(storage_path: str) -> str:
-    """Dremio's by-path lookup URL for an already URL-encoded storage path."""
-    return f"{DREMIO_URL}/api/v3/catalog/by-path/{storage_path}"
-
-
-def folder_entity() -> httpx.Response:
-    return httpx.Response(200, json={"entityType": "folder", "id": "f-1"})
-
-
-def dds_file_url(path: str) -> str:
-    return f"{DDS_URL}/api/v1/files/{path}"
-
-
 @pytest.fixture
-def creds() -> DremioCreds:
-    return DremioCreds(username="alice", _password="s3cr3t-pwd")
-
-
-@pytest.fixture
-def sdi(creds: DremioCreds) -> SdiController:
-    return SdiController(
-        SdiCatalogue(SdiConfig(api_url=SDI_URL)),
-        DocumentsClient(DDS_URL, creds),
-    )
-
-
-def not_found() -> httpx.Response:
-    return httpx.Response(404, json={"error": "not_found", "message": "no such file"})
+def sdi() -> SdiController:
+    return SdiController(SdiCatalogue(SdiConfig(api_url=SDI_URL)))

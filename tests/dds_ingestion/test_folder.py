@@ -416,12 +416,10 @@ def test_invalid_upload_mode_rejected(data_folder: Path) -> None:
     [
         ({"upload_mode": "proxy"}, "proxy"),
         ({"s3_extra": {"upload_mode": "proxy"}}, "proxy"),
-        ({}, None),
+        ({}, "direct"),  # no hint, or a server predating it
     ],
 )
-def test_begin_result_reads_the_upload_mode_hint(
-    payload: dict[str, object], expected: str | None
-) -> None:
+def test_begin_result_reads_the_upload_mode_hint(payload: dict[str, object], expected: str) -> None:
     s3: dict[str, object] = {"bucket": "b", "key_prefix": "p/", "uploads": []}
     data: dict[str, object] = {"session_id": "s", "status": "open", "s3": s3}
     if "s3_extra" in payload:
