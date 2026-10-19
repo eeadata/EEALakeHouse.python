@@ -796,13 +796,24 @@ def test_a_gpkg_export_can_be_pushed_with_dds(
     import httpx
     import pyarrow as pa
     import respx
-    from tests.geopackage.conftest import FakeSource
 
     from eea_datalakehouse.dds_documents.session import DdsSession
     from eea_datalakehouse.geopackage import GpkgController, GpkgSession
 
     dataset = "catalog.water.bwd"
-    source = FakeSource({f"{dataset}.codes": [pa.record_batch({"code": ["a"]})]})
+    codes = pa.record_batch({"code": ["a"]})
+
+    class _OneTableSource:  # a DatasetSource with one attributes table
+        def datasets(self, path: str) -> list[tuple[str, str]]:
+            return [(f"{dataset}.codes", "TABLE")]
+
+        def batches(self, sql: str) -> Any:
+            yield codes
+
+        def columns(self, path: str) -> list[tuple[str, str]]:
+            return []
+
+    source = _OneTableSource()
     monkeypatch.setattr(
         magics_module,
         "_build_gpkg_session",
