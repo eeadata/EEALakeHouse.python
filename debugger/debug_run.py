@@ -40,9 +40,9 @@ import requests
 from pathlib import Path
 from xmlrpc.client import Boolean
 from eea_datalakehouse.catalog import Catalog
-from eea_datalakehouse.dds_documents import DocumentsClient
+from eea_datalakehouse.dds_documents import DdsController, DdsFolder, DocumentsClient
 from eea_datalakehouse.dds_ingestion import DremioCreds, FolderIngest, IngestClient
-from eea_datalakehouse.sdi import SdiCatalogue, SdiController, metadata_path
+from eea_datalakehouse.sdi import SdiCatalogue, SdiController
 from eea_datalakehouse.dds_ingestion.common.dremio_identity import (endpoint, dds_credentials,
                                     resolve as _resolve_identity)
 
@@ -428,16 +428,17 @@ def run_sdi_extract() -> None:
     read-only SDI call); only the DDS upload is skipped."""
     uuid = CONFIG["sdi"]["latest_record_uuid"]
     documents = DocumentsClient(DDS_BASE_URL, dds_credentials(DREMIO_USERNAME, DREMIO_TOKEN))
-    with SdiController(SdiCatalogue.from_env(), documents) as sdi, documents:
+    with SdiController(SdiCatalogue.from_env()) as sdi, DdsController(documents) as dds:
         metadata = sdi.get_xml(uuid)
         print(f"sdi_extract  {metadata}")
         print(f"  revised   {metadata.record.date_stamp}")
         if DRY_RUN:
             print("DRY RUN — not uploading to DDS. Set DRY_RUN = False to run this for real.")
-            print(f"  would put {metadata_path(SDI_DDS_PATH, uuid)}")
+            target = dds.target(SDI_DDS_PATH, DdsFolder.METADATA)
+            print(f"  would put {target}/{metadata.filename}")
             return
-        result = sdi.push_to_dds(metadata, SDI_DDS_PATH)
-    print(f"sdi_extract  {result.action}  {result.dds_path}")
+        result = dds.push(SDI_DDS_PATH, DdsFolder.METADATA, metadata)
+    print(f"sdi_extract  {result}")
 
 
 
@@ -620,7 +621,7 @@ if __name__ == "__main__":
     TABLE2VIEW_IDEMPOTENCY_KEY = "debug-table2view-testview"
 
     # --- sdi_extract ------------------------------------------------------------
-    # Where the dataset lives in DDS; push_to_dds adds /metadata/{uuid}.xml.
+    # Where the dataset lives in DDS; DdsController.push adds /metadata/{uuid}.xml.
     # Provisional until the DDS document path is agreed (docs/sdi-integration-plan.md).
     _t = CONFIG["target"]
     SDI_DDS_PATH = f"catalog/{_t['domain']}/{_t['subdomain']}/{_t['dataflow']}"

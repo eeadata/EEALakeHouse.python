@@ -206,8 +206,9 @@ class BeginResult:
     ``upload_mode`` is the server's hint for how to send the files:
     ``"proxy"`` means upload through DDS (``POST /api/v1/ingest/stage``)
     because the presigned S3 targets are not usable from the client — e.g. the
-    storage's TLS certificate doesn't match the endpoint's name. ``None`` (no
-    hint, or a server predating it) means the presigned targets, as before.
+    storage's TLS certificate doesn't match the endpoint's name. No hint (or
+    a server predating it) reads as ``"direct"``: the presigned targets, as
+    before.
     Read from the top level of the response, or from inside ``s3``.
     """
 
@@ -215,10 +216,11 @@ class BeginResult:
     status: str
     s3: S3Plan
     collision: Any = None
-    # The values a server sends (DDS_INGEST_UPLOAD_MODE): ``direct`` — presigned
-    # only; ``proxy`` — through ``POST /ingest/stage``; ``auto`` — presigned,
-    # then the proxy on a network failure (see `FolderIngest._upload_one`).
-    upload_mode: str | None = None
+    # How the server wants the bytes sent (DDS_INGEST_UPLOAD_MODE): ``direct`` —
+    # presigned only; ``proxy`` — through ``POST /ingest/stage``; ``auto`` —
+    # presigned, then the proxy on a network failure. Absent on older servers,
+    # which never offered a choice: ``direct``.
+    upload_mode: str = "direct"
     # What commit will do (DI-12.2). ``None`` from a server predating it — which
     # is also how a client knows that server ignored a definition sent on begin.
     plan: BeginPlan | None = None
@@ -233,7 +235,7 @@ class BeginResult:
             status=data["status"],
             s3=S3Plan.from_json(s3),
             collision=data.get("collision"),
-            upload_mode=str(mode) if mode else None,
+            upload_mode=str(mode or "direct"),
             plan=BeginPlan.from_json(plan) if isinstance(plan, Mapping) else None,
         )
 

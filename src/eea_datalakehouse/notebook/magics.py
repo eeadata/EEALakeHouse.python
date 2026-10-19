@@ -1,5 +1,5 @@
-"""`%catalog`/`%%catalog`, `%ingest`, `%sdi` and `%metadata` — thin syntactic
-sugar over `CatalogSession`/`IngestSession`/`SdiSession`/`MetadataSession` (see
+"""`%catalog`/`%%catalog`, `%ingest`, `%sdi` and `%dds` — thin syntactic
+sugar over `CatalogSession`/`IngestSession`/`SdiSession`/`DdsSession` (see
 `docs/notebook-facade-for-data-scientists.md`, "Two magics, two sessions").
 
 Available the moment this package is imported inside IPython — `import
@@ -21,15 +21,19 @@ In any cell, once loaded either way::
     %ingest diagnose
     %ingest commit(retry=True)
 
-    %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
-    %metadata push_to_dds("catalog/water_management_resources/bathing_water/bwd")
+    %catalog use("catalog.water_management_resources.bathing_water.bwd")
+    %dds push(DELIVERABLES, "report.pdf", "annex/*.xlsx")
+    record = %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
+    %dds push(METADATA, record)
 
 `%sdi` (`eea_datalakehouse.sdi.session.SdiSession`) only reads the SDI
-catalogue; `%metadata` (`MetadataSession`, same module) pushes metadata files
-to DDS. Both run each call immediately, like `%catalog`, and are built on first
-use, like `%ingest`'s session, from the kernel environment (see that module's
-docstring for the variables). `%metadata push_to_dds` uploads the record
-`%sdi get_xml` fetched last, so it needs only the DDS path.
+catalogue; `%dds` (`eea_datalakehouse.dds_documents.session.DdsSession`)
+uploads files to one of the `%catalog` context's document folders in DDS
+(`DdsFolder`: DERIVED, METADATA, METHODOLOGY, ASSESSMENTS, ANALYSES,
+REFERENCES, DELIVERABLES, OTHERS — compulsory, typed bare on a `%dds` line). Both run each call
+immediately, like `%catalog`, and are built on first use, like `%ingest`'s
+session, from the kernel environment (see each module's docstring for the
+variables).
 
 `%catalog` executes each call immediately — there's no queue and no separate
 commit step to remember. A `CatalogSession` still sits underneath it (to keep
@@ -99,8 +103,11 @@ from IPython.display import HTML, display
 
 from ..catalog import Catalog
 from ..catalog.session import CatalogSession, CatalogSessionError
+from ..dds_documents.controller import DdsFolder, PushReport
+from ..dds_documents.session import DdsSession, DdsSessionError
 from ..dds_ingestion.session import IngestSession, IngestSessionError
-from ..sdi.session import MetadataSession, MetadataSessionError, SdiSession, SdiSessionError
+from ..sdi.session import SdiSession, SdiSessionError
+from ..session_utils import plain_param
 
 _USAGE = {
     "catalog": (
@@ -112,9 +119,9 @@ _USAGE = {
         "  |  %ingest diagnose  |  %ingest commit"
     ),
     "sdi": '%sdi get_xml("<uuid>")  |  %sdi resolve_series("<series uuid>")',
-    "metadata": (
-        '%metadata push_to_dds("a.b.c")  or  %metadata push_to_dds("a/b/c")'
-        "  (uploads the last %sdi get_xml result)"
+    "dds": (
+        '%dds push(DELIVERABLES, "report.pdf")  |  %dds push(METADATA, "a.xml", "b.xml")'
+        "  (into the %catalog use(...) folder)"
     ),
 }
 
@@ -304,8 +311,9 @@ _INGEST_HELP = [
 _SDI_HELP = [
     (
         "get_xml",
-        "Download the ISO 19115-3 XML of SDI record uuid, check it really is that record, "
-        "and remember it for %metadata push_to_dds. Runs immediately; needs no DDS settings.",
+        "Download the ISO 19115-3 XML of SDI record uuid and check it really is that record. "
+        "Runs immediately; needs no DDS settings. Push it with "
+        "record = %sdi get_xml(uuid), then %dds push(METADATA, record) (stored as <uuid>.xml).",
     ),
     (
         "resolve_series",
@@ -315,40 +323,75 @@ _SDI_HELP = [
 ]
 _SDI_HELP_NOTE = (
     "Environment: SDI_API_URL (empty means the public EEA catalogue; optional "
-    "SDI_USERNAME/SDI_PASSWORD for non-public records). Pushing to DDS is %metadata's job."
+    "SDI_USERNAME/SDI_PASSWORD for non-public records). Pushing to DDS is %dds's job."
 )
-# dds_base_url()/dremio_base_url() still work under %metadata; they are left
-# out of the help table on purpose, as troubleshooting helpers rather than
-# everyday commands.
-_METADATA_HELP = [
+_DDS_HELP = [
     (
-        "push_to_dds",
-        "Upload metadata (default: the last %sdi get_xml result) to "
-        "dds_path/folder/<uuid>.xml in DDS — a document upload, never an ingest. "
-        "target_name renames the file (e.g. target_name=\"bwd_2025.xml\"; .xml is added if "
-        "missing). dds_path "
-        "must already exist in the Dremio catalog (check_catalog=False skips that check). "
-        "Same bytes already there: unchanged; an older copy: replaced; a copy edited in DDS: "
-        "refused unless force=True.",
+        "push",
+        "Upload files to path/folder/ in DDS with PUT, one request per file — a document "
+        "upload, never an ingest. path defaults to the %catalog use(...) context and is "
+        "resolved like any %catalog path (absolute, or relative to the context). folder is "
+        "compulsory and must be one of DDS's document folders, typed bare (no quotes): DERIVED, "
+        "METADATA, METHODOLOGY, ASSESSMENTS, ANALYSES, REFERENCES, DELIVERABLES, OTHERS. "
+        "files are one or more, given one after another or as a list: local paths (globs like "
+        '"annex/*.pdf" too) or %sdi get_xml records (stored as <uuid>.xml). Every file is '
+        "read and checked before the first upload. target_name renames files in DDS: a string "
+        'for a single file (target_name="bwd_2025.xml"), or a dict from each file\'s own name to '
+        'its new name (target_name={"draft_v3.pdf": "report_2025.pdf"}); files left out, or an '
+        "empty target_name, keep their own name. "
+        "overwrite=True (default) replaces a file "
+        "already there; overwrite=False uploads nothing if any is.",
     ),
-    (
-        "check_catalog_path",
-        "Check dds_path exists in the Dremio catalog without pushing anything.",
-    ),
+    ("target", "Show the DDS folder push would upload to, without uploading anything."),
+    ("folders", "List the folders push accepts."),
+    ("dds_base_url", "Show the DDS URL push uses, and where it came from."),
 ]
-_METADATA_HELP_NOTE = (
-    "dds_path is the dataset's folder path, without the metadata folder. Its folders can be "
-    "separated with either '.' or '/', so these are the same path:\n"
-    "  catalog.water_management_resources.bathing_water.bwd\n"
-    "  catalog/water_management_resources/bathing_water/bwd\n"
-    "A name containing a '.' or a space is written in double quotes with '.' separators "
-    '(catalog."bathing water"."v1.0"), or as it is with \'/\' separators '
-    "(catalog/bathing water/v1.0).\n"
-    "Environment: DDS_BASE_URL and DREMIO_BASE_URL — read from the first .env found in the "
-    "notebook's folder or a parent when %metadata starts, else from the kernel environment "
-    "— and a Dremio identity: _DREMIO_USER/_DREMIO_PWD (as %ingest) or "
-    "DREMIO_USERNAME/DREMIO_TOKEN (as %catalog), used for both DDS and the catalog check."
+_DDS_HELP_NOTE = (
+    "Files go to <dataset folder>/<folder>/<file name>, e.g. after\n"
+    '  %catalog use("catalog.water_management_resources.bathing_water.bwd")\n'
+    '  %dds push(DELIVERABLES, "report.pdf")\n'
+    "-> catalog/water_management_resources/bathing_water/bwd/deliverables/report.pdf\n"
+    "\n"
+    "push examples:\n"
+    "  files — one or more, one after another, as a list, or as a glob:\n"
+    '    %dds push(DELIVERABLES, "report.pdf", "annex.xlsx")\n'
+    '    %dds push(DELIVERABLES, ["report.pdf", "annex.xlsx"])\n'
+    '    %dds push(ANALYSES, "results/*.csv")\n'
+    "  an SDI record from %sdi get_xml (stored as <uuid>.xml):\n"
+    '    record = %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")\n'
+    "    %dds push(METADATA, record)\n"
+    "  folder — compulsory, one of DERIVED, METADATA, METHODOLOGY, ASSESSMENTS, ANALYSES,\n"
+    '  REFERENCES, DELIVERABLES, OTHERS, typed bare (a string like "methodology" is refused):\n'
+    '    %dds push(METHODOLOGY, "method.docx")\n'
+    "  path= — another dataset than the %catalog context, absolute or relative to it:\n"
+    '    %dds push(DELIVERABLES, "report.pdf", path="catalog.water_management_resources.wfd")\n'
+    '    %dds push(DELIVERABLES, "report.pdf", path="../wfd")\n'
+    "  overwrite= — True (default) replaces a file already there;\n"
+    "  False uploads nothing if any is:\n"
+    "    %dds push(METADATA, record, overwrite=False)\n"
+    "  target_name= — another name in DDS: a string for one file, a dict for several\n"
+    "  (files left out keep their name):\n"
+    '    %dds push(METADATA, record, target_name="bwd_2025.xml")\n'
+    '    %dds push(DELIVERABLES, "draft_v3.pdf", "annex.xlsx", '
+    'target_name={"draft_v3.pdf": "report_2025.pdf"})\n'
+    "  all together:\n"
+    '    %dds push(DELIVERABLES, "draft_v3.pdf", "annex/*.xlsx", path="../wfd", '
+    'overwrite=False, target_name={"draft_v3.pdf": "report_2025.pdf"})\n'
+    "  (a %dds call is one line — it cannot continue on the next one)\n"
+    "  check first, without uploading:  %dds target(DELIVERABLES)  or  "
+    '%dds target(DELIVERABLES, path="../wfd")\n'
+    "\n"
+    "Environment: DDS_BASE_URL — read from the first .env found in the notebook's folder or "
+    "a parent when %dds starts, else from the kernel environment — and a Dremio identity: "
+    "_DREMIO_USER/_DREMIO_PWD (as %ingest) or DREMIO_USERNAME/DREMIO_TOKEN (as %catalog)."
 )
+# Folder names usable bare on a %dds line: `%dds push(METADATA, ...)`. They
+# win over a notebook variable of the same name, since folder must be one of
+# them (see _dispatch's extra_ns).
+_DDS_NAMESPACE: dict[str, Any] = {
+    "DdsFolder": DdsFolder,
+    **{member.name: member for member in DdsFolder},
+}
 
 
 def _build_catalog_session() -> CatalogSession:
@@ -367,11 +410,11 @@ def _build_sdi_session() -> SdiSession:
     return SdiSession()
 
 
-def _build_metadata_session(last: Any) -> MetadataSession:
-    # MetadataSession reads DDS_BASE_URL from the nearest .env right here, when
-    # it is built; a missing DDS setting or Dremio identity prints as a
-    # friendly "metadata error" on the first push_to_dds.
-    return MetadataSession(last=last)
+def _build_dds_session(resolve_path: Any) -> DdsSession:
+    # DdsSession reads DDS_BASE_URL from the nearest .env right here, when it
+    # is built; a missing DDS setting or Dremio identity prints as a friendly
+    # "dds error" on the first push.
+    return DdsSession(resolve_path=resolve_path)
 
 
 def _is_help(line: str) -> bool:
@@ -384,13 +427,10 @@ def _plain_params(func: Any) -> str:
     `str | None` union means nothing to a data custodian, and would collide
     visually with the table's own `|` column separators anyway) and no `*`
     keyword-only marker. A parameter with a default is shown as `name=default`
-    so it still reads as optional; everything else is required, in order."""
+    so it still reads as optional, one taking any number of values (`*name`)
+    as `name...`; everything else is required, in order."""
     sig = inspect.signature(func)
-    parts = [
-        name if param.default is inspect.Parameter.empty else f"{name}={param.default!r}"
-        for name, param in sig.parameters.items()
-        if name != "self"
-    ]
+    parts = [plain_param(name, param) for name, param in sig.parameters.items() if name != "self"]
     return ", ".join(parts)
 
 
@@ -574,8 +614,11 @@ def _explain_syntax_error(session: Any, line: str, exc: SyntaxError) -> str:
         keywords = [_KEYWORD_ARG.match(arg) for arg in args]
         first_keyword = next((i for i, kw in enumerate(keywords) if kw), None)
         stray = next(
-            (i for i, kw in enumerate(keywords) if first_keyword is not None
-             and i > first_keyword and kw is None),
+            (
+                i
+                for i, kw in enumerate(keywords)
+                if first_keyword is not None and i > first_keyword and kw is None
+            ),
             None,
         )
         if first_keyword is not None and stray is not None:
@@ -586,7 +629,9 @@ def _explain_syntax_error(session: Any, line: str, exc: SyntaxError) -> str:
             candidates = [
                 f"{p.name}={args[stray]}"
                 for p in params[first_keyword:]
-                if p.name not in named and _fits(p.annotation, args[stray])
+                if p.name not in named
+                and p.kind is not inspect.Parameter.VAR_POSITIONAL
+                and _fits(p.annotation, args[stray])
             ]
             hint = f" Did you mean {' or '.join(candidates)}?" if candidates else ""
             return (
@@ -615,6 +660,7 @@ def _dispatch(
     error_type: type[Exception],
     *,
     auto_commit: bool = False,
+    extra_ns: dict[str, Any] | None = None,
 ) -> Any:
     line = line.strip()
     if not line:
@@ -622,7 +668,7 @@ def _dispatch(
         return None
     if line.isidentifier():  # bare "commit" (no parens) as a convenience
         line = f"{line}()"
-    namespace = {**user_ns, "__session__": session}
+    namespace = {**user_ns, **(extra_ns or {}), "__session__": session}
     try:
         result = eval(f"__session__.{line}", namespace)  # see module docstring re: eval
         if auto_commit and result is session:
@@ -684,16 +730,42 @@ def _register_context_comm(shell: Any, magics: EEALakehouseMagics) -> None:
     comm_manager.register_target(_CONTEXT_COMM_TARGET, _on_comm_open)
 
 
+_DDS_PUSHED_COMM_TARGET = "eea_datalakehouse.dds_pushed"
+
+
+def _notify_dds_pushed(shell: Any, dds_path: str) -> None:
+    """Tell an integrated frontend (the JupyterLab Document Service panel,
+    in the separate `eeadata/EEALakeHouse` repo) that `%dds push` just
+    wrote a file, so the panel can refresh immediately instead of waiting
+    for its next poll tick. Called once per file pushed.
+
+    Opposite direction from `_register_context_comm`: here the kernel opens
+    the comm rather than reacting to one. Best-effort and silent either
+    way — no live kernel comm_manager, or a frontend that never registered
+    `_DDS_PUSHED_COMM_TARGET` (no matching extension, or one without this
+    feature), both just leave the frontend as it was.
+    """
+    comm_manager = getattr(getattr(shell, "kernel", None), "comm_manager", None)
+    if comm_manager is None:
+        return
+    try:
+        from comm import create_comm
+
+        create_comm(target_name=_DDS_PUSHED_COMM_TARGET, data={"dds_path": dds_path}).close()
+    except Exception:
+        pass
+
+
 @magics_class
 class EEALakehouseMagics(Magics):
-    """Registers `%catalog`, `%ingest`, `%sdi` and `%metadata` — see this module's docstring."""
+    """Registers `%catalog`, `%ingest`, `%sdi` and `%dds` — see this module's docstring."""
 
     def __init__(self, shell: Any) -> None:
         super().__init__(shell)
         self._catalog_session: CatalogSession | None = None
         self._ingest_session: IngestSession | None = None
         self._sdi_session: SdiSession | None = None
-        self._metadata_session: MetadataSession | None = None
+        self._dds_session: DdsSession | None = None
         self._pending_context: str | None = None
         _register_context_comm(shell, self)
 
@@ -803,8 +875,8 @@ class EEALakehouseMagics(Magics):
     def sdi(self, line: str) -> Any:
         """`%sdi` — read ISO 19115-3 metadata from SDI, each call runs immediately::
 
-            %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
-            %sdi resolve_series("c3858959-90da-4c1b-b9ca-492db0e514df")
+        %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
+        %sdi resolve_series("c3858959-90da-4c1b-b9ca-492db0e514df")
         """
         if _is_help(line):
             _print_help_table(SdiSession, _SDI_HELP, "sdi", note=_SDI_HELP_NOTE)
@@ -814,29 +886,46 @@ class EEALakehouseMagics(Magics):
         result = _dispatch(self._sdi_session, line, self.shell.user_ns, "sdi", SdiSessionError)
         return None if result is _DISPATCH_FAILED else result
 
+    def _dds_target(self, path: str | None) -> str | None:
+        """The catalog path `%dds` pushes under: `path` resolved like any
+        `%catalog` path, or the current context when `path` is `None` —
+        including one a frontend pushed before any `%catalog` cell ran."""
+        session = self._catalog_session
+        if path is None:
+            return session.get_context() if session is not None else self._pending_context
+        if session is None:
+            return path
+        try:
+            return session._resolve_path(path)  # noqa: SLF001 — same resolution as %catalog
+        except CatalogSessionError as exc:
+            raise ValueError(str(exc)) from exc
+
     @line_magic
-    def metadata(self, line: str) -> Any:
-        """`%metadata` — push metadata files to DDS, each call runs immediately::
+    def dds(self, line: str) -> Any:
+        """`%dds` — upload files to the `%catalog` context's DDS folders, each
+        call runs immediately::
 
-            %metadata push_to_dds("catalog/water_management_resources/bathing_water/bwd")
-            %metadata dds_base_url()
-
-        `push_to_dds` uploads the record `%sdi get_xml` fetched last unless
-        `metadata=` is given.
+            %dds push(DELIVERABLES, "report.pdf", "annex/*.xlsx")
+            %dds push(METADATA, record, path="catalog.water.bwd", overwrite=False)
+            %dds target(ASSESSMENTS)
         """
         if _is_help(line):
-            _print_help_table(
-                MetadataSession, _METADATA_HELP, "metadata", note=_METADATA_HELP_NOTE
-            )
+            _print_help_table(DdsSession, _DDS_HELP, "dds", note=_DDS_HELP_NOTE)
             return None
-        if self._metadata_session is None:
-            # Looked up at push time, so a get_xml run after %metadata started still counts.
-            self._metadata_session = _build_metadata_session(
-                lambda: self._sdi_session.last if self._sdi_session is not None else None
-            )
+        if self._dds_session is None:
+            # Looked up at push time, so a `use` run after %dds started still counts.
+            self._dds_session = _build_dds_session(self._dds_target)
         result = _dispatch(
-            self._metadata_session, line, self.shell.user_ns, "metadata", MetadataSessionError
+            self._dds_session,
+            line,
+            self.shell.user_ns,
+            "dds",
+            DdsSessionError,
+            extra_ns=_DDS_NAMESPACE,
         )
+        if isinstance(result, PushReport):
+            for dds_path in result.paths:
+                _notify_dds_pushed(self.shell, dds_path)
         return None if result is _DISPATCH_FAILED else result
 
 

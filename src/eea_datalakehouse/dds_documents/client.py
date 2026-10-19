@@ -7,16 +7,20 @@ Dremio tables, so this client makes **no ingest calls**: it shares
 (base URL, Bearer PAT, one method per endpoint, errors naming the call), not
 its endpoints.
 
-===============================  =============================================
-:meth:`DocumentsClient.put`      ``PUT /api/v1/files/{path}``
-:meth:`~DocumentsClient.get`     ``GET /api/v1/files/{path}``
-:meth:`~DocumentsClient.exists`  ``GET /api/v1/files/{path}``
-:meth:`~DocumentsClient.list`    ``GET /api/v1/files?prefix={folder}``
-===============================  =============================================
+================================  ============================================
+:meth:`DocumentsClient.put`       ``PUT /api/v1/files/{path}``
+:meth:`~DocumentsClient.get`      ``GET /api/v1/files/{path}``
+:meth:`~DocumentsClient.exists`   ``GET /api/v1/files/{path}``
+:meth:`~DocumentsClient.list`     ``GET /api/v1/files?prefix={folder}``
+:meth:`~DocumentsClient.folders`  ``GET /api/v1/folders``
+================================  ============================================
 
-The endpoint shapes below are **interface assumptions** still to confirm with
-the DDS team (see ``docs/sdi-integration-plan.md``). Each one is a module
-constant so a confirmed contract is a one-line change.
+``PUT`` and ``GET /api/v1/folders`` follow the Dremio Document Service's own
+routes: the upload body is the raw file, and overwriting is asked for with the
+``X-DDS-Overwrite: true`` header (an existing file otherwise answers 409). The
+other shapes are still **interface assumptions** to confirm with the DDS team
+(see ``docs/sdi-integration-plan.md``). Each one is a module constant so a
+confirmed contract is a one-line change.
 """
 
 from __future__ import annotations
@@ -33,7 +37,8 @@ DEFAULT_TIMEOUT = 60.0
 # Assumed DDS document contract — to confirm with the DDS team.
 FILES_ENDPOINT = "/api/v1/files/{path}"
 LIST_ENDPOINT = "/api/v1/files"
-OVERWRITE_PARAM = "overwrite"
+FOLDERS_ENDPOINT = "/api/v1/folders"
+OVERWRITE_HEADER = "X-DDS-Overwrite"
 # Error bodies are quoted back to the caller; cap them so an HTML error page
 # does not bury the status line it came with.
 _MAX_ERROR_CHARS = 500
@@ -121,8 +126,11 @@ class DocumentsClient:
         resp = self._http.put(
             f"{self._base_url}{endpoint}",
             content=data,
-            params={OVERWRITE_PARAM: "true" if overwrite else "false"},
-            headers={**self._auth_headers, "Content-Type": content_type},
+            headers={
+                **self._auth_headers,
+                "Content-Type": content_type,
+                OVERWRITE_HEADER: "true" if overwrite else "false",
+            },
         )
         if resp.status_code == 409:
             raise DocumentExistsError(409, _error_message(resp), where=f"PUT {endpoint}")
@@ -153,6 +161,18 @@ class DocumentsClient:
         payload: Any = resp.json()
         rows = payload.get("files", []) if isinstance(payload, dict) else payload
         return [row["path"] if isinstance(row, dict) else str(row) for row in rows]
+
+    def folders(self) -> list[str]:
+        """The document folder names DDS shows under every catalog node.
+
+        DDS keeps this list in its settings (an admin may change it), so it is
+        read live: ``{"folders": [{"key": "metadata", ...}, ...]}``.
+        """
+        resp = self._http.get(f"{self._base_url}{FOLDERS_ENDPOINT}", headers=self._auth_headers)
+        _raise_for_status(resp, f"GET {FOLDERS_ENDPOINT}")
+        payload: Any = resp.json()
+        rows = payload.get("folders", []) if isinstance(payload, dict) else payload
+        return [str(row["key"]) if isinstance(row, dict) else str(row) for row in rows]
 
     # -- internals --------------------------------------------------------
 
