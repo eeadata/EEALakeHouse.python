@@ -75,9 +75,9 @@ def _network_error() -> httpx.ConnectError:
 # --- BeginResult.upload_mode ----------------------------------------------------
 
 
-def test_upload_mode_is_read_from_begin_and_is_none_when_absent() -> None:
+def test_upload_mode_is_read_from_begin_and_defaults_to_direct() -> None:
     base = {"session_id": "s", "status": "uploading", "s3": {"bucket": "b", "key_prefix": "p/"}}
-    assert BeginResult.from_json(base).upload_mode is None
+    assert BeginResult.from_json(base).upload_mode == "direct"
     assert BeginResult.from_json({**base, "upload_mode": "auto"}).upload_mode == "auto"
 
 

@@ -250,9 +250,9 @@ class FolderIngest:
         # Set when run() cancelled its session after a failure; what retry()
         # goes by once there is no session left (PY-8).
         self._failed_run: _FailedRun | None = None
-        # The files the current run sent through DDS after a network error;
-        # appended to from the upload threads (list.append is atomic).
-        self._staged_by_fallback: list[str] = []
+        # The files the current run sent through DDS (/stage), by proxy or by
+        # fallback; appended to from the upload threads (list.append is atomic).
+        self._staged: list[str] = []
         # The largest file POST /ingest/stage accepts (PY-10): asked of DDS at
         # most once per run, and only when a file may go through it.
         self._stage_cap: int | None = None
@@ -338,22 +338,22 @@ class FolderIngest:
             files_skipped=skipped,
             etags=etags,
             upload_mode="proxy" if self._uses_proxy(begin) else "direct",
-            files_staged=uploaded if self._uses_proxy(begin) else len(self._staged_by_fallback),
+            files_staged=len(self._staged),
         )
 
+    def _effective_upload_mode(self, begin: BeginResult) -> str:
+        """How the files go: this ingest's own ``upload_mode`` when it forces one
+        (``"direct"`` or ``"proxy"``), else — with ``"auto"`` — the server's
+        ``begin.upload_mode`` (``direct``, ``proxy`` or ``auto``)."""
+        if self.upload_mode in ("direct", "proxy"):
+            return self.upload_mode
+        return begin.upload_mode
+
     def _uses_proxy(self, begin: BeginResult) -> bool:
-        """Whether to send the files through DDS rather than to S3 directly:
+        """Whether every file goes through DDS rather than to S3 directly:
         always with ``upload_mode="proxy"``, never with ``"direct"``, and with
         ``"auto"`` when ``begin`` says ``upload_mode: "proxy"``."""
-        if self.upload_mode == "auto":
-            return begin.upload_mode == "proxy"
-        return self.upload_mode == "proxy"
-
-    def _falls_back_to_proxy(self, begin: BeginResult) -> bool:
-        """Whether a presigned upload that fails at the network layer is sent
-        through DDS instead: only with ``upload_mode="auto"`` (follow the
-        server) and when ``begin`` says ``upload_mode: "auto"``."""
-        return self.upload_mode == "auto" and begin.upload_mode == "auto"
+        return self._effective_upload_mode(begin) == "proxy"
 
     def begin(self) -> BeginResult:
         """Open the transfer and get the presigned upload targets (step 1 of 3).
@@ -872,8 +872,7 @@ class FolderIngest:
     ) -> tuple[dict[str, str], list[dict[str, object]], int, int]:
         targets = list(begin.s3.uploads)
         proxy = self._uses_proxy(begin)
-        fallback = self._falls_back_to_proxy(begin)
-        self._staged_by_fallback = []
+        self._staged = []
         self._stage_cap_asked = False
         if proxy:
             logger.info("uploading through DDS (proxy), not to the presigned S3 targets")
@@ -897,8 +896,7 @@ class FolderIngest:
                 return etags, multipart_etags, 0, skipped
             with ThreadPoolExecutor(max_workers=self.parallelism) as pool:
                 futures = {
-                    pool.submit(self._upload_one, t, begin.session_id, proxy, fallback): t
-                    for t in pending
+                    pool.submit(self._upload_one, t, begin): t for t in pending
                 }
                 try:
                     for future in as_completed(futures):
@@ -929,39 +927,35 @@ class FolderIngest:
         return etags, multipart_etags, len(pending), skipped
 
     def _upload_one(
-        self,
-        target: UploadTarget,
-        session_id: str,
-        proxy: bool = False,
-        fallback: bool = False,
+        self, target: UploadTarget, begin: BeginResult
     ) -> tuple[str | None, list[dict[str, object]] | None]:
         """Upload one file; return ``(single_etag, multipart_parts)``.
 
-        At most one element is non-``None``: a single-shot upload yields the
-        ETag (or ``None`` if S3 omitted it); a multipart upload yields the
-        per-part ETag list and the single ETag is ``None``. A proxied upload
-        (`proxy`) sends the whole file through DDS — DDS writes it to S3 with
-        its own connection, so this process never contacts the storage — and
-        yields neither: there are no S3 ETags to hand to commit.
+        At most one element is non-``None``: a single-shot upload yields the ETag
+        (or ``None`` if S3 omitted it); a multipart upload yields the per-part
+        ETag list; a file sent through DDS (``/stage``) yields neither.
 
-        With `fallback` (see `_falls_back_to_proxy`), a presigned upload that
-        fails at the **network** layer (unreachable endpoint, DNS, TLS,
-        timeout) is sent through DDS instead — the contract upload-mode rule
-        the JupyterLab extension implements. An HTTP error from S3 is not
-        retried through DDS: that is a signing or permission problem the proxy
-        would not fix.
+        Honours the effective upload mode — this ingest's own ``upload_mode``
+        when it forces ``direct`` or ``proxy``, else the server's (contract
+        upload-mode rule, the same one the JupyterLab extension implements):
+        ``proxy`` always goes through
+        DDS; ``direct`` uses the presigned target only; ``auto`` uses it and, if
+        it fails at the **network** layer (unreachable endpoint, DNS, TLS,
+        timeout), sends the file through DDS instead. An HTTP error from S3 is
+        not retried through DDS: that is a signing or permission problem the
+        proxy would not fix. Nor is a file larger than ``/stage`` accepts (PY-10).
         """
         data = (self.folder / target.rel_path).read_bytes()
-        if proxy:
-            self._client.stage(session_id, target.rel_path, data)
-            return None, None
+        mode = self._effective_upload_mode(begin)
+        if mode == "proxy":
+            return self._stage(begin.session_id, target, data)
         try:
             if target.is_multipart:
                 parts = self._client.upload_file_multipart(target, data)
                 return None, [dict(p) for p in parts]
             return self._client.upload_file(target, data), None
         except httpx.TransportError as exc:
-            if not fallback:
+            if mode != "auto":
                 raise
             cap = self._stage_limit()
             if cap is not None and len(data) > cap:
@@ -976,7 +970,7 @@ class FolderIngest:
                 target.rel_path,
                 exc,
             )
-            return self._stage(session_id, target, data)
+            return self._stage(begin.session_id, target, data)
 
     def _stage(
         self, session_id: str, target: UploadTarget, data: bytes
@@ -985,7 +979,7 @@ class FolderIngest:
         S3 with its own credentials. A file the server planned as multipart goes
         through whole; DDS accepts that at commit (DI-12.10a)."""
         self._client.stage(session_id, target.rel_path, data)
-        self._staged_by_fallback.append(target.rel_path)
+        self._staged.append(target.rel_path)
         return None, None
 
     def _stage_limit(self) -> int | None:

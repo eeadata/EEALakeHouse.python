@@ -936,7 +936,7 @@ Two parties decide: `FolderIngest(upload_mode=…)` and the server's hint in
 |---|---|---|
 | `"auto"` (default) | `"proxy"` | all through DDS (`POST /api/v1/ingest/stage`) |
 | `"auto"` | `"auto"` — DDS's default | to S3; a file whose upload fails at the network layer goes through DDS instead |
-| `"auto"` | `"direct"`, or nothing (an older server: `None`) | to S3 only |
+| `"auto"` | `"direct"` — also what no hint (an older server) reads as | to S3 only |
 | `"direct"` | anything | to S3 only |
 | `"proxy"` | anything | all through DDS |
 
@@ -1132,7 +1132,7 @@ working when the server adds fields.
 | `UploadPart` | `part_number`, `url` |
 | `UploadTarget` | `rel_path`, `url`, `method="POST"`, `fields`, `headers`, `max_bytes`, `upload_id`, `parts`; `is_multipart` (true when `upload_id` **and** `parts` are set) |
 | `S3Plan` | `bucket`, `key_prefix`, `uploads: tuple[UploadTarget, ...]` |
-| `BeginResult` | `session_id`, `status`, `s3: S3Plan`, `collision`, `upload_mode` (the server's hint; `None` when it sends none), `plan: BeginPlan \| None` |
+| `BeginResult` | `session_id`, `status`, `s3: S3Plan`, `collision`, `upload_mode` (the server's hint; `"direct"` when it sends none), `plan: BeginPlan \| None` |
 | `BeginPlan` | `placement`, `table_path`, `storage_path`, `action` (`"create"`, `"append"`, `"replace"`, `"fail"`), `definition_source`, `definition_applied`, `definition_ignored`; `describe()` — one sentence, the extension's wording |
 | `DryRunResult` | `plan: BeginPlan`, `key_prefix`, `collision` |
 | `TableDefinition` | `columns: tuple[ColumnDef, ...]`, `partition_by`, `sort_by`, `version`; `as_payload()` sends only what was set |

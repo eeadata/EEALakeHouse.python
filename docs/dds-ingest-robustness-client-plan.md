@@ -68,12 +68,13 @@ missing was the automatic fallback (G10 in `Documentation/data-digestion.md`).
   the multipart threshold in proxy mode.
 
 > Landed `9d924f7`. The merge with `774691a` on `main` (`101b09c`) dropped part of
-> Oskar's code; repaired on `eea_bliki` on 2026-10-19 (§5.1). As built, Oskar's
-> design is kept: `BeginResult.upload_mode` is `None` when the server sends none and
-> is read from the top level or from inside `s3`; `FolderIngest(upload_mode=…)`
-> decides, and its default `"auto"` follows the server. The fallback is added on
-> top: only when both `FolderIngest` and the server say `"auto"`
-> (`_falls_back_to_proxy`). DDS sends `upload_mode` on every begin, `"auto"` unless
+> Oskar's code; repaired the same day twice over (§5.1), and since `staging` was
+> merged into `eea_bliki` the code is Oskar's repair, `ea142ca`.
+> `BeginResult.upload_mode` reads the hint from the top level or from inside `s3`,
+> and no hint (an older server) reads as `"direct"`. `_effective_upload_mode`
+> decides: `FolderIngest(upload_mode="direct"|"proxy")` wins, and its default
+> `"auto"` follows the server. The fallback happens when that comes to `"auto"` —
+> both sides say so. DDS sends `upload_mode` on every begin, `"auto"` unless
 > configured, so the fallback is on by default. The `/stage` size cap is checked
 > before uploading since PY-10.
 
@@ -262,10 +263,14 @@ editor, dropped twelve lines of `774691a`:
 - `FolderIngest(upload_mode="proxy")` reported a proxy upload while uploading to S3.
 - 12 tests fail on `main`.
 
-Repaired on `eea_bliki` on 2026-10-19: Oskar's lines restored as he wrote them, PY-1's
-fallback added on top, and only PY-1's own test changed (`upload_mode` is `None` when
-the server sends none, as in `774691a`). The whole suite passes. This has to reach
-`main` before any task below.
+Repaired twice on 2026-10-19, independently: on `eea_bliki` (`60cad54`: Oskar's
+`774691a` restored as written, `upload_mode` `None` without a hint) and by Oskar on
+`development`, which reached `staging` (`ea142ca`: `_effective_upload_mode`, and
+`"direct"` without a hint). The two behave the same; they differ only in what "no
+hint" reads as, and Oskar chose `"direct"`. When `staging` was merged into
+`eea_bliki`, his version was taken and the later tasks (PY-8, PY-10, PY-13, the CSV
+encoding check) were re-applied on top of it. `main` itself still needs one of them
+(PR #97 carries `60cad54`).
 
 ### 5.2 Where each task stands
 

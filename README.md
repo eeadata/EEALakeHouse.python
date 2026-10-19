@@ -36,7 +36,7 @@ pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@staging"    
 ```
 
 # staging's latest release (early access) — pin to the tag the "staging" badge above shows
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.30-staging"
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.32-staging"
 ```
 
 ## Usage
@@ -239,63 +239,95 @@ not one statement each):
 
 ## SDI metadata
 
-`eea_datalakehouse.sdi` copies a dataset's ISO 19115-3 metadata record from the EEA SDI
-catalogue (GeoNetwork) into the dataset's `metadata` folder in DDS. The XML is a **document
-upload**, not an ingest: nothing becomes a Dremio table. The calling code always passes the
-SDI UUID. See `docs/sdi-integration-plan.md`.
+`eea_datalakehouse.sdi` reads a dataset's ISO 19115-3 metadata record from the EEA SDI
+catalogue (GeoNetwork). The calling code always passes the SDI UUID. Storing the record in DDS
+is `eea_datalakehouse.dds_documents`'s job (next section): a record is a file it can push, as
+`{uuid}.xml`. See `docs/sdi-integration-plan.md`.
 
 ```python
+from eea_datalakehouse.dds_documents import DdsController, DdsFolder
 from eea_datalakehouse.sdi import SdiController
 
-with SdiController.from_env() as sdi:
+with SdiController.from_env() as sdi, DdsController.from_env() as dds:
     metadata = sdi.get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")   # SDI -> bytes
-    result = sdi.push_to_dds(metadata, "catalog/water_management_resources/bathing_water/bwd")
-    result.dds_path   # ".../bwd/metadata/070d9baa-448d-4168-8514-7dadb3ad876d.xml"
-    result.action     # "uploaded" | "unchanged" | "replaced"
+    dds.push("catalog/water_management_resources/bathing_water/bwd", DdsFolder.METADATA, metadata)
+    # -> .../bwd/metadata/070d9baa-448d-4168-8514-7dadb3ad876d.xml
 ```
 
 - `get_xml(uuid)` checks the response is `mdb:MD_Metadata` and identifies `uuid`
   (`NotIso19115_3`, `UuidMismatch`; `SdiNotFound` / `SdiAuthError` for 404 / 401-403).
-- `push_to_dds(metadata, dds_path, target_name=None, folder="metadata", force=False)` names the
-  file `{uuid}.xml` unless `target_name` is given (`.xml` is added if missing), and takes `dds_path` in catalog
-  format (`a.b.c`, sent to DDS as `a/b/c`; quoted names like `"v1.0"` lose their quotes and stay
-  one segment) or storage format (`a/b/c`). It first checks `dds_path` exists in the Dremio
-  catalog when the controller has a catalog client (`CatalogPathNotFound` otherwise), then
-  compares with the copy
-  already in DDS: same bytes is `unchanged`; an older copy is `replaced`; a copy that is newer or
-  undated (someone edited it in DDS) raises `DdsCopyConflict` unless `force=True`.
 - `resolve_series(series_uuid)` returns the one release of a series that is not superseded, or
   raises `NotCurrentError` listing every release.
 - `metadata.provenance_tags()` gives `sdi_record_uuid` / `sdi_edition` / `sdi_date_stamp` in
   `Catalog.setmeta2wiki`'s `tags=` shape, if you want them on the dataset's wiki.
 
 Environment: `SDI_API_URL` (empty means `https://sdi.eea.europa.eu/catalogue`), optional
-`SDI_USERNAME` / `SDI_PASSWORD` for non-public records, and for the upload `DDS_BASE_URL` plus
-`_DREMIO_USER` / `_DREMIO_PWD`, as for ingest. The DDS document endpoints
-(`dds_documents/client.py`) are still assumptions to confirm with the DDS team.
+`SDI_USERNAME` / `SDI_PASSWORD` for non-public records.
 
-In a notebook, two magics split the work: `%sdi` (`SdiSession`) reads SDI, and `%metadata`
-(`MetadataSession`) pushes metadata files to DDS. Both are built on first use from the kernel
-environment like `%catalog`'s and `%ingest`'s sessions. `%metadata push_to_dds` uploads the
-record `%sdi get_xml` fetched last, so it needs only the path (worked example:
-`debugger/sdi_session_example.ipynb`):
+## DDS documents
+
+`eea_datalakehouse.dds_documents` uploads files to the document folders DDS shows under every
+catalog node, with one `PUT` per file. It is a **document upload**, not an ingest: nothing
+becomes a Dremio table. `DdsFolder` holds DDS's eight built-in folders — `DERIVED`, `METADATA`,
+`METHODOLOGY`, `ASSESSMENTS`, `ANALYSES`, `REFERENCES`, `DELIVERABLES`, `OTHERS` — and the target
+folder must always be one of them.
 
 ```python
-import eea_datalakehouse.notebook   # registers %catalog/%ingest/%sdi/%metadata
+from eea_datalakehouse.dds_documents import DdsController, DdsFolder
 
-%sdi help
-%sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
-%metadata push_to_dds("catalog/water_management_resources/bathing_water/bwd")
+with DdsController.from_env() as dds:
+    report = dds.push("catalog.water_management_resources.bathing_water.bwd",
+                      DdsFolder.DELIVERABLES, ["report.pdf", "annex/*.xlsx"])
+    report.paths   # (".../bwd/deliverables/report.pdf", ".../bwd/deliverables/annex1.xlsx", ...)
 ```
 
-For the push, `DDS_BASE_URL` and `DREMIO_BASE_URL` are read from the first `.env` in the
-notebook's folder or a parent when `%metadata` builds its session (the kernel environment's
-value only applies if that `.env` doesn't set one; `%metadata dds_base_url()` /
-`dremio_base_url()` show which is in use). `%metadata push_to_dds` first checks that `dds_path`
-exists in the Dremio catalog (a `/` path is converted to `a.b.c` for that) and uploads nothing
-if it doesn't; `%metadata check_catalog_path(path)` runs the check alone, and
-`check_catalog=False` skips it. The Dremio identity is `_DREMIO_USER` /
+- `push(dds_path, folder, files, overwrite=True, target_name="")` puts each file at
+  `{dds_path}/{folder}/{file name}`. `dds_path` is in catalog format (`a.b.c`; quoted names like
+  `"v1.0"` lose their quotes and stay one segment) or storage format (`a/b/c`), below the
+  catalog root. `folder` is compulsory and must be a `DdsFolder` member; anything else, a
+  string like `"metadata"` included, raises `TypeError` and uploads nothing.
+- `files` is one file or a list: local paths (a glob pattern too), `DdsFile(name, data)`, or
+  any object with `filename` / `content` (an `SdiMetadata` record). Every file is read and
+  checked before the first upload; the content type is guessed from the name.
+- `target_name` renames files in DDS: a string for the one file pushed
+  (`target_name="bwd_2025.xml"`), or a dict from a file's own name to its new name
+  (`target_name={"draft_v3.pdf": "report_2025.pdf"}`) when there are several. Files the dict
+  leaves out, or an empty `target_name` (the default), keep their own name; a key that matches no
+  file, or two files ending up with one name, uploads nothing.
+- `overwrite=True` replaces files already there (sent as DDS's `X-DDS-Overwrite: true` header).
+  `overwrite=False` checks every target first and
+  raises `DdsFilesExistError`, uploading nothing, if any is taken. A failure part-way raises
+  `DdsPushError`, whose `uploaded` lists what already went.
+- `target(dds_path, folder)` shows the folder without uploading.
+
+Environment: `DDS_BASE_URL` plus `_DREMIO_USER` / `_DREMIO_PWD`, as for ingest. The DDS document
+endpoints (`dds_documents/client.py`) are still assumptions to confirm with the DDS team.
+
+## Notebook magics for SDI and DDS (`%sdi` / `%dds`)
+
+`%sdi` (`SdiSession`) reads SDI and `%dds` (`DdsSession`) pushes files to DDS. Both are built
+on first use from the kernel environment like `%catalog`'s and `%ingest`'s sessions. `%dds
+push` puts files in a folder of the dataset `%catalog use(...)` last selected; `path=` picks
+another one, absolute or relative to that context, as any `%catalog` path. The folder names
+can be typed bare on a `%dds` line (worked example: `debugger/sdi_session_example.ipynb`):
+
+```python
+import eea_datalakehouse.notebook   # registers %catalog/%ingest/%sdi/%dds
+
+%catalog use("catalog.water_management_resources.bathing_water.bwd")
+%dds push(DELIVERABLES, "report.pdf", "annex/*.xlsx")
+record = %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
+%dds push(METADATA, record, overwrite=False)
+%dds target(ASSESSMENTS)       # where a push would go
+%dds help
+```
+
+`DDS_BASE_URL` is read from the first `.env` in the notebook's folder or a parent when `%dds`
+builds its session (the kernel environment's value only applies if that `.env` doesn't set one;
+`%dds dds_base_url()` shows which is in use). The Dremio identity is `_DREMIO_USER` /
 `_DREMIO_PWD` (as `%ingest`), falling back to `DREMIO_USERNAME` / `DREMIO_TOKEN` (as `%catalog`).
+After each push, `%dds` tells an integrated JupyterLab panel which files changed (comm target
+`eea_datalakehouse.dds_pushed`, one message per file).
 
 ## Notebook facade (`%catalog` / `%ingest`)
 
@@ -412,9 +444,13 @@ context itself — raises `CatalogSessionError` if none is set yet:
 | `dds_ingestion/progress.py` | tqdm progress bar with graceful fallback |
 | `dds_ingestion/folder.py` | `FolderIngest` orchestration (scan/parallel/resume) |
 | `dds_documents/client.py` | `DocumentsClient` — put/get/list plain files in DDS folders (no ingest) |
-| `sdi/controller.py` | `SdiController` — `get_xml()`, `push_to_dds()`, `resolve_series()` |
+| `dds_documents/controller.py` | `DdsController` / `DdsFolder` — push files to a catalog node's DDS document folders (metadata, deliverables, ...) |
+| `dds_documents/paths.py` | catalog (`a.b.c`) ⇄ storage (`a/b/c`) path conversion |
+| `dds_documents/session.py` | `DdsSession` — what `%dds` dispatches onto |
+| `sdi/controller.py` | `SdiController` — `get_xml()`, `resolve_series()` |
 | `sdi/catalogue.py` | `SdiCatalogue` — read-only GeoNetwork REST client |
-| `sdi/session.py` | `SdiSession` / `MetadataSession` — what `%sdi` / `%metadata` dispatch onto |
+| `sdi/session.py` | `SdiSession` — what `%sdi` dispatches onto |
+| `session_utils.py` | friendly session errors, strict argument types, `.env` lookup |
 | `sdi/iso.py` | reads UUID, title, edition, dates and series children from ISO 19115-3 |
 | `catalog/client.py` | `Catalog` — two connections (REST + Flight), every operation as a method |
 | `catalog/operations.py` | the operations themselves (table2view, datacopy, createfolder, ...), as functions taking an executor and/or a `CatalogRestClient` |
@@ -499,7 +535,7 @@ To pin to one specific release instead, use the exact tag the live badges under
 %pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.30"
 
 # staging's latest release (early access)
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.30-staging"
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.32-staging"
 ```
 
 Use the `%pip` magic rather than `!pip` — it installs into the kernel the
