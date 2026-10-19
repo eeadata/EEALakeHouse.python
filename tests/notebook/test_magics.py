@@ -449,7 +449,7 @@ class _FakeDdsSession:
         self.calls: list[tuple[object, object, str | None, bool]] = []
 
     def push(
-        self, folder: object, files: object, path: str | None = None, overwrite: bool = True
+        self, folder: object, *files: object, path: str | None = None, overwrite: bool = True
     ) -> object:
         target = self._resolve_path(path)
         self.calls.append((folder, files, target, overwrite))
@@ -472,17 +472,17 @@ def test_dds_pushes_to_the_catalog_context_with_bare_folder_names(
     # %dds built first: the context is still looked up at push time.
     ip.run_line_magic("dds", "help")
     ip.run_line_magic("catalog", 'use("catalog.water.bwd")')
-    report = ip.run_line_magic("dds", 'push(DELIVERABLES, ["a.pdf", "b.pdf"], overwrite=False)')
+    report = ip.run_line_magic("dds", 'push(DELIVERABLES, "a.pdf", "b.pdf", overwrite=False)')
 
     session = _magics_instance(ip)._dds_session
     assert session.calls == [
-        (magics_module.DdsFolder.DELIVERABLES, ["a.pdf", "b.pdf"], "catalog.water.bwd", False)
+        (magics_module.DdsFolder.DELIVERABLES, ("a.pdf", "b.pdf"), "catalog.water.bwd", False)
     ]
     assert report.paths == ("catalog.water.bwd/x/a.pdf", "catalog.water.bwd/x/b.pdf")
     assert notified == list(report.paths)
 
 
-def test_dds_notebook_variables_win_over_folder_names(
+def test_dds_folder_names_win_over_notebook_variables(
     ip: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(magics_module, "_build_dds_session", _FakeDdsSession)
@@ -490,10 +490,15 @@ def test_dds_notebook_variables_win_over_folder_names(
     ip.user_ns["METADATA"] = "assessments"
     try:
         ip.run_line_magic("dds", 'push(METADATA, "a.pdf")')
+        ip.run_line_magic("dds", 'push(DdsFolder.OTHERS, "a.pdf")')
     finally:
         del ip.user_ns["METADATA"]
 
-    assert _magics_instance(ip)._dds_session.calls[0][0] == "assessments"
+    calls = _magics_instance(ip)._dds_session.calls
+    assert [call[0] for call in calls] == [
+        magics_module.DdsFolder.METADATA,
+        magics_module.DdsFolder.OTHERS,
+    ]
 
 
 def test_dds_target_resolves_path_like_catalog(ip: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -555,11 +560,15 @@ def test_dds_help_lists_methods_without_building_a_session(
     assert "%dds methods" in out
     assert "DDS_BASE_URL" in out
     assert "deliverables/report.pdf" in out
+    examples = [line.strip() for line in out.splitlines() if line.strip().startswith("%dds push(")]
+    for option in ("path=", "overwrite=False", 'target_name="', "target_name={", '"*.csv"'):
+        assert any(option in line or option.strip('"') in line for line in examples), option
+    assert all(line.count("(") == line.count(")") for line in examples)  # each fits on one line
     table_html = displayed[0].data
     for name in ("push", "target", "folders", "dds_base_url"):
         assert f">{name}<" in table_html
-    assert "folder, files, path=None, overwrite=True" in table_html
-    assert "METADATA, ASSESSMENTS, DELIVERABLES" in table_html
+    assert "folder, files..., path=None, overwrite=True, target_name=&#x27;&#x27;" in table_html
+    assert "DERIVED, METADATA, METHODOLOGY, ASSESSMENTS, ANALYSES" in table_html
     assert _magics_instance(ip)._dds_session is None
 
 
@@ -571,26 +580,26 @@ class _FakePushSession:
     """Just the signature `%dds push` exposes — never pushes."""
 
     def push(
-        self, folder: str, files: object, path: str | None = None, overwrite: bool = True
+        self, folder: str, *files: object, path: str | None = None, overwrite: bool = True
     ) -> str:
         return "pushed"
 
 
-USAGE = "usage: push(folder, files, path=None, overwrite=True)"
+USAGE = "usage: push(folder, files..., path=None, overwrite=True)"
 
 
 @pytest.mark.parametrize(
     ("line", "expected"),
     [
         (
-            "push(F, files=x, True)",
-            "argument 3 (True) has no name, but comes after files=x — once an argument is "
+            "push(F, x, path=p, True)",
+            "argument 4 (True) has no name, but comes after path=p — once an argument is "
             "given by name, every argument after it needs a name too. Did you mean "
             "overwrite=True?",
         ),
-        ('push(F, files=x, "catalog.a")', 'Did you mean path="catalog.a"?'),
-        ("push(F, files=x, flag)", "Did you mean path=flag or overwrite=flag"),
-        ('push("a, b", files=x, "c(,)")', 'argument 3 ("c(,)") has no name'),
+        ('push(F, x, overwrite=False, "catalog.a")', 'Did you mean path="catalog.a"?'),
+        ("push(F, x, path=p, flag)", "Did you mean overwrite=flag"),
+        ('push("a, b", x, path=p, "c(,)")', 'argument 4 ("c(,)") has no name'),
         ("push(F,", "invalid syntax:"),
     ],
 )

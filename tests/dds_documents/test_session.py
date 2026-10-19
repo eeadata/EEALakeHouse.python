@@ -9,6 +9,7 @@ import respx
 from eea_datalakehouse.dds_documents import (
     DdsController,
     DdsFile,
+    DdsFolder,
     DdsSession,
     DdsSessionError,
     DocumentsClient,
@@ -39,7 +40,7 @@ def _session(context: str | None = DATASET, **kwargs: object) -> DdsSession:
 def test_push_goes_to_the_context_with_the_kernel_identity() -> None:
     put = respx.put(file_url(f"{TARGET}/report.pdf")).mock(return_value=httpx.Response(201))
 
-    report = _session().push("DELIVERABLES", REPORT)
+    report = _session().push(DdsFolder.DELIVERABLES, REPORT)
 
     assert report.paths == (f"{TARGET}/report.pdf",)
     assert put.calls.last.request.headers["Authorization"] == "Bearer pat-a"
@@ -51,49 +52,51 @@ def test_push_path_overrides_the_context() -> None:
         return_value=httpx.Response(201)
     )
 
-    _session().push("metadata", REPORT, path="catalog/air/aq")
+    _session().push(DdsFolder.METADATA, REPORT, path="catalog/air/aq")
 
     assert put.called
 
 
 def test_target_shows_the_folder_without_any_settings() -> None:
-    assert _session(env={}).target("DELIVERABLES") == TARGET
-    assert _session(env={}).target("metadata", "catalog.air") == "catalog/air/metadata"
+    assert _session(env={}).target(DdsFolder.DELIVERABLES) == TARGET
+    assert _session(env={}).target(DdsFolder.METADATA, "catalog.air") == "catalog/air/metadata"
 
 
 @pytest.mark.parametrize("context", [None, ""])
 def test_no_context_and_no_path_is_a_session_error(context: str | None) -> None:
     with pytest.raises(DdsSessionError, match=r"%catalog use\(\.\.\.\) or pass path="):
-        _session(context).push("metadata", REPORT)
+        _session(context).push(DdsFolder.METADATA, REPORT)
 
 
 def test_root_context_is_refused_before_any_settings() -> None:
     with pytest.raises(DdsSessionError, match="catalog root"):
-        _session("catalog", env={}).push("metadata", REPORT)
+        _session("catalog", env={}).push(DdsFolder.METADATA, REPORT)
 
 
-def test_unknown_folder_is_refused_before_any_settings() -> None:
-    with pytest.raises(DdsSessionError, match="unknown DDS folder 'reports'"):
-        _session(env={}).push("reports", REPORT)
+@pytest.mark.parametrize("folder", ["metadata", "converted", 42])
+def test_a_folder_that_is_not_a_dds_folder_is_refused_before_any_settings(folder: object) -> None:
+    with pytest.raises(DdsSessionError, match="folder must be one of the DdsFolder values"):
+        _session(env={}).push(folder, REPORT)  # type: ignore[arg-type]
+    with pytest.raises(DdsSessionError, match="folder must be one of the DdsFolder values"):
+        _session(env={}).target(folder)  # type: ignore[arg-type]
 
 
 def test_a_missing_file_is_a_session_error(tmp_path: Path) -> None:
     with pytest.raises(DdsSessionError, match="no such file"):
-        _session().push("metadata", str(tmp_path / "nope.xml"))
+        _session().push(DdsFolder.METADATA, str(tmp_path / "nope.xml"))
 
 
 def test_push_without_dremio_identity_is_a_session_error() -> None:
     with pytest.raises(DdsSessionError, match="DREMIO_TOKEN") as info:
-        _session(env={"DDS_BASE_URL": DDS_URL}).push("metadata", REPORT)
+        _session(env={"DDS_BASE_URL": DDS_URL}).push(DdsFolder.METADATA, REPORT)
     assert isinstance(info.value.__cause__, MissingCredentialsError)
 
 
 @pytest.mark.parametrize(
     ("args", "kwargs", "message"),
     [
-        ((42, REPORT), {}, r"argument 1 \(folder\) must be str, not int"),
-        (("metadata", REPORT), {"path": 1}, r"argument 2 \(path\) must be str or None"),
-        (("metadata", REPORT), {"overwrite": 1}, r"argument 3 \(overwrite\) must be bool"),
+        ((DdsFolder.METADATA, REPORT), {"path": 1}, r"argument 2 \(path\) must be str or None"),
+        ((DdsFolder.METADATA, REPORT), {"overwrite": 1}, r"argument 3 \(overwrite\) must be bool"),
     ],
 )
 def test_push_checks_argument_types_strictly(
@@ -105,21 +108,148 @@ def test_push_checks_argument_types_strictly(
 
 def test_call_that_does_not_fit_the_signature_shows_the_usage() -> None:
     with pytest.raises(DdsSessionError) as info:
-        _session().push("metadata", REPORT, force=True)  # type: ignore[call-arg]
+        _session().push(DdsFolder.METADATA, REPORT, force=True)  # type: ignore[call-arg]
 
     assert "got an unexpected keyword argument 'force'" in str(info.value)
-    assert str(info.value).endswith("usage: push(folder, files, path=None, overwrite=True)")
+    assert str(info.value).endswith(
+        "usage: push(folder, files..., path=None, overwrite=True, target_name='')"
+    )
 
 
-def test_folders_lists_the_names_push_accepts() -> None:
-    assert _session().folders() == ["METADATA", "ASSESSMENTS", "DELIVERABLES"]
+@respx.mock
+@pytest.mark.parametrize(
+    "files",
+    [
+        ("a.txt", "b.txt"),
+        (["a.txt", "b.txt"],),
+        ("a.txt", ["b.txt"]),
+    ],
+)
+def test_push_takes_several_files_in_one_call(
+    files: tuple[object, ...], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a.txt").write_text("a")
+    (tmp_path / "b.txt").write_text("b")
+    monkeypatch.chdir(tmp_path)
+    respx.put(url__startswith=file_url(TARGET)).mock(return_value=httpx.Response(201))
+
+    report = _session().push(DdsFolder.DELIVERABLES, *files)
+
+    assert report.paths == (f"{TARGET}/a.txt", f"{TARGET}/b.txt")
+
+
+@respx.mock
+def test_target_name_renames_the_one_file() -> None:
+    put = respx.put(file_url(f"{TARGET}/bwd_2025.xml")).mock(return_value=httpx.Response(201))
+
+    report = _session().push(DdsFolder.DELIVERABLES, REPORT, target_name=" bwd_2025.xml ")
+
+    assert report.paths == (f"{TARGET}/bwd_2025.xml",)
+    assert put.calls.last.request.content == REPORT.data
+
+
+def test_empty_target_name_keeps_the_file_name() -> None:
+    with respx.mock:
+        respx.put(file_url(f"{TARGET}/report.pdf")).mock(return_value=httpx.Response(201))
+        assert _session().push(DdsFolder.DELIVERABLES, REPORT, target_name="").paths == (
+            f"{TARGET}/report.pdf",
+        )
+
+
+@pytest.mark.parametrize(
+    ("files", "target_name", "message"),
+    [
+        ((REPORT, DdsFile("b.pdf", b"")), "x.pdf", "as a str names one file, but 2 .* pass a dict"),
+        ((REPORT,), "a/b.pdf", "must not be a path"),
+        ((REPORT,), "a:b.pdf", "not a valid file name"),
+    ],
+)
+def test_bad_target_name_uploads_nothing(
+    files: tuple[object, ...], target_name: str, message: str
+) -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        put = mock.put(url__startswith=file_url(TARGET))
+        with pytest.raises(DdsSessionError, match=message):
+            _session().push(DdsFolder.DELIVERABLES, *files, target_name=target_name)
+    assert not put.called
+
+
+def test_target_name_must_be_a_str_or_dict() -> None:
+    with pytest.raises(
+        DdsSessionError, match=r"argument 4 \(target_name\) must be str or dict, not NoneType"
+    ):
+        _session(env={}).push(DdsFolder.METADATA, REPORT, target_name=None)  # type: ignore[arg-type]
+
+
+@respx.mock
+def test_a_dict_target_name_renames_several_files_and_keeps_the_rest() -> None:
+    put = respx.put(url__startswith=file_url(TARGET)).mock(return_value=httpx.Response(201))
+    files = (REPORT, DdsFile("annex.xlsx", b"x"), DdsFile("notes.txt", b"n"))
+
+    report = _session().push(
+        DdsFolder.DELIVERABLES,
+        *files,
+        target_name={"report.pdf": "report_2025.pdf", " annex.xlsx ": "annex_2025.xlsx"},
+    )
+
+    assert report.paths == (
+        f"{TARGET}/report_2025.pdf",
+        f"{TARGET}/annex_2025.xlsx",
+        f"{TARGET}/notes.txt",
+    )
+    assert [c.request.content for c in put.calls] == [b"%PDF-1", b"x", b"n"]
+    assert put.calls[0].request.headers["Content-Type"] == "application/pdf"
+
+
+@pytest.mark.parametrize(
+    ("target_name", "message"),
+    [
+        ({"nope.pdf": "x.pdf"}, r"renames 'nope.pdf', but no file pushed has that name"),
+        ({"report.pdf": "notes.txt"}, "several files would be pushed as notes.txt"),
+        ({"report.pdf": "a/b.pdf"}, "must not be a path"),
+        ({"report.pdf": 3}, "maps file names"),
+    ],
+)
+def test_a_bad_dict_target_name_uploads_nothing(
+    target_name: dict[str, object], message: str
+) -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        put = mock.put(url__startswith=file_url(TARGET))
+        with pytest.raises(DdsSessionError, match=message):
+            _session().push(
+                DdsFolder.DELIVERABLES,
+                REPORT,
+                DdsFile("notes.txt", b""),
+                target_name=target_name,  # type: ignore[arg-type]
+            )
+    assert not put.called
+
+
+@respx.mock
+def test_an_empty_value_in_the_dict_keeps_the_name() -> None:
+    respx.put(file_url(f"{TARGET}/report.pdf")).mock(return_value=httpx.Response(201))
+
+    report = _session().push(DdsFolder.DELIVERABLES, REPORT, target_name={"report.pdf": ""})
+
+    assert report.paths == (f"{TARGET}/report.pdf",)
+
+
+def test_push_with_no_files_is_a_session_error() -> None:
+    with pytest.raises(DdsSessionError, match="no files to push"):
+        _session().push(DdsFolder.METADATA)
+
+
+def test_folders_lists_the_dds_folder_values() -> None:
+    assert _session(env={}).folders() == [m.name for m in DdsFolder]
 
 
 @respx.mock
 def test_a_controller_handed_in_is_used(documents: DocumentsClient) -> None:
     respx.put(file_url(f"{TARGET}/report.pdf")).mock(return_value=httpx.Response(201))
 
-    report = _session(env={}, controller=DdsController(documents)).push("deliverables", REPORT)
+    report = _session(env={}, controller=DdsController(documents)).push(
+        DdsFolder.DELIVERABLES, REPORT
+    )
 
     assert report.paths == (f"{TARGET}/report.pdf",)
 
@@ -151,7 +281,7 @@ def test_push_goes_to_the_dotenv_url(tmp_path: Path) -> None:
         return_value=httpx.Response(201)
     )
 
-    _session(dotenv_path=tmp_path / ".env").push("deliverables", REPORT)
+    _session(dotenv_path=tmp_path / ".env").push(DdsFolder.DELIVERABLES, REPORT)
 
     assert put.called
 

@@ -14,7 +14,7 @@ from eea_datalakehouse.dds_documents import (
     DdsPushError,
     DocumentsClient,
 )
-from eea_datalakehouse.dds_documents.controller import collect_files
+from eea_datalakehouse.dds_documents.controller import collect_files, folder_name
 
 from .conftest import DATASET, TARGET, file_url, not_found
 
@@ -36,25 +36,53 @@ def files(tmp_path: Path) -> Path:
 # -- folders and target -------------------------------------------------------
 
 
-@pytest.mark.parametrize("value", [DdsFolder.METADATA, "METADATA", "metadata", " Metadata/ "])
-def test_folder_parses_a_member_or_its_name_in_any_case(value: DdsFolder | str) -> None:
-    assert DdsFolder.parse(value) is DdsFolder.METADATA
+def test_the_eight_built_in_folders_match_dds() -> None:
+    assert [m.value for m in DdsFolder] == [
+        "derived",
+        "metadata",
+        "methodology",
+        "assessments",
+        "analyses",
+        "references",
+        DdsFolder.DELIVERABLES,
+        "others",
+    ]
 
 
-def test_unknown_folder_lists_the_valid_ones() -> None:
-    with pytest.raises(ValueError, match="use one of METADATA, ASSESSMENTS, DELIVERABLES"):
-        DdsFolder.parse("reports")
+def test_folder_name_is_the_members_value() -> None:
+    assert folder_name(DdsFolder.METADATA) == "metadata"
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("metadata", "not str 'metadata' — write METADATA, without quotes"),
+        ("METADATA", "write METADATA, without quotes"),
+        (
+            "maps",
+            r"must be one of the DdsFolder values DERIVED, METADATA, .*, OTHERS, not str 'maps'$",
+        ),
+        (None, "not NoneType None"),
+    ],
+)
+def test_folder_must_be_a_dds_folder(value: object, message: str) -> None:
+    with pytest.raises(TypeError, match=message):
+        folder_name(value)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
     ("dds_path", "folder", "expected"),
     [
         (DATASET, DdsFolder.DELIVERABLES, TARGET),
-        ("catalog/water/bwd/", "assessments", "catalog/water/bwd/assessments"),
-        ('catalog."bathing water"."v1.0"', "METADATA", "catalog/bathing water/v1.0/metadata"),
+        ("catalog/water/bwd/", DdsFolder.ASSESSMENTS, "catalog/water/bwd/assessments"),
+        (
+            'catalog."bathing water"."v1.0"',
+            DdsFolder.METADATA,
+            "catalog/bathing water/v1.0/metadata",
+        ),
     ],
 )
-def test_target(dds_path: str, folder: str, expected: str) -> None:
+def test_target(dds_path: str, folder: DdsFolder, expected: str) -> None:
     assert DdsController.target(dds_path, folder) == expected
 
 
@@ -107,6 +135,7 @@ def test_a_glob_skips_folders(files: Path) -> None:
         (lambda d: DdsFile("a:b.txt", b""), ValueError, "not a valid file name"),
         (lambda d: b"raw bytes", TypeError, "cannot push a bytes"),
         (lambda d: 42, TypeError, "int"),
+        (lambda d: True, TypeError, "for overwrite, write overwrite=True"),
     ],
 )
 def test_collect_rejects(files: Path, make: object, error: type[Exception], message: str) -> None:
@@ -122,13 +151,13 @@ def test_push_puts_every_file_with_its_content_type(dds: DdsController, files: P
     pdf = respx.put(file_url(f"{TARGET}/report.pdf")).mock(return_value=httpx.Response(201))
     txt = respx.put(file_url(f"{TARGET}/notes.txt")).mock(return_value=httpx.Response(201))
 
-    report = dds.push(DATASET, "DELIVERABLES", [files / "report.pdf", files / "notes.txt"])
+    report = dds.push(DATASET, DdsFolder.DELIVERABLES, [files / "report.pdf", files / "notes.txt"])
 
     assert report.paths == (f"{TARGET}/report.pdf", f"{TARGET}/notes.txt")
     assert report.target == TARGET
     assert pdf.calls.last.request.content == b"%PDF-1"
     assert pdf.calls.last.request.headers["Content-Type"] == "application/pdf"
-    assert pdf.calls.last.request.url.params["overwrite"] == "true"
+    assert pdf.calls.last.request.headers["X-DDS-Overwrite"] == "true"
     assert txt.calls.last.request.headers["Content-Type"] == "text/plain"
     assert repr(report).startswith(f"pushed 2 file(s) to {TARGET}:")
 
@@ -152,7 +181,10 @@ def test_no_overwrite_uploads_nothing_if_any_file_exists(dds: DdsController, fil
 
     with pytest.raises(DdsFilesExistError, match="notes.txt; pass overwrite=True") as info:
         dds.push(
-            DATASET, "deliverables", [files / "report.pdf", files / "notes.txt"], overwrite=False
+            DATASET,
+            DdsFolder.DELIVERABLES,
+            [files / "report.pdf", files / "notes.txt"],
+            overwrite=False,
         )
 
     assert info.value.existing == (f"{TARGET}/notes.txt",)
@@ -164,9 +196,18 @@ def test_no_overwrite_pushes_new_files_without_overwrite(dds: DdsController, fil
     respx.get(file_url(f"{TARGET}/report.pdf")).mock(return_value=not_found())
     put = respx.put(file_url(f"{TARGET}/report.pdf")).mock(return_value=httpx.Response(201))
 
-    dds.push(DATASET, "deliverables", files / "report.pdf", overwrite=False)
+    dds.push(DATASET, DdsFolder.DELIVERABLES, files / "report.pdf", overwrite=False)
 
-    assert put.calls.last.request.url.params["overwrite"] == "false"
+    assert put.calls.last.request.headers["X-DDS-Overwrite"] == "false"
+
+
+def test_a_string_folder_uploads_nothing(dds: DdsController, files: Path) -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        put = mock.put(url__startswith=file_url("catalog"))
+        with pytest.raises(TypeError, match="write DELIVERABLES, without quotes"):
+            dds.push(DATASET, "deliverables", files / "notes.txt")  # type: ignore[arg-type]
+
+    assert not put.called
 
 
 @respx.mock
@@ -177,7 +218,7 @@ def test_a_failure_part_way_names_what_was_uploaded(dds: DdsController, files: P
     )
 
     with pytest.raises(DdsPushError, match="disk full") as info:
-        dds.push(DATASET, "deliverables", [files / "report.pdf", files / "notes.txt"])
+        dds.push(DATASET, DdsFolder.DELIVERABLES, [files / "report.pdf", files / "notes.txt"])
 
     assert info.value.uploaded == (f"{TARGET}/report.pdf",)
     assert f"already uploaded: {TARGET}/report.pdf" in str(info.value)
@@ -187,7 +228,7 @@ def test_bad_input_uploads_nothing(dds: DdsController, files: Path) -> None:
     with respx.mock(assert_all_called=False) as mock:
         put = mock.put(url__startswith=file_url(TARGET))
         with pytest.raises(ValueError, match="no such file"):
-            dds.push(DATASET, "deliverables", [files / "report.pdf", files / "nope.pdf"])
+            dds.push(DATASET, DdsFolder.DELIVERABLES, [files / "report.pdf", files / "nope.pdf"])
 
     assert not put.called
 
