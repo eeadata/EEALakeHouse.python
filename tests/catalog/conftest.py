@@ -106,6 +106,9 @@ class FakeCatalogRest:
         self._raise_on_create_folder = raise_on_create_folder
         self._raise_on_delete_folder = raise_on_delete_folder
         self._raise_on_exists = raise_on_exists
+        # Seeded per-test by assignment, since only the folder-tree tests care.
+        self.view_definitions: dict[str, tuple[str, list[str]]] = {}
+        self.folder_listing: list[str] = []
 
     def exists(self, path: str) -> bool:
         if self._raise_on_exists is not None:
@@ -182,6 +185,20 @@ class FakeCatalogRest:
         if path not in self.existing:
             raise CatalogOperationError(f"{path!r} does not exist")
         self._tags[path] = list(tags)
+
+    def get_view_definition(self, path: str) -> tuple[str, list[str]] | None:
+        from eea_datalakehouse.catalog.errors import CatalogOperationError
+
+        if path not in self.existing:
+            raise CatalogOperationError(f"{path!r} does not exist")
+        return self.view_definitions.get(path)
+
+    def list_folders(self, path: str, *, recursive: bool = True) -> list[str]:
+        from eea_datalakehouse.catalog.errors import CatalogOperationError
+
+        if path not in self.existing:
+            raise CatalogOperationError(f"{path!r} does not exist")
+        return list(self.folder_listing)
 
     def ensure_folder_path(self, path: str) -> list[str]:
         from eea_datalakehouse.catalog.errors import CatalogOperationError

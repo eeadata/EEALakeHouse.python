@@ -230,6 +230,74 @@ class CatalogRestClient:
             return False
         return entity is not None and entity.get("entityType") == "dataset"
 
+    def children(self, path: str) -> list[dict[str, Any]]:
+        """Dremio's own child JSON for every entity directly inside `path`.
+
+        Each child carries at least ``path`` (a list of segments), ``id`` and
+        ``type``; a container also carries ``containerType`` (see
+        `_child_is_folder`). Raises `CatalogOperationError` if `path` does not
+        exist — unlike `is_folder`/`is_table_or_view`, which swallow a failed
+        lookup, because "I could not read this folder" and "this folder is
+        empty" are not the same answer for a caller that is about to copy or
+        delete its contents.
+        """
+        entity = self._lookup_by_path(path)
+        if entity is None:
+            raise CatalogOperationError(f"{path!r} does not exist")
+        return list(entity.get("children") or [])
+
+    def list_folders(self, path: str, *, recursive: bool = True) -> list[str]:
+        """Dot-paths of the folders inside `path`, shallowest first.
+
+        `path` itself is not included. `recursive=True` (the default) walks
+        the whole subtree; `False` returns only the direct children. Ordering
+        is breadth-first, which is the order a caller has to *create* them in
+        on the other side — a parent before anything under it.
+
+        Same unverified assumption as `delete_folder`'s cascade: a folder
+        child is recognised by ``type="CONTAINER"`` /
+        ``containerType="FOLDER"``.
+        """
+        found: list[str] = []
+        queue = [path]
+        while queue:
+            current = queue.pop(0)
+            for child in self.children(current):
+                if not self._child_is_folder(child):
+                    continue
+                child_path = ".".join(child.get("path") or [])
+                if not child_path:
+                    continue
+                found.append(child_path)
+                if recursive:
+                    queue.append(child_path)
+        return found
+
+    def get_view_definition(self, path: str) -> tuple[str, list[str]] | None:
+        """``(sql, sql_context)`` for the view at `path`, or None if `path` is
+        not a view (or Dremio's entity carries no SQL for it).
+
+        Dremio's catalog entity for a virtual dataset carries both the SQL
+        *as written* and the ``sqlContext`` it was written against — and the
+        context is what makes an unqualified ``FROM sales`` inside that SQL
+        resolvable. `INFORMATION_SCHEMA."VIEWS"` has the definition but not
+        the context, which is why this REST route is preferred where it
+        answers (see `getviewsql`).
+
+        Best-effort about *reachability*, not about correctness: a lookup
+        Dremio rejects outright (the 400 described in `is_folder`) surfaces as
+        `CatalogOperationError`, so the caller can fall back rather than
+        silently copy a view with no definition.
+        """
+        entity = self._lookup_by_path(path)
+        if entity is None:
+            raise CatalogOperationError(f"{path!r} does not exist")
+        sql = entity.get("sql")
+        if not sql:
+            return None
+        context = [str(segment) for segment in (entity.get("sqlContext") or [])]
+        return str(sql), context
+
     def get_wiki(self, path: str) -> str:
         """The Dremio wiki text attached to the catalog entity at `path`.
 

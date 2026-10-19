@@ -206,6 +206,27 @@ def _entry_exists(executor: SqlExecutor, path: str, *, idempotency_key: str) -> 
     return len(rows) > 0
 
 
+def entryexists(
+    executor: SqlExecutor,
+    path: str,
+    *,
+    idempotency_key: str,
+) -> bool:
+    """Whether `path` is a table or view Dremio knows about.
+
+    The public form of the existence check `table2view`/`datacopy`/`datamove`
+    already run internally. Transport-agnostic (`INFORMATION_SCHEMA`, so REST
+    or Flight both answer) — unlike `CatalogRestClient.exists`, which goes
+    through the REST catalog API and also sees folders, spaces and sources.
+    Fetches no rows from `path` itself, so it costs nothing on a large table.
+    """
+    try:
+        return _entry_exists(executor, path, idempotency_key=idempotency_key)
+    except EngineStartingError as exc:
+        retry_state.record(idempotency_key, "entryexists", path, str(exc), params={"path": path})
+        raise
+
+
 def _entry_kind(executor: SqlExecutor, path: str, *, idempotency_key: str) -> Literal["TABLE", "VIEW"]:
     """Whether `path` is a Dremio TABLE or VIEW, via INFORMATION_SCHEMA's
     own ``TABLE_TYPE`` column — doubles as an existence check.
@@ -1198,6 +1219,237 @@ def gettableitemsfrom(
     return TableInfo(schema=schema, row_count=row_count)
 
 
+@dataclass(frozen=True, slots=True)
+class CatalogEntry:
+    """One table or view under a schema: its full dot-path, and which it is."""
+
+    path: str
+    kind: Literal["TABLE", "VIEW"]
+
+
+def getentriesfrom(
+    executor: SqlExecutor,
+    schema_path: str,
+    *,
+    idempotency_key: str,
+) -> list[CatalogEntry]:
+    """`gettablesfrom`, but each path carries whether it is a TABLE or a VIEW.
+
+    Same single query over the whole subtree (see `gettablesfrom` for the
+    `LIKE` reasoning), with ``TABLE_TYPE`` selected as well — so a caller
+    copying a folder knows per entry what it is without one `_entry_kind`
+    round-trip per path. It matters: copying a view with
+    ``CREATE TABLE … AS SELECT`` silently materialises it into a table,
+    which is a different kind of thing from the original.
+
+    Sorted by path, so two runs enumerate in the same order.
+    """
+    like_pattern = f"{_like_escape(schema_path)}.%"
+    sql = (
+        'SELECT "TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE" FROM INFORMATION_SCHEMA."TABLES" '
+        f"WHERE \"TABLE_SCHEMA\" = {_quote_literal(schema_path)} "
+        f"OR \"TABLE_SCHEMA\" LIKE {_quote_literal(like_pattern)} ESCAPE '\\'"
+    )
+    rows = _fetch_step(
+        executor,
+        sql,
+        operation="getentriesfrom",
+        target=schema_path,
+        idempotency_key=idempotency_key,
+        params={"schema_path": schema_path},
+    )
+    entries = [
+        CatalogEntry(
+            path=f"{row['TABLE_SCHEMA']}.{row['TABLE_NAME']}",
+            kind="VIEW" if "VIEW" in str(row.get("TABLE_TYPE", "")).upper() else "TABLE",
+        )
+        for row in rows
+    ]
+    return sorted(entries, key=lambda entry: entry.path)
+
+
+@dataclass(frozen=True, slots=True)
+class ViewDefinition:
+    """A view's own SQL, and the catalog context it was written against.
+
+    `context` is the ``sqlContext`` Dremio stores beside the SQL — the schema
+    an unqualified ``FROM sales`` inside `sql` resolves against. It is empty
+    when the definition came from `INFORMATION_SCHEMA."VIEWS"`, which has no
+    equivalent column: an empty `context` means *unknown*, not *none*.
+    """
+
+    sql: str
+    context: tuple[str, ...] = ()
+
+
+def getviewsql(
+    executor: SqlExecutor,
+    view_path: str,
+    *,
+    catalog_rest: CatalogRestClient | None = None,
+    idempotency_key: str,
+) -> ViewDefinition:
+    """The SQL the view at `view_path` is defined by.
+
+    Two sources, in this order — they answer with different amounts of the
+    truth, so the better one is tried first:
+
+    1. `catalog_rest.get_view_definition` (Dremio's catalog entity), which
+       carries the SQL **and** its ``sqlContext``. Skipped without a
+       `catalog_rest`, and fallen through if the lookup is rejected — some
+       Dremio source types answer a nested by-path lookup with a 400 (see
+       `CatalogRestClient.is_folder`).
+    2. ``INFORMATION_SCHEMA."VIEWS"``, which has ``VIEW_DEFINITION`` but no
+       context — so the result's `context` is empty and any unqualified
+       reference inside the SQL cannot be resolved from it.
+
+    Raises `CatalogOperationError` if neither answers — a view whose
+    definition cannot be read is not something a caller should quietly
+    replace with a guess.
+    """
+    if catalog_rest is not None:
+        try:
+            definition = catalog_rest.get_view_definition(view_path)
+        except CatalogOperationError:
+            definition = None
+        if definition is not None:
+            sql, context = definition
+            retry_state.clear(idempotency_key)
+            return ViewDefinition(sql=sql, context=tuple(context))
+
+    schema_path = _parent_path(view_path)
+    if schema_path is None:
+        raise ValueError(f"{view_path!r} has no containing schema")
+    leaf = view_path.rsplit(".", 1)[-1]
+    sql_query = (
+        'SELECT "VIEW_DEFINITION" FROM INFORMATION_SCHEMA."VIEWS" '
+        f"WHERE \"TABLE_SCHEMA\" = {_quote_literal(schema_path)} "
+        f"AND \"TABLE_NAME\" = {_quote_literal(leaf)}"
+    )
+    rows = _fetch_step(
+        executor,
+        sql_query,
+        operation="getviewsql",
+        target=view_path,
+        idempotency_key=idempotency_key,
+        params={"view_path": view_path},
+    )
+    definition_sql = str(rows[0].get("VIEW_DEFINITION", "")) if rows else ""
+    if not definition_sql.strip():
+        raise CatalogOperationError(
+            f"could not read the view definition of {view_path!r} — "
+            "it is not a view, or Dremio reports no SQL for it"
+        )
+    return ViewDefinition(sql=definition_sql, context=())
+
+
+def createviewas(
+    executor: SqlExecutor,
+    view_path: str,
+    sql: str,
+    *,
+    overwrite: bool = False,
+    create_target_folder: bool = True,
+    catalog_rest: CatalogRestClient | None = None,
+    idempotency_key: str,
+) -> SqlResult:
+    """Create the view at `view_path` from an arbitrary `sql` query body.
+
+    `table2view`'s general form: that one always writes
+    ``SELECT * FROM <source>``, this one takes whatever query you hand it —
+    which is what a folder copy needs, since a copied view has to select
+    from the *copied* tables, not the originals (see
+    `eea_datalakehouse.catalog.foldertree`).
+
+    `sql` is the query body only (no ``CREATE VIEW`` prefix) and is sent
+    through unchanged — quoting and correctness are the caller's, since the
+    text usually comes back out of Dremio itself.
+
+    `overwrite=False` (the default) raises `CatalogOperationError` if
+    anything already sits at `view_path`, rather than letting Dremio answer
+    with its own less specific error. `overwrite=True` drops whatever is
+    actually there first, detecting whether it is a table or a view — the
+    same reasoning as `datacopy`'s own `check_or_drop_target`.
+    """
+    params: dict[str, Any] = {
+        "view_path": view_path,
+        "sql": sql,
+        "overwrite": overwrite,
+        "create_target_folder": create_target_folder,
+    }
+
+    def ensure_target_folder() -> None:
+        if not create_target_folder:
+            return
+        parent = _parent_path(view_path)
+        if parent is None:
+            return
+        if catalog_rest is None:
+            raise CatalogOperationError(
+                "createviewas(create_target_folder=True) needs catalog_rest= "
+                "to check/create the target folder"
+            )
+        catalog_rest.ensure_folder_path(parent)
+
+    def check_or_drop_target() -> None:
+        if not _entry_exists(executor, view_path, idempotency_key=idempotency_key):
+            return
+        if not overwrite:
+            raise CatalogOperationError(
+                f"target {view_path!r} already exists — pass overwrite=True to replace it"
+            )
+        existing_kind = _entry_kind(executor, view_path, idempotency_key=idempotency_key)
+        executor.execute(
+            f"DROP {existing_kind} IF EXISTS {_quote_path(view_path)}",
+            idempotency_key=idempotency_key,
+        )
+
+    def create_view() -> SqlResult:
+        return executor.execute(
+            f"CREATE VIEW {_quote_path(view_path)} AS {sql}", idempotency_key=idempotency_key
+        )
+
+    return _run_actions(
+        [ensure_target_folder, check_or_drop_target, create_view],
+        operation="createviewas",
+        target=view_path,
+        idempotency_key=idempotency_key,
+        params=params,
+    )
+
+
+def getfoldersfrom(
+    catalog_rest: CatalogRestClient,
+    path: str,
+    *,
+    recursive: bool = True,
+    idempotency_key: str,
+) -> list[str]:
+    """Dot-paths of the folders under `path`, shallowest first.
+
+    REST-only (see module docstring) — folders are not in
+    `INFORMATION_SCHEMA`, which only knows about tables and views, so an
+    *empty* folder is invisible to `gettablesfrom`/`getentriesfrom` and can
+    only be found this way.
+
+    Breadth-first, which is the order they have to be created in on the
+    other side. `path` itself is not included.
+    """
+    try:
+        folders = catalog_rest.list_folders(path, recursive=recursive)
+    except EngineStartingError as exc:
+        retry_state.record(
+            idempotency_key,
+            "getfoldersfrom",
+            path,
+            str(exc),
+            params={"path": path, "recursive": recursive},
+        )
+        raise
+    retry_state.clear(idempotency_key)
+    return folders
+
+
 def getwikifrom(
     catalog_rest: CatalogRestClient,
     path: str,
@@ -1674,6 +1926,11 @@ _OPERATIONS = {
     "deletetable": deletetable,
     "gettablesfrom": gettablesfrom,
     "gettableitemsfrom": gettableitemsfrom,
+    "entryexists": entryexists,
+    "getentriesfrom": getentriesfrom,
+    "getviewsql": getviewsql,
+    "createviewas": createviewas,
+    "getfoldersfrom": getfoldersfrom,
     "getwikifrom": getwikifrom,
     "gettagsfrom": gettagsfrom,
     "setwikito": setwikito,

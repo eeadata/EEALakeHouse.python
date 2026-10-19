@@ -71,10 +71,14 @@ class IngestApiError(RuntimeError):
     ``schema_required``; ``""`` when the body carried none) and ``retryable``
     whether repeating the request — for a failed transfer, ``retry`` — can
     succeed unchanged (``None`` from a server predating contract v0.8).
+    ``failed_stage`` is where a failed commit broke, ``"upload"`` or ``"load"``,
+    as the session reports it; ``FolderIngest`` sets it, and it is ``None``
+    everywhere else.
     """
 
     error_slug: str = ""
     retryable: bool | None = None
+    failed_stage: str | None = None
 
     def __init__(self, status_code: int, message: str, *, where: str | None = None) -> None:
         super().__init__(
@@ -353,6 +357,31 @@ class IngestClient:
         self._raise_for_status(resp, f"GET /api/v1/ingest/{session_id}")
         return StatusResult.from_json(resp.json())
 
+    def health(self) -> None:
+        """Raise unless DDS answers its liveness probe (``GET /health``, no login)."""
+        resp = self._http.get(f"{self._base_url}/health")
+        self._raise_for_status(resp, "GET /health")
+
+    def limits(self, runner: str = "notebook") -> dict[str, Any]:
+        """The ingest size limits for this kind of client (``GET /api/v1/ingest/limits``,
+        contract v0.8). Needs a login, so it also proves the credential works."""
+        resp = self._http.get(
+            f"{self._base_url}/api/v1/ingest/limits",
+            params={"runner": runner},
+            headers=self._auth_headers,
+        )
+        self._raise_for_status(resp, "GET /api/v1/ingest/limits")
+        result: dict[str, Any] = resp.json()
+        return result
+
+    def storage_selftest(self) -> dict[str, Any]:
+        """Re-run DDS's S3 write test and return its verdict (``POST /storage-selftest``,
+        no login). ``storage_write_test.ok`` says whether ingest can write."""
+        resp = self._http.post(f"{self._base_url}/storage-selftest")
+        self._raise_for_status(resp, "POST /storage-selftest")
+        result: dict[str, Any] = resp.json()
+        return result
+
     def list_sessions(self, state: str | None = None) -> list[StatusResult]:
         """Your ingest sessions (``GET /api/v1/ingest``).
 
@@ -368,7 +397,12 @@ class IngestClient:
         rows = payload if isinstance(payload, list) else payload.get("sessions", [])
         return [StatusResult.from_json(row) for row in rows]
 
-    def retry(self, session_id: str) -> StatusResult:
+    def retry(
+        self,
+        session_id: str,
+        *,
+        definition: TableDefinition | Mapping[str, Any] | None = None,
+    ) -> StatusResult:
         """Re-run a failed session's last stage (``POST /api/v1/ingest/{id}/retry``).
 
         Only a ``failed`` session can be retried, and only the Dremio load stage
@@ -376,9 +410,16 @@ class IngestClient:
         (see :attr:`StatusResult.is_resumable`). A session whose upload never
         completed, or whose failure a re-run cannot fix, raises
         :class:`IngestApiError` telling you to upload again.
+
+        ``definition`` (contract v0.8, DI-12.6) replaces the stored table
+        definition before the re-run — the fix for a ``schema_required`` or
+        ``schema_mismatch`` failure without uploading again. Without it the
+        request has no body, exactly as before.
         """
+        payload = definition_payload(definition)
         resp = self._http.post(
             f"{self._base_url}/api/v1/ingest/{session_id}/retry",
+            json={"definition": payload} if payload is not None else None,
             headers=self._auth_headers,
         )
         self._raise_for_status(resp, f"POST /api/v1/ingest/{session_id}/retry")

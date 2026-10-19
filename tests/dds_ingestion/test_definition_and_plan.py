@@ -1,4 +1,5 @@
-"""PY-3 (optional table definition) and PY-4 (show the plan, dry run).
+"""PY-3 (optional table definition), PY-4 (show the plan, dry run) and PY-9
+(retry with a corrected definition).
 
 Companion to the DDS DI-12 plan; see docs/dds-ingest-robustness-client-plan.md.
 """
@@ -22,6 +23,7 @@ from eea_datalakehouse.dds_ingestion.models import (
     ColumnDef,
     DryRunResult,
     FileSpec,
+    StatusResult,
     TableDefinition,
     definition_payload,
 )
@@ -266,3 +268,91 @@ def test_folder_dry_run_uploads_nothing_and_shows_the_plan(
     assert client.begin_calls == [] and client.uploaded == [] and client.commit_calls == []
     assert job.session_id is None
     assert "Importing as a new editable table" in capsys.readouterr().out
+
+
+# --- PY-9: retry with a corrected definition ----------------------------------------
+
+DEFINITION_JSON = {"columns": [{"name": "a", "type": "INT", "nullable": False}]}
+
+
+@respx.mock
+def test_retry_without_a_definition_sends_todays_request(creds: DremioCreds) -> None:
+    """Golden: no body, as before DI-12.6."""
+    route = respx.post(f"{BASE_URL}/api/v1/ingest/sess-1/retry").mock(
+        return_value=httpx.Response(200, json={"session_id": "sess-1", "status": "committing"})
+    )
+    with IngestClient(BASE_URL, creds) as client:
+        client.retry("sess-1")
+    request = route.calls.last.request
+    assert request.read() == b""
+    assert "content-type" not in request.headers
+
+
+@respx.mock
+def test_retry_sends_a_corrected_definition(creds: DremioCreds) -> None:
+    route = respx.post(f"{BASE_URL}/api/v1/ingest/sess-1/retry").mock(
+        return_value=httpx.Response(200, json={"session_id": "sess-1", "status": "committing"})
+    )
+    with IngestClient(BASE_URL, creds) as client:
+        client.retry("sess-1", definition=DEFINITION)
+    assert json.loads(route.calls.last.request.read()) == {"definition": DEFINITION_JSON}
+
+
+class FailedSessionClient(PlanClient):
+    """A session that failed with ``schema_required``; ``retry`` records its arguments."""
+
+    def __init__(self, *, resumable: bool) -> None:
+        super().__init__(plan=PLAN_JSON)
+        self.status_payload = {
+            "status": "failed",
+            "progress": {},
+            "failed_stage": "load" if resumable else "upload",
+            "resumable": resumable,
+            "error_code": "schema_required",
+        }
+        self.retry_calls: list[dict[str, object]] = []
+
+    def retry(self, session_id: str, **kwargs: object) -> StatusResult:
+        self.retry_calls.append({"session_id": session_id, **kwargs})
+        return StatusResult.from_json({"session_id": session_id, "status": "done", "progress": {}})
+
+
+def _attached(folder: Path, client: FakeClient) -> FolderIngest:
+    return FolderIngest.attach(
+        "sess-1",
+        folder,
+        "bio/uploads",
+        data_format="csv",
+        intent="editable",
+        show_progress=False,
+        client=client,  # type: ignore[arg-type]
+    )
+
+
+def test_retry_resumes_the_load_with_the_corrected_definition(tmp_path: Path) -> None:
+    client = FailedSessionClient(resumable=True)
+    job = _attached(_csv_folder(tmp_path), client)
+
+    outcome = job.retry(table_definition=DEFINITION)
+
+    assert outcome.resumed
+    assert client.retry_calls == [{"session_id": "sess-1", "definition": DEFINITION}]
+    assert client.begin_calls == []  # nothing uploaded again
+
+
+def test_retry_without_a_definition_calls_retry_as_before(tmp_path: Path) -> None:
+    client = FailedSessionClient(resumable=True)
+    _attached(_csv_folder(tmp_path), client).retry()
+    assert client.retry_calls == [{"session_id": "sess-1"}]
+
+
+def test_a_retry_that_uploads_again_sends_the_corrected_definition_on_begin(
+    tmp_path: Path,
+) -> None:
+    client = FailedSessionClient(resumable=False)
+    job = _attached(_csv_folder(tmp_path), client)
+
+    job.retry(table_definition=DEFINITION)
+
+    assert client.retry_calls == []
+    assert client.begin_calls[0]["definition"] == DEFINITION
