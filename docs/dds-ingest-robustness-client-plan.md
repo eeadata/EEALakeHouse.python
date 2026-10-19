@@ -188,7 +188,11 @@ missing was the automatic fallback (G10 in `Documentation/data-digestion.md`).
 > format; columns are inferred only for CSV/JSON into an **editable** table, the one
 > case where the server builds the table from them; a JSON array cannot be inferred
 > and says so. Open: the end-to-end editable CSV run against `local-stack`
-> (DI-12.15) has not been done from this client.
+> (DI-12.15) has not been done from this client. Fixed 2026-10-19: a CSV whose text is not
+> UTF-8 was inferred as `VARBINARY` columns (pyarrow reads such text as binary) and
+> sent. Since DDS passes no `encoding` on to Dremio, which reads CSV as UTF-8, the
+> client now refuses a non-UTF-8 `csv_options` `encoding`, and a file that is not
+> UTF-8, before anything is uploaded.
 
 ### PY-7 `FolderIngest.diagnose()` — R4 — **DONE**
 
@@ -415,6 +419,10 @@ done).
   check: after DI-12.22 (R6b).
 - **Undo for `IngestSession`** once DDS can delete a read-only table (DI-12.21, R6b);
   its module docstring notes that it is missing.
+- **Non-UTF-8 CSV that actually loads.** Today the client refuses it (PY-6 note).
+  Either DDS honours `csv_options['encoding']` — server work: it accepts the field
+  and uses it nowhere — or the client converts the files to UTF-8 before `begin`,
+  which changes their sizes and so has to happen before the file list is sent.
 
 ### 5.5 Order
 

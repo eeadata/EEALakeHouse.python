@@ -29,7 +29,7 @@ import pyarrow as pa
 
 from .client import IngestApiError, IngestClient, UnsupportedByServerError
 from .credentials import DremioCreds, load_base_url, load_creds
-from .formats import FORMATS, compare_columns, local_columns
+from .formats import FORMATS, compare_columns, first_non_utf8, is_utf8, local_columns
 from .models import (
     BeginPlan,
     BeginResult,
@@ -361,6 +361,7 @@ class FolderIngest:
         The server validates the target here — an unauthorised or non-existent
         catalog folder fails now, before a single byte is uploaded.
         """
+        self._check_csv_encoding_option()
         files = scan_folder(self.folder, self.data_format)
         if not files:
             raise FileNotFoundError(
@@ -396,6 +397,7 @@ class FolderIngest:
         real begin would raise, or :class:`UnsupportedByServerError` against a
         DDS server that predates dry runs.
         """
+        self._check_csv_encoding_option()
         files = scan_folder(self.folder, self.data_format)
         if not files:
             raise FileNotFoundError(
@@ -442,6 +444,13 @@ class FolderIngest:
         try:
             columns = local_columns(self.folder, rel_paths, self.data_format, options)
         except (ValueError, pa.ArrowException) as exc:
+            # A file that is not UTF-8 would load garbled, not just untyped: say so.
+            bad = first_non_utf8(self.folder, rel_paths) if self.data_format == "csv" else None
+            if bad is not None:
+                raise self._encoding_error(
+                    f"{bad!r} is not valid UTF-8, and Dremio reads CSV as UTF-8, so its "
+                    "text would load garbled: save it as UTF-8 and run again."
+                ) from exc
             logger.warning(
                 "could not infer the %s columns locally (%s); the server will ask for "
                 "them — pass table_definition=…",
@@ -455,6 +464,26 @@ class FolderIngest:
         if self.show_progress:
             print(f"Inferred columns: {summary}")
         return inferred
+
+    def _check_csv_encoding_option(self) -> None:
+        """Refuse a CSV ``encoding`` other than UTF-8 before anything starts: DDS
+        accepts the option but passes no encoding on to Dremio, which reads CSV as
+        UTF-8, so such a file would load garbled rather than fail."""
+        encoding = (self.csv_options or {}).get("encoding")
+        if self.data_format == "csv" and encoding and not is_utf8(str(encoding)):
+            raise self._encoding_error(
+                f"csv_options asks for encoding {encoding!r}, but DDS ignores it and "
+                "Dremio reads CSV as UTF-8, so the text would load garbled: save the "
+                "files as UTF-8, drop the encoding option, and run again."
+            )
+
+    @staticmethod
+    def _encoding_error(message: str) -> IngestApiError:
+        err = IngestApiError(
+            400, message, where="local CSV encoding check (nothing was uploaded)"
+        )
+        err.retryable = False
+        return err
 
     def _check_parquet_columns(self, rel_paths: list[str], given: list[Mapping[str, Any]]) -> None:
         """Refuse given Parquet columns that contradict the local footers, before

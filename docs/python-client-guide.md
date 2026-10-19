@@ -792,7 +792,7 @@ FolderIngest(
 | `multipart` | `True`/`False` forces the server's multipart decision; `None` leaves it to the server. |
 | `table_definition` | The table's column types (and, for later servers, partitioning and sorting) — a `TableDefinition` or a dict in the contract's shape. See [Table definitions](#table-definitions-csvjson-options-inferred-columns). |
 | `cleanup_on_failure` | After a commit failure the server *could* retry, cancel the session — deleting its uploaded files — instead of keeping it for `retry()`. Default `False`: kept. With it, a `retry()` afterwards uploads again under a new session. |
-| `csv_options` / `json_options` | Parsing hints sent on begin, each only for its own format. CSV: `delimiter`, `quote`, `header`, `encoding`. JSON: `format`, `"lines"` or `"array"`. Inference uses them too. |
+| `csv_options` / `json_options` | Parsing hints sent on begin, each only for its own format. CSV: `delimiter`, `quote`, `header` — DDS also accepts `encoding` but passes it on to nothing, so anything other than UTF-8 is refused (see [CSV must be UTF-8](#table-definitions-csvjson-options-inferred-columns)). JSON: `format`, `"lines"` or `"array"`. Inference uses them too. |
 | `infer_schema` | For CSV/JSON into an `editable` table without a `table_definition`: infer the columns locally from every file and send them. `False` turns that off. |
 | `show_progress` | `False` suppresses the progress bar, and the plan, inferred columns and `diagnose()` lines that are otherwise printed. |
 | `upload_mode` | `"auto"` follows the server; `"direct"` uploads only to S3; `"proxy"` sends every file through DDS. `ValueError` otherwise. See [`upload_mode`](#upload_mode--how-the-bytes-travel). |
@@ -910,6 +910,13 @@ reads every file with pyarrow, widens the types across files, prints them as
 JSON *array*, for one — logs a warning and sends nothing; the server then asks
 for the columns. `infer_schema=False` turns inference off. Parquet needs none:
 its files carry their own schema.
+
+**CSV must be UTF-8.** Dremio reads CSV as UTF-8 and DDS passes no encoding on
+to it, so a Latin-1 or Windows-1252 file would load garbled — and inference alone
+would read its text columns as binary. The client refuses such a file before
+anything is uploaded: a `csv_options` `encoding` other than UTF-8 (however
+spelled: `utf8`, `UTF-8` are fine), or, while inferring columns, a file that is
+not valid UTF-8, which the error names. Save the files as UTF-8 first.
 
 **Parquet with columns given.** They are checked against the files' own footers
 before anything is uploaded, with the server's comparison rules. A mismatch
