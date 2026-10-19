@@ -44,6 +44,9 @@ behaviour behind those snippets.
   - [`FolderIngest`](#folderingest)
   - [`intent` — what a transfer leaves behind](#intent--what-a-transfer-leaves-behind)
   - [`sub_path` — read-only data that accumulates](#sub_path--read-only-data-that-accumulates)
+  - [Table definitions, CSV/JSON options, inferred columns](#table-definitions-csvjson-options-inferred-columns)
+  - [`upload_mode` — how the bytes travel](#upload_mode--how-the-bytes-travel)
+  - [Checking a transfer first: `dry_run()` and `diagnose()`](#checking-a-transfer-first-dry_run-and-diagnose)
   - [Managing, resuming and abandoning a transfer](#managing-resuming-and-abandoning-a-transfer)
   - [`IngestOutcome`, `scan_folder`, `ingest_folder`](#ingestoutcome-scan_folder-ingest_folder)
   - [`IngestClient` — one method per endpoint](#ingestclient--one-method-per-endpoint)
@@ -135,7 +138,12 @@ fewest lines that actually work.
 | …and keep the handle, so a failure is resumable | `job = FolderIngest(..., **_dds); job.run()` |
 | add this year to a table that grows | `ingest(..., intent="read_only", table_name="t", sub_path="2026")` |
 | redo one year only | `ingest(..., sub_path="2026", conflict_mode="replace")` |
+| CSV / JSON into an editable table | `ingest("./csv", "path.to.target", data_format="csv", intent="editable")` — columns inferred |
+| …with the column types I choose | `ingest(..., table_definition=TableDefinition(columns=(ColumnDef("v", "DOUBLE"),)))` |
+| check a transfer before starting it | `job.diagnose()` · `job.dry_run()` |
 | resume a failed transfer | `job.retry()` |
+| …after fixing the columns | `job.retry(table_definition=…)` |
+| S3 is unreachable from this kernel | `FolderIngest(..., upload_mode="proxy", **_dds).run()` |
 | pick a transfer up in a later kernel | `FolderIngest.attach(session_id, ..., **_dds)` |
 | abandon a transfer | `job.cancel()` |
 | see my transfers | `IngestClient(**_dds).list_sessions(state="failed")` |
@@ -250,6 +258,47 @@ ingest("./bw_2026", "water_management_resources.bathing_water.bwd.reference",
        table_name="water_temperature", sub_path="2026", conflict_mode="replace")
 ```
 
+### CSV or JSON into an editable table
+
+An editable table is built from column types. For CSV and JSON the client reads
+every file locally, infers them, prints them (`Inferred columns: …`) and sends
+them with the transfer — nothing to write:
+
+```python
+out = ingest("./stations_csv", "biodiversity.uploads", data_format="csv", intent="editable")
+```
+
+To choose the types yourself, pass a table definition — and parsing hints, if
+the files need them:
+
+```python
+from eea_datalakehouse.dds_ingestion import ColumnDef, TableDefinition
+
+columns = TableDefinition(columns=(
+    ColumnDef("station_id", "VARCHAR"),
+    ColumnDef("measured_at", "TIMESTAMP"),
+    ColumnDef("value", "DOUBLE"),
+))
+out = ingest("./stations_csv", "biodiversity.uploads", data_format="csv", intent="editable",
+             table_definition=columns, csv_options={"delimiter": ";"})
+```
+
+A JSON *array* file cannot be inferred — pass its columns this way. Details:
+[Table definitions](#table-definitions-csvjson-options-inferred-columns).
+
+### Check a transfer before you start it
+
+```python
+job = FolderIngest("./my_data", "biodiversity.uploads", data_format="parquet", **_dds)
+job.diagnose()       # one ✓ / ✗ line per check, ending with a dry run of this folder
+job.dry_run()        # only the dry run: what commit would do
+```
+
+Neither uploads anything or opens a session. `diagnose()` says, in plain
+language, which of DDS, your credential, the file sizes, DDS's storage and the
+target is the problem — see
+[Checking a transfer first](#checking-a-transfer-first-dry_run-and-diagnose).
+
 ### The transfer failed — resume it without re-uploading
 
 ```python
@@ -264,8 +313,25 @@ except Exception:
 `retry()` decides from the server's own report. It re-runs just the load step
 when the staged files survived, starts a fresh session when they did not, and
 **raises rather than guessing** for a permanently-stored transfer that a blind
-re-run would duplicate. The full decision table is
-[here](#managing-resuming-and-abandoning-a-transfer).
+re-run would duplicate. An *upload* failure has already cancelled the session
+(the error's note says so); `retry()` then uploads again if the failure can pass
+— a network error, a 5xx — and otherwise raises with the upload error. The full
+decision table is [here](#managing-resuming-and-abandoning-a-transfer).
+
+### The load failed on its columns — fix them and resume
+
+A commit that failed with `schema_required` or `schema_mismatch` (the error's
+`error_slug`) needs no new upload — only the right columns:
+
+```python
+from eea_datalakehouse.dds_ingestion import ColumnDef, TableDefinition
+
+job.retry(table_definition=TableDefinition(columns=(ColumnDef("value", "DOUBLE"),)))
+```
+
+The corrected definition replaces the stored one and only the load re-runs. It
+needs a DDS server with DI-12.6; an older one ignores the definition and the
+retry fails as before.
 
 ### Pick a transfer up in a later kernel
 
@@ -331,22 +397,20 @@ dataflow level and below are created.
 
 ### S3 is unreachable from this kernel — send the bytes through the server
 
-The fallback when presigned uploads cannot connect. Slower, since every byte
-transits DDS:
+Every file goes through DDS (`POST /api/v1/ingest/stage`) instead of to the
+presigned S3 targets. Slower, since every byte transits DDS:
 
 ```python
-from pathlib import Path
-from eea_datalakehouse.dds_ingestion import scan_folder
-
-folder = Path("./my_data")
-with IngestClient(**_dds) as c:
-    begin = c.begin(target_catalog_path="biodiversity.uploads", intent="read_only",
-                    data_format="parquet", conflict_mode="fail",
-                    files=scan_folder(folder, "parquet"))
-    for t in begin.s3.uploads:
-        c.stage(begin.session_id, t.rel_path, (folder / t.rel_path).read_bytes())
-    print(c.commit(session_id=begin.session_id))
+job = FolderIngest("./my_data", "biodiversity.uploads", data_format="parquet",
+                   upload_mode="proxy", **_dds)
+out = job.run()
+print(out.upload_mode, out.files_staged)     # "proxy", every file
 ```
+
+Usually you do not need to ask. With the default `upload_mode="auto"` the client
+follows the server, which can say `proxy` itself; and when it says `auto` (DDS's
+default), a file whose presigned upload fails at the network layer goes through
+DDS on its own. See [`upload_mode`](#upload_mode--how-the-bytes-travel).
 
 ### Tell staged from permanent
 
@@ -666,12 +730,18 @@ begin  →  upload (all files, in parallel)  →  commit
    server validates the target *here*, so an unauthorised or non-existent
    catalog folder fails before a single byte moves. It answers with an
    [`S3Plan`](#models): a bucket, a key prefix, and one presigned
-   [`UploadTarget`](#models) per file.
+   [`UploadTarget`](#models) per file — and, from a server with contract v0.8,
+   a [`BeginPlan`](#models) saying what commit will do, which `run()` shows
+   before uploading.
 2. **upload** — each file's bytes go straight from your machine to object
-   storage using the target exactly as issued. Small files use a presigned POST
-   policy (or a legacy presigned PUT); large ones use S3 multipart with a
+   storage using the target exactly as issued. Small files use a presigned PUT
+   (older servers issue a POST policy); large ones use S3 multipart with a
    presigned URL per part. The DDS bearer token is **never** sent on these
-   requests — each presigned URL carries its own auth.
+   requests — each presigned URL carries its own auth. Where S3 cannot be
+   reached from your kernel the bytes go through DDS instead — see
+   [`upload_mode`](#upload_mode--how-the-bytes-travel). If an upload fails,
+   `run()` cancels the session before raising, so the files that did land are
+   deleted rather than left behind.
 3. **`commit`** — the server loads what landed into the table. This is where the
    Dremio work happens (`CREATE TABLE` + `COPY INTO` on a managed catalog), so
    it is the step most likely to fail, and the one
@@ -695,7 +765,13 @@ FolderIngest(
     parallelism=4,
     idempotency_key=None,
     multipart=None,
+    table_definition=None,       # TableDefinition | dict
+    cleanup_on_failure=False,
+    csv_options=None,            # dict, sent only with data_format="csv"
+    json_options=None,           # dict, sent only with data_format="json"
+    infer_schema=True,
     show_progress=True,
+    upload_mode="auto",          # "auto" | "direct" | "proxy"
     client=None,                 # inject an IngestClient (tests, custom transport)
     base_url=None,               # else DDS_BASE_URL
     creds=None,                  # else _DREMIO_USER / _DREMIO_PWD
@@ -714,7 +790,12 @@ FolderIngest(
 | `parallelism` | Concurrent uploads (a `ThreadPoolExecutor`). Must be ≥ 1 — `ValueError` otherwise. |
 | `idempotency_key` | Passed to `begin` so a repeated call replays the same session rather than starting a second one. **Dropped automatically** when `retry()` has to start over, or the server would just replay the failed session. |
 | `multipart` | `True`/`False` forces the server's multipart decision; `None` leaves it to the server. |
-| `show_progress` | `False` suppresses the progress bar entirely. |
+| `table_definition` | The table's column types (and, for later servers, partitioning and sorting) — a `TableDefinition` or a dict in the contract's shape. See [Table definitions](#table-definitions-csvjson-options-inferred-columns). |
+| `cleanup_on_failure` | After a commit failure the server *could* retry, cancel the session — deleting its uploaded files — instead of keeping it for `retry()`. Default `False`: kept. |
+| `csv_options` / `json_options` | Parsing hints sent on begin, each only for its own format. CSV: `delimiter`, `quote`, `header`, `encoding`. JSON: `format`, `"lines"` or `"array"`. Inference uses them too. |
+| `infer_schema` | For CSV/JSON into an `editable` table without a `table_definition`: infer the columns locally from every file and send them. `False` turns that off. |
+| `show_progress` | `False` suppresses the progress bar, and the plan, inferred columns and `diagnose()` lines that are otherwise printed. |
+| `upload_mode` | `"auto"` follows the server; `"direct"` uploads only to S3; `"proxy"` sends every file through DDS. `ValueError` otherwise. See [`upload_mode`](#upload_mode--how-the-bytes-travel). |
 | `client` / `base_url` / `creds` | Injection points. Pass `client=` and the object never builds its own (and never closes yours). Otherwise `base_url` defaults to `DDS_BASE_URL` and `creds` to `load_creds()`. |
 
 Credentials live in the `IngestClient`, never on `FolderIngest` itself.
@@ -723,12 +804,14 @@ Credentials live in the `IngestClient`, never on `FolderIngest` itself.
 
 | Method | Does |
 |---|---|
-| `run() -> IngestOutcome` | The whole `begin → upload → commit` flow. Leaves the client open so you can still `status()`/`retry()`/`cancel()`. |
+| `run() -> IngestOutcome` | The whole `begin → upload → commit` flow. Cancels the session if an upload fails. Leaves the client open so you can still `status()`/`retry()`/`cancel()`. |
 | `begin() -> BeginResult` | Step 1 alone. Raises `FileNotFoundError` if the scan found no files of `data_format`. Sets `session_id`. |
+| `dry_run() -> DryRunResult` | Every check `begin` runs, and what commit would do — **nothing uploaded, no session**. See [Checking a transfer first](#checking-a-transfer-first-dry_run-and-diagnose). |
+| `diagnose() -> Diagnosis` | Plain-language checks, one per line, ending with a dry run. See [Checking a transfer first](#checking-a-transfer-first-dry_run-and-diagnose). |
 | `commit(*, multipart_etags=None) -> CommitResult` | Step 3 alone. `IngestStateError` if nothing has begun. |
 | `status() -> StatusResult` | Server-side state of this transfer. |
 | `estimate() -> EstimateResult` | Row count + size class of the staged data, between upload and commit. |
-| `retry() -> IngestOutcome` | Resume or re-run — see [below](#managing-resuming-and-abandoning-a-transfer). |
+| `retry(*, table_definition=None) -> IngestOutcome` | Resume or re-run, optionally with corrected columns — see [below](#managing-resuming-and-abandoning-a-transfer). |
 | `cancel() -> None` | Delete the staged data and drop the session. Does **not** drop a table an earlier successful commit already created. Clears `session_id`. |
 | `close() -> None` | Release the HTTP client, but only if this object created it. |
 | `session_id` (property) | `None` until `begin()` runs or `attach()` supplies one. |
@@ -791,6 +874,112 @@ FolderIngest(
   nothing: `scan_folder` keeps sub-folders and the server preserves the original
   `rel_path`.
 
+## Table definitions, CSV/JSON options, inferred columns
+
+A table definition says what the table should look like. Every field is
+optional, and only the fields you set are sent:
+
+```python
+from eea_datalakehouse.dds_ingestion import ColumnDef, TableDefinition
+
+TableDefinition(
+    columns=(ColumnDef("station_id", "VARCHAR"), ColumnDef("value", "DOUBLE")),
+    partition_by=(),      # accepted; the plan says whether this server applies it
+    sort_by=(),
+    version=None,         # None → version 1
+)
+```
+
+A dict in the contract's shape works anywhere a `TableDefinition` does:
+`{"columns": [{"name": "value", "type": "DOUBLE"}]}`. Types are Dremio's
+(`VARCHAR`, `BIGINT`, `DOUBLE`, `DECIMAL(10,2)`, `TIMESTAMP`, …).
+`ColumnDef.nullable` and `description` are accepted by the server but not
+applied yet.
+
+**Where it goes.** On `begin`. A server with contract v0.8 answers with a plan
+(`BeginResult.plan`); `run()` prints `plan.describe()` — the sentence the
+JupyterLab extension shows — and logs a warning for each part of the definition
+this server does not apply (`plan.definition_ignored`). A server without plans
+ignored it, so it is sent again on `commit`.
+
+**When you give none — inferred columns.** For CSV or JSON into an `editable`
+table (the one case where the server builds the table from columns), the client
+reads every file with pyarrow, widens the types across files, prints them as
+`Inferred columns: …`, and sends them as the definition. `csv_options` and
+`json_options` are used for that reading too. A file that cannot be inferred — a
+JSON *array*, for one — logs a warning and sends nothing; the server then asks
+for the columns. `infer_schema=False` turns inference off. Parquet needs none:
+its files carry their own schema.
+
+**Parquet with columns given.** They are checked against the files' own footers
+before anything is uploaded, with the server's comparison rules. A mismatch
+raises `IngestApiError` (422, `error_slug="schema_mismatch"`) in the server's
+wording, and `where` says it was the local check. The server checks again at
+commit and stays the authority.
+
+**After a failure.** `retry(table_definition=…)` sends corrected columns with
+the retry — see [Managing](#managing-resuming-and-abandoning-a-transfer).
+
+## `upload_mode` — how the bytes travel
+
+Two parties decide: `FolderIngest(upload_mode=…)` and the server's hint in
+`BeginResult.upload_mode` (DDS's `DDS_INGEST_UPLOAD_MODE`).
+
+| `FolderIngest(upload_mode=…)` | the server says | the files go |
+|---|---|---|
+| `"auto"` (default) | `"proxy"` | all through DDS (`POST /api/v1/ingest/stage`) |
+| `"auto"` | `"auto"` — DDS's default | to S3; a file whose upload fails at the network layer goes through DDS instead |
+| `"auto"` | `"direct"`, or nothing (an older server: `None`) | to S3 only |
+| `"direct"` | anything | to S3 only |
+| `"proxy"` | anything | all through DDS |
+
+- **Only a network-layer failure falls back** — an unreachable endpoint, DNS, TLS,
+  a timeout. An HTTP error from S3 is a signing or permission problem that DDS
+  would not fix, so it is raised.
+- **`/stage` has its own size cap.** DDS checks it only when each file arrives,
+  so the client asks first (`GET /api/v1/ingest/limits`, at most once per run and
+  only when a file may go through DDS). With `"proxy"`, a file over the cap is
+  refused before anything is uploaded. With the fallback, such a file is not
+  sent through DDS, and the network error carries a note saying why. A server
+  without that endpoint is not checked locally.
+- A file the server planned as multipart goes through DDS whole.
+- `IngestOutcome.upload_mode` is `"proxy"` when every file went through DDS, else
+  `"direct"`; `IngestOutcome.files_staged` counts the files that went through
+  DDS, so a fallback shows.
+
+## Checking a transfer first: `dry_run()` and `diagnose()`
+
+Neither uploads anything or leaves a session behind.
+
+**`dry_run() -> DryRunResult`** runs every check `begin` runs — privileges, the
+target folder, storage, collisions, the table definition — and returns what
+commit would do: `plan` (a `BeginPlan`), `key_prefix` and `collision`. The plan
+is printed too. It raises what a real `begin` would raise. A DDS server without
+dry runs would open a real session instead; the client cancels it straight away
+and raises `UnsupportedByServerError`.
+
+**`diagnose() -> Diagnosis`** runs these checks in order and prints one line
+each (`✓` passed, `✗` failed, `–` skipped, with the reason):
+
+| Step | Checks | Skipped when |
+|---|---|---|
+| DDS reachable | `GET /health` | — if it fails, every step after it is skipped |
+| Credential accepted | `GET /api/v1/ingest/limits`, which needs a login (`GET /api/v1/ingest` on a server without it) | — |
+| File sizes | each file against `max_bytes` (what begin accepts) and `stage_max_bytes` (what `/stage` accepts; failing only with `upload_mode="proxy"`) | DDS reported no limits |
+| Storage write test | DDS's own S3 write test (`POST /storage-selftest`) | no verdict yet, or an older server |
+| Dry run of this folder | everything `dry_run()` checks, including WRITE on the target | a server without dry runs |
+
+```
+✓ DDS reachable: the service answers
+✓ Credential accepted: DDS accepts your Dremio credential
+✓ File sizes: within DDS's limits (largest: sub/b.parquet, 7 bytes)
+✓ Storage write test: DDS can write to its S3 storage
+✓ Dry run of this folder: Importing as a new editable table at bio/uploads/t.
+```
+
+`Diagnosis.steps` holds one `DiagnosisStep(name, ok, detail)` per line, `ok`
+being `None` for a skipped step, and `Diagnosis.ok` is true when no step failed.
+
 ## Managing, resuming and abandoning a transfer
 
 ```python
@@ -812,7 +1001,21 @@ with FolderIngest(folder="./my_data", target_catalog_path="catalog.theme.sub",
 | failed, not resumable, staged placement | Opens a fresh session and uploads the folder again, dropping any `idempotency_key` first. |
 | `done` | `IngestStateError` — already succeeded, nothing to retry. |
 | `pending` / `uploading` / `committing` | `IngestStateError` — wait for it to finish. |
+| — this object's own `run()` failed **in the upload**, so it cancelled the session | Uploads again under a new session when the failure can pass — a network error, a 5xx, or DDS saying `retryable` — and the cancel went through. Otherwise `IngestStateError`, quoting the upload error. The server is not asked: that session never got all its files. |
 | no session at all | `IngestStateError`. |
+
+**With corrected columns.** `retry(table_definition=…)` replaces the
+definition this transfer was given. A resumed load uses it without uploading
+again — the fix for a `schema_required` or `schema_mismatch` failure (DI-12.6; a
+server before that ignores it) — and an upload under a new session sends it on
+`begin`.
+
+**What a failure leaves behind.** A failed *upload* cancels the session before
+the error reaches you, deleting the files that did land; the error's note says
+so, or says the cancel failed and the server's sweep will remove them. A failed
+*commit* keeps the session for `retry()` when the server says it can be retried,
+unless `cleanup_on_failure=True`; one it cannot retry the server has already
+cleaned up.
 
 > ⚠ **A transfer whose files are stored permanently is never re-uploaded
 > blindly.** There the upload landed in the table's own folder and stayed, so a
@@ -856,6 +1059,8 @@ class IngestOutcome:
     files_skipped: int
     etags: dict[str, str]          # rel_path -> single-shot ETag (multipart entries are not here)
     resumed: bool = False
+    upload_mode: str = "direct"    # "proxy" when every file went through DDS
+    files_staged: int = 0          # files that went through DDS: all with "proxy", the fallbacks otherwise
 ```
 
 ```python
@@ -887,16 +1092,20 @@ IngestClient(base_url, creds, *, timeout=60.0, http_client=None)
 
 | Method | Endpoint / action |
 |---|---|
-| `begin(*, target_catalog_path, intent, data_format, conflict_mode, files, table_name=None, sub_path=None, idempotency_key=None, multipart=None)` | `POST /api/v1/ingest/begin` → `BeginResult` |
+| `begin(*, target_catalog_path, intent, data_format, conflict_mode, files, table_name=None, sub_path=None, idempotency_key=None, multipart=None, definition=None, csv_options=None, json_options=None)` | `POST /api/v1/ingest/begin` → `BeginResult`. A server that took `definition` returns `BeginResult.plan`. Only the fields that were set are sent. |
+| `dry_run(*, …)` | `POST /api/v1/ingest/begin` with `dry_run: true` → `DryRunResult`. Takes `begin`'s arguments except `idempotency_key` and `multipart`. Against a server without dry runs: cancels the session it opened and raises `UnsupportedByServerError`. |
 | `commit(*, session_id, definition=None, multipart_etags=None)` | `POST /api/v1/ingest/commit` → `CommitResult` |
 | `get_status(session_id)` | `GET /api/v1/ingest/{id}` → `StatusResult` |
 | `list_sessions(state=None)` | `GET /api/v1/ingest` → `list[StatusResult]`. `state` filters server-side: `"active"`, `"failed"`, `"all"`. |
-| `retry(session_id)` | `POST /api/v1/ingest/{id}/retry` → `StatusResult` |
+| `retry(session_id, *, definition=None)` | `POST /api/v1/ingest/{id}/retry` → `StatusResult`. With `definition`, the body `{"definition": …}` replaces the stored one (DI-12.6); without it, no body, as before. |
 | `cancel(session_id)` | `DELETE /api/v1/ingest/{id}` |
 | `estimate(session_id)` | `POST /api/v1/ingest/estimate` → `EstimateResult`. On a managed catalog the count comes from staged Parquet footers; CSV/JSON have none and report `0`. |
 | `stage(session_id, rel_path, data)` | `POST /api/v1/ingest/stage` → `StageResult`. Uploads one file **through the server** — the fallback when the S3 endpoint is not reachable from this kernel. Slower (the bytes transit the server), so prefer `upload_file`. |
-| `upload_file(target, data)` | To S3, not DDS. Presigned POST policy (form `fields` first, `file` part **last**, so S3 honours the policy conditions) or legacy presigned PUT. Returns the `ETag` header or `None`. |
+| `upload_file(target, data)` | To S3, not DDS. Presigned PUT with the target's signed `headers` — the normal path since contract v0.7 — or, from an older server, a POST policy (form `fields` first, `file` part **last**, so S3 honours the policy conditions). Returns the `ETag` header or `None`. An `httpx.TransportError` (unreachable, TLS, timeout) passes through unchanged. |
 | `upload_file_multipart(target, data)` | To S3. Splits `data` into `len(target.parts)` chunks (ceil division; last part takes the remainder) and `PUT`s each to its presigned part URL. Returns `[{"part_number", "etag"}, …]` for `commit`'s `multipart_etags`. Raises if S3 omits an ETag for any part. |
+| `health()` | `GET /health` (no login); raises unless DDS answers. |
+| `limits(runner="notebook")` | `GET /api/v1/ingest/limits` → dict: `max_bytes` (the largest file begin accepts from this kind of client), `stage_max_bytes` (through `/stage`), `multipart_threshold`. Needs a login. |
+| `storage_selftest()` | `POST /storage-selftest` (no login) → dict; `storage_write_test.ok` says whether DDS can write to its S3. |
 | `close()` | Closes the `httpx.Client` **only if** the client created it. Also a context manager. |
 
 Both upload methods enforce `target.max_bytes` locally (a `413`
@@ -916,7 +1125,11 @@ working when the server adds fields.
 | `UploadPart` | `part_number`, `url` |
 | `UploadTarget` | `rel_path`, `url`, `method="POST"`, `fields`, `headers`, `max_bytes`, `upload_id`, `parts`; `is_multipart` (true when `upload_id` **and** `parts` are set) |
 | `S3Plan` | `bucket`, `key_prefix`, `uploads: tuple[UploadTarget, ...]` |
-| `BeginResult` | `session_id`, `status`, `s3: S3Plan`, `collision` |
+| `BeginResult` | `session_id`, `status`, `s3: S3Plan`, `collision`, `upload_mode` (the server's hint; `None` when it sends none), `plan: BeginPlan \| None` |
+| `BeginPlan` | `placement`, `table_path`, `storage_path`, `action` (`"create"`, `"append"`, `"replace"`, `"fail"`), `definition_source`, `definition_applied`, `definition_ignored`; `describe()` — one sentence, the extension's wording |
+| `DryRunResult` | `plan: BeginPlan`, `key_prefix`, `collision` |
+| `TableDefinition` | `columns: tuple[ColumnDef, ...]`, `partition_by`, `sort_by`, `version`; `as_payload()` sends only what was set |
+| `ColumnDef` | `name`, `type` (a Dremio type), `nullable`, `description` |
 | `CommitResult` | `session_id`, `status`, `table_path`, `record_count`, `storage_path` |
 | `Progress` | `files_done`, `files_total`, `step` |
 | `StatusResult` | `status`, `progress`, `raw` — plus the properties below |
@@ -943,6 +1156,9 @@ client does not model yet is still reachable.
 | `error` | why it failed, including the stage (`"Dremio load failed: …"`, `"S3 upload failed: …"`). `None` unless failed. |
 | `is_terminal` | status is `done`, `failed` or `cancelled` |
 | `is_resumable` | failed **and** the server's own `resumable` flag is truthy |
+| `failed_stage` | where a failed transfer broke: `"upload"` or `"load"` |
+| `error_code` | the failure's slug, e.g. `"schema_required"` (contract v0.8) |
+| `describe_failure()` | one sentence on the failure — stage, slug, reason, and what a retry would do — worded exactly as the JupyterLab Transfers panel words it |
 
 Lifecycle: `pending` → `uploading` → `committing` → `done`, or `failed` /
 `cancelled`.
@@ -980,8 +1196,21 @@ RuntimeError
 ├── IngestStateError             asked for locally-impossible state, before any HTTP call
 └── IngestApiError               a DDS call returned non-success
     ├── StorageUnavailableError  DDS cannot write to its own S3 (503)
+    ├── UnsupportedByServerError the DDS server predates the feature (e.g. dry runs)
     └── S3UploadError            a presigned upload failed — NOT a DDS error
 ```
+
+**What every `IngestApiError` tells you**, besides its message:
+
+| Attribute | Meaning |
+|---|---|
+| `error_slug` | DDS's machine-readable `error`, e.g. `schema_required`, `schema_mismatch`; `""` when the body had none |
+| `retryable` | whether repeating — for a failed transfer, `retry()` — can succeed unchanged; `None` from a server before contract v0.8 |
+| `failed_stage` | on a failed commit from `FolderIngest`: `"upload"` or `"load"`, from the session; `None` otherwise |
+
+A failed commit also carries the session's own failure text as an exception
+note — `StatusResult.describe_failure()`, the sentence the Transfers panel
+shows. A failed upload carries a note on what happened to its session.
 
 **`IngestApiError`** carries `status_code`, `message` and `where` — the call that
 failed, e.g. `POST /api/v1/ingest/begin`. `where` is in the message because a
@@ -1007,9 +1236,14 @@ an unreachable endpoint, a gateway error. It adds `rel_path` and `url`, and its
 message names both, so you can tell "your upload never landed" from "the
 Document Service refused the request".
 
+**`UnsupportedByServerError`** — the DDS server is older than the feature a call
+needs (e.g. `dry_run()`). A subclass of `IngestApiError`, so code that catches
+that keeps working.
+
 **`IngestStateError`** is raised locally, before any HTTP call — committing a
 transfer that never began, retrying one that is still running, cancelling
-nothing.
+nothing, or retrying an upload that would fail the same way (its message quotes
+the upload error).
 
 ## Notebook helpers (`dds_ingestion.common`)
 
