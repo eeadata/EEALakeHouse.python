@@ -580,8 +580,16 @@ class FolderIngest:
         self._client.cancel(self._session_id)
         self._session_id = None
 
-    def retry(self) -> IngestOutcome:
+    def retry(
+        self, *, table_definition: TableDefinition | Mapping[str, Any] | None = None
+    ) -> IngestOutcome:
         """Re-run this transfer from the step that failed.
+
+        ``table_definition`` replaces the one this transfer was given — the fix
+        for a commit that failed on its columns (``schema_required``,
+        ``schema_mismatch``). A resumed load uses it without uploading again
+        (DI-12.6; a server before that ignores it), and a new upload sends it on
+        begin.
 
         Two cases, decided by the server's own report of where it broke:
 
@@ -612,6 +620,8 @@ class FolderIngest:
         Raises :class:`IngestStateError` if there is nothing to retry — no
         session, one that is still running, or one that already succeeded.
         """
+        if table_definition is not None:
+            self.table_definition = table_definition
         if self._upload_failure is not None:
             # Whether or not its cancel went through, that session never got all
             # its files: the server has nothing to resume (PY-8).
@@ -630,7 +640,12 @@ class FolderIngest:
             )
         if status.is_resumable:
             logger.info("resuming the load step of %s", self._session_id)
-            resumed = self._client.retry(self._session_id)
+            # Without a definition, the call is exactly the one made before DI-12.6.
+            resumed = (
+                self._client.retry(self._session_id, definition=table_definition)
+                if table_definition is not None
+                else self._client.retry(self._session_id)
+            )
             return IngestOutcome(
                 begin=self._begin,
                 commit=CommitResult.from_json(resumed.raw),

@@ -397,7 +397,12 @@ class IngestClient:
         rows = payload if isinstance(payload, list) else payload.get("sessions", [])
         return [StatusResult.from_json(row) for row in rows]
 
-    def retry(self, session_id: str) -> StatusResult:
+    def retry(
+        self,
+        session_id: str,
+        *,
+        definition: TableDefinition | Mapping[str, Any] | None = None,
+    ) -> StatusResult:
         """Re-run a failed session's last stage (``POST /api/v1/ingest/{id}/retry``).
 
         Only a ``failed`` session can be retried, and only the Dremio load stage
@@ -405,9 +410,16 @@ class IngestClient:
         (see :attr:`StatusResult.is_resumable`). A session whose upload never
         completed, or whose failure a re-run cannot fix, raises
         :class:`IngestApiError` telling you to upload again.
+
+        ``definition`` (contract v0.8, DI-12.6) replaces the stored table
+        definition before the re-run — the fix for a ``schema_required`` or
+        ``schema_mismatch`` failure without uploading again. Without it the
+        request has no body, exactly as before.
         """
+        payload = definition_payload(definition)
         resp = self._http.post(
             f"{self._base_url}/api/v1/ingest/{session_id}/retry",
+            json={"definition": payload} if payload is not None else None,
             headers=self._auth_headers,
         )
         self._raise_for_status(resp, f"POST /api/v1/ingest/{session_id}/retry")
