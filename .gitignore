@@ -17,3 +17,4 @@ debugger/bathing_water/
 
 # Windows download metadata (WSL copies it next to downloaded files)
 *:Zone.Identifier
+debugger/output.gpkg
