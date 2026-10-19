@@ -112,6 +112,23 @@ def test_a_failed_commit_is_described_like_the_transfers_panel(data_folder: Path
     assert client.cancelled == []  # kept for retry by default
 
 
+def test_a_failed_commit_carries_its_stage(data_folder: Path) -> None:
+    # PY-13: the stage is an attribute too, not only part of the note.
+    with pytest.raises(IngestApiError) as exc:
+        _job(data_folder, FailingCommitClient(retryable=True)).run()
+    assert exc.value.failed_stage == "load"
+
+
+@respx.mock
+def test_an_api_error_has_no_stage_of_its_own(creds: DremioCreds) -> None:
+    respx.post(f"{BASE_URL}/api/v1/ingest/commit").mock(
+        return_value=httpx.Response(400, json={"error": "bad_request", "message": "no"})
+    )
+    with IngestClient(BASE_URL, creds) as client, pytest.raises(IngestApiError) as exc:
+        client.commit(session_id="s")
+    assert exc.value.failed_stage is None
+
+
 @pytest.mark.parametrize(
     ("retryable", "cleanup", "cancelled"),
     [(True, True, True), (False, True, False), (True, False, False)],

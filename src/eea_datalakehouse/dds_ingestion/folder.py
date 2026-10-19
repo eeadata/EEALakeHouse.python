@@ -97,6 +97,9 @@ class IngestOutcome:
     etags: dict[str, str] = field(default_factory=dict)
     resumed: bool = False
     upload_mode: str = "direct"  # how the files went: "direct" (presigned S3) or "proxy" (DDS)
+    # How many of files_uploaded went through DDS (/stage): all of them with
+    # "proxy", the network-error fallbacks with "direct" (PY-13).
+    files_staged: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +246,9 @@ class FolderIngest:
         # Set when run() cancelled its session after a failed upload; what
         # retry() goes by once there is no session left (PY-8).
         self._upload_failure: _UploadFailure | None = None
+        # The files the current run sent through DDS after a network error;
+        # appended to from the upload threads (list.append is atomic).
+        self._staged_by_fallback: list[str] = []
 
         # The client owns the credentials; if the caller did not inject one we
         # build it from the kernel environment. Creds never leave the client.
@@ -323,6 +329,7 @@ class FolderIngest:
             files_skipped=skipped,
             etags=etags,
             upload_mode="proxy" if self._uses_proxy(begin) else "direct",
+            files_staged=uploaded if self._uses_proxy(begin) else len(self._staged_by_fallback),
         )
 
     def _uses_proxy(self, begin: BeginResult) -> bool:
@@ -687,15 +694,18 @@ class FolderIngest:
         ``cleanup_on_failure``. Best-effort: nothing here replaces ``err``.
 
         The note is the session's own failure text (:meth:`StatusResult.
-        describe_failure`), the same the Transfers panel shows. A failure the
-        server cannot retry was already cleaned up server-side; a retryable one
-        is kept for :meth:`retry` unless ``cleanup_on_failure`` is set.
+        describe_failure`), the same the Transfers panel shows, and
+        ``err.failed_stage`` its stage. A failure the server cannot retry was
+        already cleaned up server-side; a retryable one is kept for :meth:`retry`
+        unless ``cleanup_on_failure`` is set.
         """
         session_id = self._session_id
         if session_id is None:
             return
         try:
-            err.add_note(self._client.get_status(session_id).describe_failure())
+            status = self._client.get_status(session_id)
+            err.failed_stage = status.failed_stage
+            err.add_note(status.describe_failure())
         except Exception:  # noqa: BLE001 — the commit error is what matters
             logger.debug("could not fetch the failed session's status", exc_info=True)
         if self.cleanup_on_failure and err.retryable is True:
@@ -766,6 +776,7 @@ class FolderIngest:
         targets = list(begin.s3.uploads)
         proxy = self._uses_proxy(begin)
         fallback = self._falls_back_to_proxy(begin)
+        self._staged_by_fallback = []
         if proxy:
             logger.info("uploading through DDS (proxy), not to the presigned S3 targets")
         done = self._already_done(begin.session_id)
@@ -867,6 +878,7 @@ class FolderIngest:
         S3 with its own credentials. A file the server planned as multipart goes
         through whole; DDS accepts that at commit (DI-12.10a)."""
         self._client.stage(session_id, target.rel_path, data)
+        self._staged_by_fallback.append(target.rel_path)
         return None, None
 
 

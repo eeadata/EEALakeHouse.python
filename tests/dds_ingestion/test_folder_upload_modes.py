@@ -91,6 +91,7 @@ def test_proxy_mode_sends_every_file_through_dds(data_folder: Path) -> None:
     assert sorted(client.staged) == ["a.parquet", "sub/b.parquet"]
     assert client.attempted == []
     assert outcome.commit.status == "committed"
+    assert (outcome.upload_mode, outcome.files_staged) == ("proxy", 2)
 
 
 def test_auto_mode_falls_back_to_dds_on_a_network_error(data_folder: Path) -> None:
@@ -101,6 +102,13 @@ def test_auto_mode_falls_back_to_dds_on_a_network_error(data_folder: Path) -> No
     assert "sub/b.parquet" in client.uploaded
     assert outcome.commit.status == "committed"
     assert client.cancelled == []
+    # The fallback shows: one file of two went through DDS (PY-13).
+    assert (outcome.upload_mode, outcome.files_uploaded, outcome.files_staged) == ("direct", 2, 1)
+
+
+def test_a_plain_direct_upload_stages_nothing(data_folder: Path) -> None:
+    outcome = _make_ingest(data_folder, ModeClient(upload_mode="auto")).run()
+    assert outcome.files_staged == 0
 
 
 def test_auto_mode_does_not_retry_an_s3_http_error_through_dds(data_folder: Path) -> None:

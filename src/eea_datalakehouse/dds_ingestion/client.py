@@ -71,10 +71,14 @@ class IngestApiError(RuntimeError):
     ``schema_required``; ``""`` when the body carried none) and ``retryable``
     whether repeating the request — for a failed transfer, ``retry`` — can
     succeed unchanged (``None`` from a server predating contract v0.8).
+    ``failed_stage`` is where a failed commit broke, ``"upload"`` or ``"load"``,
+    as the session reports it; ``FolderIngest`` sets it, and it is ``None``
+    everywhere else.
     """
 
     error_slug: str = ""
     retryable: bool | None = None
+    failed_stage: str | None = None
 
     def __init__(self, status_code: int, message: str, *, where: str | None = None) -> None:
         super().__init__(
