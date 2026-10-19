@@ -32,7 +32,10 @@ import atexit
 import signal
 import threading
 import weakref
+from collections.abc import Iterator
 from typing import Any, Literal
+
+import pyarrow as pa
 
 from . import operations, retry_state
 from .operations import TableInfo, VersionResult
@@ -305,6 +308,20 @@ class Catalog:
         return operations.gettableitemsfrom(
             self._executor, table_path, idempotency_key=idempotency_key
         )
+
+    def stream_rows(self, sql: str, *, idempotency_key: str) -> Iterator[pa.RecordBatch]:
+        """Run a SELECT and yield its rows as Arrow `RecordBatch` chunks as they
+        arrive, never the whole result at once (see `FlightSqlExecutor.
+        stream_batches`). Always Arrow Flight: like `datacopy`/`datamove`,
+        this moves data, and REST's poll-then-paginate shape doesn't scale to
+        a bulk read."""
+        return self._flight_executor.stream_batches(sql, idempotency_key=idempotency_key)
+
+    def open_flight_channel(self) -> FlightSqlExecutor:
+        """A Flight executor on its own gRPC channel, logged in as this
+        catalog — for reading several large results at once, one channel
+        each (see `FlightSqlExecutor.fork`). The caller closes it."""
+        return self._flight_executor.fork()
 
     def getwikifrom(self, path: str, *, idempotency_key: str) -> str:
         return operations.getwikifrom(self._catalog_rest, path, idempotency_key=idempotency_key)

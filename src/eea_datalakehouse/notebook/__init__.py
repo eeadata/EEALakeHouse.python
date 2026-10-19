@@ -1,5 +1,5 @@
-"""The notebook-facing surface — `%catalog`/`%ingest`/`%sdi`/`%dds` magics
-over `CatalogSession`/`IngestSession`/`SdiSession`/`DdsSession` (see
+"""The notebook-facing surface — `%catalog`/`%ingest`/`%sdi`/`%dds`/`%gpkg` magics
+over `CatalogSession`/`IngestSession`/`SdiSession`/`DdsSession`/`GpkgSession` (see
 `docs/notebook-facade-for-data-scientists.md`). Requires IPython, which the
 rest of this package does not — install the `notebook` extra
 (`pip install "EEADataLakehouse[notebook]"`) to get it.
