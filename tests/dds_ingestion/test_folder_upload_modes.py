@@ -1,5 +1,5 @@
-"""PY-1 (upload_mode + /stage fallback), PY-2 (cancel when an upload fails) and
-PY-8 (retry after that cancel).
+"""PY-1 (upload_mode + /stage fallback), PY-2 (cancel when an upload fails),
+PY-8 (retry after that cancel) and PY-10 (the /stage size cap).
 
 Companion to the DDS DI-12 plan; see docs/dds-ingest-robustness-client-plan.md.
 """
@@ -11,7 +11,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from eea_datalakehouse.dds_ingestion.client import S3UploadError
+from eea_datalakehouse.dds_ingestion.client import IngestApiError, S3UploadError
 from eea_datalakehouse.dds_ingestion.folder import IngestStateError
 from eea_datalakehouse.dds_ingestion.models import (
     BeginResult,
@@ -255,3 +255,67 @@ def test_ingest_session_retry_recovers_from_a_network_error(data_folder: Path) -
     report = session.commit(retry=True)
 
     assert [o.commit.status for o in report.outcomes] == ["committed"]
+
+
+# --- PY-10: the /stage size cap ---------------------------------------------------
+
+
+class CappedClient(FlakyClient):
+    """FlakyClient that answers GET /ingest/limits; ``stage_max_bytes=None`` is a
+    server before DI-12.11 (404)."""
+
+    def __init__(self, *, stage_max_bytes: int | None, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.stage_max_bytes = stage_max_bytes
+        self.limits_calls = 0
+
+    def limits(self, runner: str = "notebook") -> dict[str, object]:
+        self.limits_calls += 1
+        if self.stage_max_bytes is None:
+            raise IngestApiError(404, "Not Found", where="GET /api/v1/ingest/limits")
+        return {"max_bytes": 1000, "stage_max_bytes": self.stage_max_bytes}
+
+
+def test_proxy_refuses_a_file_over_the_stage_cap_before_uploading_anything(
+    data_folder: Path,
+) -> None:
+    # data_folder: a.parquet is 6 bytes, sub/b.parquet 7.
+    client = CappedClient(upload_mode="proxy", stage_max_bytes=6)
+    with pytest.raises(IngestApiError, match=r"too large: 'sub/b.parquet' \(7 bytes\)") as exc:
+        _make_ingest(data_folder, client).run()
+
+    assert client.staged == []
+    assert client.cancelled == ["sess-X"]
+    assert exc.value.retryable is False
+
+
+def test_proxy_against_a_server_without_limits_uploads_as_before(data_folder: Path) -> None:
+    client = CappedClient(upload_mode="proxy", stage_max_bytes=None)
+    _make_ingest(data_folder, client).run()
+    assert sorted(client.staged) == ["a.parquet", "sub/b.parquet"]
+
+
+def test_no_fallback_for_a_file_over_the_stage_cap(data_folder: Path) -> None:
+    client = CappedClient(
+        upload_mode="auto", stage_max_bytes=5, fail={"a.parquet": _network_error()}
+    )
+    with pytest.raises(httpx.ConnectError) as exc:
+        _make_ingest(data_folder, client).run()
+
+    assert client.staged == []
+    assert any("Not sent through DDS instead" in note for note in exc.value.__notes__)
+
+
+def test_the_limits_are_asked_only_when_a_file_may_go_through_dds(data_folder: Path) -> None:
+    plain = CappedClient(upload_mode="auto", stage_max_bytes=100)
+    _make_ingest(data_folder, plain).run()
+    assert plain.limits_calls == 0  # a direct upload sends what it sent before
+
+    two_fallbacks = CappedClient(
+        upload_mode="auto",
+        stage_max_bytes=100,
+        fail={"a.parquet": _network_error(), "sub/b.parquet": _network_error()},
+    )
+    outcome = _make_ingest(data_folder, two_fallbacks).run()
+    assert outcome.files_staged == 2
+    assert two_fallbacks.limits_calls == 1

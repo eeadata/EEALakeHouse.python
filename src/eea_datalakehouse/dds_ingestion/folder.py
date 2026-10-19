@@ -17,6 +17,7 @@ layer can be mocked or swapped in tests.
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -249,6 +250,11 @@ class FolderIngest:
         # The files the current run sent through DDS after a network error;
         # appended to from the upload threads (list.append is atomic).
         self._staged_by_fallback: list[str] = []
+        # The largest file POST /ingest/stage accepts (PY-10): asked of DDS at
+        # most once per run, and only when a file may go through it.
+        self._stage_cap: int | None = None
+        self._stage_cap_asked = False
+        self._stage_cap_lock = threading.Lock()
 
         # The client owns the credentials; if the caller did not inject one we
         # build it from the kernel environment. Creds never leave the client.
@@ -468,11 +474,12 @@ class FolderIngest:
         """Check, in plain language, whether this transfer would work — without
         starting it (PY-7). Nothing is uploaded and no session is created.
 
-        In order: DDS reachable; the credential accepted; DDS's own S3 write test;
-        and a dry run of this exact folder, which covers the privileges on the
-        target, the target folder, collisions and the table definition. A check
-        that cannot run (DDS unreachable, a server predating it) is reported as
-        skipped, with the reason, instead of failing the ones after it.
+        In order: DDS reachable; the credential accepted; the files against DDS's
+        size limits (PY-10); DDS's own S3 write test; and a dry run of this exact
+        folder, which covers the privileges on the target, the target folder,
+        collisions and the table definition. A check that cannot run (DDS
+        unreachable, a server predating it) is reported as skipped, with the
+        reason, instead of failing the ones after it.
         """
         result = Diagnosis()
 
@@ -486,13 +493,19 @@ class FolderIngest:
             self._client.health()
         except (httpx.HTTPError, IngestApiError) as exc:
             add("DDS reachable", False, str(exc))
-            for name in ("Credential accepted", "Storage write test", "Dry run of this folder"):
+            for name in (
+                "Credential accepted",
+                "File sizes",
+                "Storage write test",
+                "Dry run of this folder",
+            ):
                 add(name, None, "skipped: DDS is not reachable")
             return result
         add("DDS reachable", True, "the service answers")
 
+        limits: dict[str, Any] | None = None
         try:
-            self._client.limits("notebook")
+            limits = self._client.limits("notebook")
             add("Credential accepted", True, "DDS accepts your Dremio credential")
         except IngestApiError as exc:
             if exc.status_code == 404:  # a server predating GET /ingest/limits
@@ -503,6 +516,8 @@ class FolderIngest:
                     add("Credential accepted", False, inner.message)
             else:
                 add("Credential accepted", False, exc.message)
+
+        add("File sizes", *self._check_file_sizes(limits))
 
         try:
             verdict = self._client.storage_selftest().get("storage_write_test") or {}
@@ -524,6 +539,38 @@ class FolderIngest:
         except (IngestApiError, FileNotFoundError, ValueError) as exc:
             add("Dry run of this folder", False, str(getattr(exc, "message", exc)))
         return result
+
+    def _check_file_sizes(self, limits: Mapping[str, Any] | None) -> tuple[bool | None, str]:
+        """:meth:`diagnose`'s size step (PY-10): this folder's files against the
+        caps DDS reports — ``max_bytes`` for any file of this caller, which begin
+        enforces, and ``stage_max_bytes`` for a file sent through DDS."""
+        if limits is None:
+            return None, "skipped: DDS did not report its size limits"
+        files = scan_folder(self.folder, self.data_format)
+        if not files:
+            return None, f"skipped: no {self.data_format} files under {self.folder}"
+
+        def over(cap: object) -> list[str]:
+            if not isinstance(cap, int):
+                return []
+            return [f"{f.rel_path} ({f.size:,} bytes)" for f in files if f.size > cap]
+
+        max_bytes, stage_max = limits.get("max_bytes"), limits.get("stage_max_bytes")
+        if too_big := over(max_bytes):
+            return False, f"larger than DDS accepts ({max_bytes:,} bytes): {', '.join(too_big)}"
+        if too_big_to_stage := over(stage_max):
+            names = ", ".join(too_big_to_stage)
+            if self.upload_mode == "proxy":
+                return False, (
+                    f"larger than DDS accepts through /stage ({stage_max:,} bytes), where "
+                    f"upload_mode='proxy' sends every file: {names}"
+                )
+            return True, (
+                f"fine for a direct upload, but larger than DDS accepts through /stage "
+                f"({stage_max:,} bytes), so these cannot fall back to it: {names}"
+            )
+        largest = max(files, key=lambda f: f.size)
+        return True, f"within DDS's limits (largest: {largest.rel_path}, {largest.size:,} bytes)"
 
     def _report_plan(self, plan: BeginPlan) -> None:
         """Show what commit will do: printed when ``show_progress`` (the same
@@ -792,11 +839,14 @@ class FolderIngest:
         proxy = self._uses_proxy(begin)
         fallback = self._falls_back_to_proxy(begin)
         self._staged_by_fallback = []
+        self._stage_cap_asked = False
         if proxy:
             logger.info("uploading through DDS (proxy), not to the presigned S3 targets")
         done = self._already_done(begin.session_id)
         pending = [t for t in targets if t.rel_path not in done]
         skipped = len(targets) - len(pending)
+        if proxy:
+            self._refuse_files_over_the_stage_cap(pending)
 
         # Single-shot ETags (rel_path -> ETag) and multipart commit entries
         # ({rel_path, upload_id, parts:[{part_number, etag}]}) are collected
@@ -878,6 +928,13 @@ class FolderIngest:
         except httpx.TransportError as exc:
             if not fallback:
                 raise
+            cap = self._stage_limit()
+            if cap is not None and len(data) > cap:
+                exc.add_note(
+                    f"Not sent through DDS instead: {target.rel_path!r} is {len(data):,} "
+                    f"bytes, more than POST /api/v1/ingest/stage accepts ({cap:,} bytes)."
+                )
+                raise
             logger.warning(
                 "presigned upload of %s failed at the network layer (%s); "
                 "sending it through DDS instead",
@@ -895,6 +952,49 @@ class FolderIngest:
         self._client.stage(session_id, target.rel_path, data)
         self._staged_by_fallback.append(target.rel_path)
         return None, None
+
+    def _stage_limit(self) -> int | None:
+        """The largest file ``POST /api/v1/ingest/stage`` accepts, from ``GET
+        /api/v1/ingest/limits`` (DI-12.11), asked at most once per run (PY-10).
+
+        ``None`` when DDS does not say — a server before DI-12.11 answers 404 —
+        or the question fails: this is a check ahead of DDS's own, never a
+        reason to fail an upload by itself.
+        """
+        with self._stage_cap_lock:
+            if not self._stage_cap_asked:
+                self._stage_cap_asked = True
+                try:
+                    value = self._client.limits("notebook").get("stage_max_bytes")
+                except Exception:  # noqa: BLE001 — best-effort, see the docstring
+                    logger.debug("could not read the ingest limits", exc_info=True)
+                    value = None
+                self._stage_cap = value if isinstance(value, int) else None
+            return self._stage_cap
+
+    def _refuse_files_over_the_stage_cap(self, targets: list[UploadTarget]) -> None:
+        """With ``proxy`` every file goes through ``POST /ingest/stage``, which DDS
+        caps on its own and checks only when each file arrives (PY-10). Refuse an
+        oversized file before anything is uploaded, rather than after the files
+        ahead of it."""
+        cap = self._stage_limit()
+        if cap is None:
+            return
+        too_big: list[str] = []
+        for target in targets:
+            size = (self.folder / target.rel_path).stat().st_size
+            if size > cap:
+                too_big.append(f"{target.rel_path!r} ({size:,} bytes)")
+        if not too_big:
+            return
+        err = IngestApiError(
+            400,
+            f"DDS accepts files of up to {cap:,} bytes through POST /api/v1/ingest/stage, "
+            f"which this upload goes through; too large: {', '.join(too_big)}",
+            where="local size check against GET /api/v1/ingest/limits (nothing was uploaded)",
+        )
+        err.retryable = False
+        raise err
 
 
 def ingest_folder(
