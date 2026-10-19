@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from eea_datalakehouse.dds_ingestion.folder import Diagnosis, FolderIngest
 from eea_datalakehouse.dds_ingestion.models import (
     BeginResult,
     CommitResult,
@@ -211,3 +212,47 @@ def test_the_one_line_options_reach_folder_ingest(tmp_path: Path) -> None:
     assert csv_begin["definition"] == columns
     assert client.staged == ["a.csv"]  # upload_mode="proxy": through DDS, not S3
     assert json_begin["json_options"] == {"format": "array"}
+
+
+def test_diagnose_checks_every_queued_ingest_and_keeps_the_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    checked: list[tuple[Path, bool]] = []
+
+    def fake_diagnose(self: FolderIngest) -> Diagnosis:
+        checked.append((self.folder, self.show_progress))
+        return Diagnosis()
+
+    monkeypatch.setattr(FolderIngest, "diagnose", fake_diagnose)
+    client = _StubClient()
+    session = IngestSession(client=client)  # type: ignore[arg-type]
+    a, b = _make_folder(tmp_path, "a"), _make_folder(tmp_path, "b")
+    session.ingest(a, "bio.uploads.a", data_format="parquet", show_progress=False)
+    session.ingest(b, "bio.uploads.b", data_format="parquet", show_progress=False)
+
+    session.diagnose()
+
+    assert checked == [(a, True), (b, True)]  # the lines print even for a quiet ingest
+    assert client.begin_calls == 0
+    assert repr(session) == "IngestSession(pending=2)"
+    assert f"ingest {a!r} -> 'bio.uploads.a':" in capsys.readouterr().out
+
+
+def test_diagnose_reports_a_missing_folder_and_goes_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(FolderIngest, "diagnose", lambda self: Diagnosis())
+    session = IngestSession(client=_StubClient())  # type: ignore[arg-type]
+    session.ingest(tmp_path / "gone", "bio.uploads.x", data_format="parquet")
+    session.ingest(_make_folder(tmp_path, "b"), "bio.uploads.b", data_format="parquet")
+
+    session.diagnose()
+
+    out = capsys.readouterr().out
+    assert "✗ cannot check it: not a directory" in out
+    assert "'bio.uploads.b':" in out
+
+
+def test_diagnose_with_nothing_queued_says_so(capsys: pytest.CaptureFixture[str]) -> None:
+    IngestSession(client=_StubClient()).diagnose()  # type: ignore[arg-type]
+    assert "nothing queued" in capsys.readouterr().out

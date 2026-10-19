@@ -316,6 +316,7 @@ import eea_datalakehouse.notebook  # registers %catalog/%ingest — no %load_ext
 
 %ingest ingest(folder="./bw_2026", target_catalog_path="bwd.reference",
                 data_format="parquet", table_name="water_temperature")
+%ingest diagnose          # optional: check the queued ingests first; nothing is uploaded
 %ingest commit(retry=True)
 ```
 

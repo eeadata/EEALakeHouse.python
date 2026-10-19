@@ -170,6 +170,36 @@ class IngestSession:
         )
         return self
 
+    def diagnose(self) -> None:
+        """Check every queued ingest without running it — `FolderIngest.diagnose`
+        for each, one printed line per check: DDS reachable, the credential, the
+        file sizes, DDS's storage, and a dry run of that folder into its target.
+        Nothing is uploaded and the queue is kept, so a `commit()` afterwards
+        runs exactly these ingests."""
+        if not self._pending:
+            print("nothing queued — queue an ingest(...) first, then diagnose")
+            return
+        for item in self._pending:
+            print(f"{item.describe()}:")
+            try:
+                job = FolderIngest(
+                    item.folder,
+                    item.target_catalog_path,
+                    data_format=item.data_format,
+                    client=self._client,
+                    base_url=self._base_url,
+                    creds=self._creds,
+                    **{**item.kwargs, "show_progress": True},  # the lines are the point
+                )
+            except (OSError, ValueError, RuntimeError) as exc:
+                # A missing folder or credential is itself the finding.
+                print(f"✗ cannot check it: {exc}")
+                continue
+            try:
+                job.diagnose()
+            finally:
+                job.close()
+
     def commit(self, *, retry: bool = False, max_retries: int = 3) -> IngestCommitReport:
         """Run every queued ingest, in order. Stops at the first failure —
         see the module docstring: nothing already succeeded can be rolled

@@ -18,6 +18,7 @@ In any cell, once loaded either way::
 
     %ingest ingest(folder="./bw_2026", target_catalog_path="bwd.reference",
                     data_format="parquet", table_name="water_temperature")
+    %ingest diagnose
     %ingest commit(retry=True)
 
     %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
@@ -108,7 +109,7 @@ _USAGE = {
     ),
     "ingest": (
         '%ingest ingest(folder="./data", target_catalog_path="a.b", data_format="parquet")'
-        "  |  %ingest commit"
+        "  |  %ingest diagnose  |  %ingest commit"
     ),
     "sdi": '%sdi get_xml("<uuid>")  |  %sdi resolve_series("<series uuid>")',
     "metadata": (
@@ -292,6 +293,11 @@ _INGEST_HELP = [
         "upload_mode='proxy' when S3 is unreachable; csv_options={'delimiter': ';'}; "
         "table_definition={'columns': [{'name': 'value', 'type': 'DOUBLE'}]} for the column "
         "types of a CSV/JSON table.",
+    ),
+    (
+        "diagnose",
+        "Check every queued ingest without running it: DDS, your credential, the file "
+        "sizes, DDS's storage, and a dry run. Nothing is uploaded; the queue is kept.",
     ),
     ("commit", "Run every queued ingest in order; stops at the first failure."),
 ]
