@@ -30,6 +30,7 @@ ingest; this is a client-side queue of possibly many.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -37,7 +38,7 @@ from typing import Any
 from .client import IngestClient
 from .credentials import DremioCreds
 from .folder import DEFAULT_PARALLELISM, FolderIngest, IngestOutcome, IngestStateError
-from .models import DataFormat, Intent
+from .models import DataFormat, Intent, TableDefinition, UploadMode
 
 
 class IngestSessionError(RuntimeError):
@@ -124,12 +125,29 @@ class IngestSession:
         parallelism: int = DEFAULT_PARALLELISM,
         multipart: bool | None = None,
         show_progress: bool = True,
+        table_definition: TableDefinition | Mapping[str, Any] | None = None,
+        csv_options: Mapping[str, Any] | None = None,
+        json_options: Mapping[str, Any] | None = None,
+        upload_mode: UploadMode = "auto",
     ) -> IngestSession:
         """Queue one folder ingest — see `FolderIngest` for what each argument
         means. No `idempotency_key` here: unlike the catalog side, a queued
         ingest's own key would only ever be used once per `commit()`, so
         there is nothing to encapsulate — `FolderIngest` already defaults
-        it to `None` (a fresh session every run)."""
+        it to `None` (a fresh session every run).
+
+        Each of the last four still fits on the one `%ingest` line that queues
+        the ingest::
+
+            upload_mode="proxy"                   # S3 is unreachable from this kernel
+            csv_options={"delimiter": ";"}        # CSV parsing hints
+            json_options={"format": "array"}      # a JSON array rather than JSON lines
+            table_definition={"columns": [{"name": "value", "type": "DOUBLE"}]}
+
+        `FolderIngest`'s `infer_schema` and `cleanup_on_failure` are left out on
+        purpose: turning inference off only makes DDS ask for the columns, which
+        `table_definition` gives anyway, and a cleanup after a failed commit
+        would leave `commit(retry=True)` nothing to retry."""
         self._pending.append(
             _QueuedIngest(
                 folder=folder,
@@ -143,6 +161,10 @@ class IngestSession:
                     "parallelism": parallelism,
                     "multipart": multipart,
                     "show_progress": show_progress,
+                    "table_definition": table_definition,
+                    "csv_options": csv_options,
+                    "json_options": json_options,
+                    "upload_mode": upload_mode,
                 },
             )
         )

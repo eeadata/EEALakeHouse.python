@@ -286,7 +286,13 @@ _CATALOG_HELP = [
     ),
 ]
 _INGEST_HELP = [
-    ("ingest", "Queue one folder ingest (see FolderIngest for what each argument means)."),
+    (
+        "ingest",
+        "Queue one folder ingest (see FolderIngest for what each argument means). "
+        "upload_mode='proxy' when S3 is unreachable; csv_options={'delimiter': ';'}; "
+        "table_definition={'columns': [{'name': 'value', 'type': 'DOUBLE'}]} for the column "
+        "types of a CSV/JSON table.",
+    ),
     ("commit", "Run every queued ingest in order; stops at the first failure."),
 ]
 _SDI_HELP = [

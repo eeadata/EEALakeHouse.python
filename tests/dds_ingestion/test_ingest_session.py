@@ -15,6 +15,7 @@ from eea_datalakehouse.dds_ingestion.models import (
     BeginResult,
     CommitResult,
     S3Plan,
+    StageResult,
     StatusResult,
     UploadTarget,
 )
@@ -166,3 +167,47 @@ def test_retry_resumes_a_failed_commit_before_giving_up(tmp_path: Path) -> None:
     assert len(report.outcomes) == 1
     assert report.outcomes[0].resumed is True
     assert client.retry_calls == ["sess-1"]
+
+
+def test_the_one_line_options_reach_folder_ingest(tmp_path: Path) -> None:
+    # PY-11: upload_mode, csv_options, json_options and table_definition, each
+    # given on the one line that queues the ingest.
+    class RecordingClient(_StubClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.begin_kwargs: list[dict[str, Any]] = []
+            self.staged: list[str] = []
+
+        def begin(self, *, files: list[Any], **kwargs: Any) -> BeginResult:
+            self.begin_kwargs.append(kwargs)
+            return super().begin(files=files, **kwargs)
+
+        def stage(self, session_id: str, rel_path: str, data: bytes) -> StageResult:
+            self.staged.append(rel_path)
+            return StageResult(rel_path=rel_path, key=f"p/{rel_path}", bytes_written=len(data))
+
+    csv_folder = tmp_path / "csv"
+    csv_folder.mkdir()
+    (csv_folder / "a.csv").write_text("a;b\n1;2\n")
+    json_folder = tmp_path / "json"
+    json_folder.mkdir()
+    (json_folder / "a.json").write_text('[{"a": 1}]')
+    columns = {"columns": [{"name": "a", "type": "BIGINT"}]}
+
+    client = RecordingClient()
+    session = IngestSession(client=client)  # type: ignore[arg-type]
+    session.ingest(
+        csv_folder, "bio.uploads.c", data_format="csv", intent="editable", show_progress=False,
+        csv_options={"delimiter": ";"}, table_definition=columns, upload_mode="proxy",
+    )
+    session.ingest(
+        json_folder, "bio.uploads.j", data_format="json", show_progress=False,
+        json_options={"format": "array"},
+    )
+    session.commit()
+
+    csv_begin, json_begin = client.begin_kwargs
+    assert csv_begin["csv_options"] == {"delimiter": ";"}
+    assert csv_begin["definition"] == columns
+    assert client.staged == ["a.csv"]  # upload_mode="proxy": through DDS, not S3
+    assert json_begin["json_options"] == {"format": "array"}
