@@ -37,6 +37,7 @@ behaviour behind those snippets.
   - [The setup cell](#the-setup-cell)
   - [Ingest recipes](#ingest-recipes)
   - [Catalog recipes](#catalog-recipes)
+    - [Move a whole folder](#move-a-whole-folder-somewhere-else)
   - [End to end, in one cell](#end-to-end-in-one-cell)
 - [Part 1 — `dds_ingestion`](#part-1--dds_ingestion)
   - [The transfer model](#the-transfer-model)
@@ -55,6 +56,7 @@ behaviour behind those snippets.
   - [`Catalog` and its two transports](#catalog-and-its-two-transports)
   - [`idempotency_key` and the retry contract](#idempotency_key-and-the-retry-contract)
   - [Operation reference](#operation-reference)
+    - [Whole folders](#whole-folders--catalogfoldertree)
   - [Executors (`catalog.sql`)](#executors-catalogsql)
   - [`CatalogRestClient` (`catalog.rest`)](#catalogrestclient-catalogrest)
   - [`retry_state`](#retry_state)
@@ -141,6 +143,9 @@ fewest lines that actually work.
 | turn an ingested table into a view | `catalog.table2view(view, source, idempotency_key=KEY)` |
 | …for every table in a folder | `for p in catalog.gettablesfrom(SRC, …): catalog.table2view(…)` |
 | copy / move a table | `catalog.datacopy(a, b, …)` · `catalog.datamove(a, b, …)` |
+| **move a whole folder** — subfolders, tables and views | `foldermove(catalog, src, dst, idempotency_key=KEY)` |
+| …see what that would do, first | `foldermove(…, dry_run=True)` → `print(report.summary())` |
+| copy a folder without removing the source | `foldercopy(catalog, src, dst, idempotency_key=KEY)` |
 | list everything under a folder | `catalog.gettablesfrom("bwd", idempotency_key=KEY)` |
 | schema + row count, no rows fetched | `catalog.gettableitemsfrom(path, idempotency_key=KEY)` |
 | create / delete a folder | `catalog.createfolder(p, …)` · `catalog.deletefolder(p, …)` |
@@ -444,6 +449,61 @@ the target is verified to exist before it reports success:
 ```python
 catalog.datamove("bwd.draft.bw", "bwd.versions.v2026", idempotency_key=KEY)
 ```
+
+### Move a whole folder somewhere else
+
+Sub-folders, tables and views together — the views rewritten so the copy points
+at its own tables rather than back at the originals. Look before you leap:
+
+```python
+from eea_datalakehouse.catalog import foldermove
+
+report = foldermove(catalog, "bwd.draft", "bwd.archive.2025",
+                    idempotency_key=KEY, dry_run=True)
+print(report.summary())          # every folder, table (with its row count) and rewritten view
+```
+
+Nothing was written. When the plan reads right, drop `dry_run`:
+
+```python
+report = foldermove(catalog, "bwd.draft", "bwd.archive.2025",
+                    idempotency_key=KEY, on_progress=print)
+print(report.summary())
+report.verified, report.source_deleted
+```
+
+What it actually does, in this order:
+
+1. **Folders** first, shallowest first — including empty ones, which
+   `INFORMATION_SCHEMA` cannot see and only the REST catalog knows about.
+2. **Tables** with `datacopy`, then `COUNT(*)` **on both sides**. A table whose
+   counts disagree fails the whole move.
+3. **Views** recreated from their own SQL, with every reference into the moved
+   subtree remapped to the new location, in dependency order (a view over
+   another view is created after it). They are counted on both sides too.
+4. **Only then** the source is taken apart — views, tables, folders
+   deepest-first, then the source folder itself.
+
+**If anything fails, the source is left exactly where it is** and
+`report.verified` is `False`. Fix what the report names and run it again:
+tables that already landed with a matching count are skipped, so a re-run is
+cheap and safe. To copy without ever removing the source, call `foldercopy`
+with the same arguments.
+
+Worth knowing:
+
+- **`overwrite=False` by default.** A target table that already exists with a
+  *different* row count fails that entry rather than being silently accepted.
+  Pass `overwrite=True` to replace it.
+- **`report.summary()` is the thing to read** — per entry: what happened, both
+  row counts, and any note about how a view's SQL was rewritten.
+- **The view rewrite is textual**, not a parse of Dremio's SQL dialect. It
+  never touches string literals or comments, and only rewrites chains it can
+  resolve. Read the rewritten definitions in a dry run before applying a
+  subtree of complicated views.
+- **Dremio wiki and tags travel with each entry** (`copy_metadata=True`),
+  best-effort — a wiki that will not copy is a note, not a failure. The **DDS**
+  `meta.json` sidecar is a different system and is *not* carried.
 
 ### Delete a view
 
@@ -1138,9 +1198,19 @@ created. Nothing in the library fans an operation out over a folder's contents �
 to convert a whole folder, loop over `gettablesfrom`:
 [recipe](#turn-every-table-in-a-folder-into-views-in-another-folder).
 
+**`createviewas(view_path, sql, *, overwrite=False, create_target_folder=True)`**
+— `table2view`'s general form: a view over any query body you hand it, not just
+`SELECT * FROM <source>`. `sql` is the body only (no `CREATE VIEW` prefix) and is
+sent through unchanged — quoting and correctness are yours, since the text
+usually comes back out of Dremio itself. `overwrite=True` drops whatever is
+actually at `view_path` first, detecting whether it is a table or a view.
+
 **`deleteview(view_path)`** — `DROP VIEW IF EXISTS`. Idempotent. If `view_path`
 is actually a table, this fails loudly rather than dropping the wrong kind of
 entry.
+
+**`deletetable(table_path)`** — `DROP TABLE IF EXISTS`; `deleteview`'s
+counterpart, failing just as loudly on the wrong kind of entry.
 
 **`draft2version(draft_path, version_path)`** and
 **`publishversion(consumer_view_path, version_path)`** — **not implemented**;
@@ -1182,6 +1252,65 @@ Shared behaviour:
   for a no-result-rows DDL statement are unverified here — so it checks
   `target_path` actually exists in the catalog before declaring success.
 
+### Whole folders — `catalog.foldertree`
+
+`folderscan` / `foldercopy` / `foldermove` (also methods on `Catalog`). These
+are orchestration over the operations above rather than one statement each, so
+they live in their own module — see its docstring for the assumptions they rest
+on, and the [recipe](#move-a-whole-folder-somewhere-else) for how to drive them.
+
+**`folderscan(catalog, source_path, target_path) -> FolderTree`** — read-only.
+Every sub-folder, table and view under `source_path`, mapped to where it would
+land, with each view's SQL already rewritten and the views in dependency order.
+Raises if the two paths are the same, or if either is inside the other.
+
+```python
+@dataclass(frozen=True, slots=True)
+class TreeEntry:
+    source_path: str
+    target_path: str
+    kind: Literal["FOLDER", "TABLE", "VIEW"]
+    view_sql: str | None              # views: as Dremio stores it
+    view_context: tuple[str, ...]     # views: its sqlContext, if known
+    remapped_sql: str | None          # views: what will actually be created
+    depends_on: tuple[str, ...]       # views: what it selects from, in this subtree
+    notes: tuple[str, ...]
+```
+
+**`foldercopy(catalog, source_path, target_path, *, dry_run=False,
+overwrite=False, skip_existing=True, verify_views=True, copy_metadata=True,
+qualify_external=True, tree=None, on_progress=None) -> FolderTransferReport`**
+— reproduces the subtree and proves it. Folders first (empty ones included),
+then tables via `datacopy` with `COUNT(*)` compared on both sides, then views
+recreated from their own SQL with references into the subtree remapped. A
+per-entry failure is recorded, not raised — the sweep finishes so you see the
+whole picture.
+
+`skip_existing=True` is what makes a re-run cheap: a target table already there
+**with the source's row count** is reported `skipped`. One with a *different*
+count fails that entry rather than being silently accepted.
+
+**`foldermove(catalog, source_path, target_path, *, delete_source_root=True,
+…)`** — `foldercopy`, then removal of the source **only if `report.verified`**:
+views in reverse dependency order, then tables, then folders deepest-first.
+`deletefolder(cascade=True)` is deliberately not used — a folder that will not
+delete because something unexpected is inside it is a fact worth surfacing.
+
+**`FolderTransferReport`** — `folders` / `tables` / `views` are lists of
+`EntryResult(entry, status, source_rows, target_rows, sql, error, notes)`, where
+`status` is `planned` / `created` / `copied` / `skipped` / `failed`.
+`report.verified` is the green light, `report.failures` is what to fix,
+`report.deleted` and `report.delete_errors` say what came off the source, and
+`report.summary()` prints the lot.
+
+**`remap_view_sql(sql, *, source_path, target_path, entries, context=(),
+external_exists=None) -> RemapResult`** — the view rewriter on its own. Textual,
+never a parse of Dremio's dialect: it skips string literals and comments, and
+rewrites only identifier chains it can resolve — against a known entry, against
+the source root, or against the view's own `sqlContext`. Its docstring lists the
+four rules in order, and the one corner it can get wrong.
+
+
 ### Discovery
 
 **`gettablesfrom(schema_path) -> list[str]`** — every table and view under
@@ -1190,6 +1319,35 @@ whole subtree (`TABLE_SCHEMA` equal to `schema_path` or `LIKE schema_path.%`,
 since SQL `LIKE`'s `%` matches across dots), with `_`/`%` in real folder names
 escaped so an underscore is not read as a wildcard. Full paths rather than bare
 names because two subfolders can each hold a table of the same name.
+
+**`getentriesfrom(schema_path) -> list[CatalogEntry]`** — the same sweep, with
+`TABLE_TYPE` selected as well, so each path carries whether it is a `"TABLE"` or
+a `"VIEW"`. Sorted by path. This is what a folder-level operation needs: copying
+a view with `CREATE TABLE … AS SELECT` silently materialises it into a table.
+
+**`entryexists(path) -> bool`** — whether `path` is a table or view Dremio knows
+about, via `INFORMATION_SCHEMA` (so REST or Flight both answer). Fetches no rows,
+so it costs nothing on a large table. Unlike `CatalogRestClient.exists`, it does
+not see folders, spaces or sources.
+
+**`getviewsql(view_path) -> ViewDefinition`** — the SQL a view is defined by.
+
+```python
+@dataclass(frozen=True, slots=True)
+class ViewDefinition:
+    sql: str                      # the query body, as Dremio stores it
+    context: tuple[str, ...]      # the sqlContext it was written against; () = unknown
+```
+
+Two sources, better one first: Dremio's own catalog entity (which carries the
+`sqlContext` as well as the text), then `INFORMATION_SCHEMA."VIEWS"` (text only,
+so `context` comes back empty — meaning *unknown*, not *none*). Raises if
+neither answers, rather than letting a caller replace a view with a guess.
+
+**`getfoldersfrom(path, *, recursive=True) -> list[str]`** — the folders under
+`path`, shallowest first (the order they have to be created in on the other
+side). REST-only: folders are not in `INFORMATION_SCHEMA`, so an **empty** folder
+is invisible to `gettablesfrom`/`getentriesfrom` and can only be found this way.
 
 **`gettableitemsfrom(table_path) -> TableInfo`** — one table or view's schema and
 row count, **without fetching any rows**.

@@ -139,7 +139,11 @@ exact same arguments.
 - `draft2version(draft_path, version_path)` / `publishversion(consumer_view_path, version_path)`
   — **not implemented yet** (both raise `NotImplementedError`); promoting a draft table into a
   permanent version and repointing a consumer-facing view at it.
+- `createviewas(view_path, sql, overwrite=False, create_target_folder=True)` — `table2view`'s
+  general form: creates a view from any query body you hand it, not just `SELECT * FROM <source>`.
+  The SQL is sent through unchanged.
 - `deleteview(view_path)` — `DROP VIEW IF EXISTS`.
+- `deletetable(table_path)` — `DROP TABLE IF EXISTS`; `deleteview`'s counterpart.
 
 **Copying/moving data** — always over Arrow Flight SQL, never REST, regardless of
 `EEA_CATALOG_TRANSPORT` (needs `username=` on `Catalog(...)` for the Flight auth handshake):
@@ -156,11 +160,39 @@ exact same arguments.
   `target_path` actually exists in the catalog before declaring success, rather than trusting a
   silent CREATE/DROP.
 
+**A whole folder at once** (`catalog/foldertree.py` — orchestration over the operations above,
+not one statement each):
+- `folderscan(source_path, target_path)` — read-only: every sub-folder, table and view under
+  `source_path`, mapped to where it would land under `target_path`, with each view's SQL already
+  rewritten and the views in dependency order. Returns a `FolderTree`.
+- `foldercopy(source_path, target_path, dry_run=False, overwrite=False, skip_existing=True,
+  verify_views=True, copy_metadata=True, tree=None)` — reproduces the subtree and **proves it**:
+  folders first (empty ones included), then tables via `datacopy` with `COUNT(*)` compared on
+  both sides, then views recreated from their own SQL with every reference into the moved
+  subtree remapped to the new location, so the copy is self-contained. Returns a
+  `FolderTransferReport`; a per-entry failure is reported, not raised.
+- `foldermove(source_path, target_path, ..., delete_source_root=True)` — `foldercopy`, and then
+  removes the source **only if `report.verified`**: views in reverse dependency order, then
+  tables, then folders deepest-first. Anything less than a clean copy leaves the source exactly
+  where it is.
+- `remap_view_sql(sql, source_path=..., target_path=..., entries=..., context=...)` — the view
+  rewriter on its own, if you want to see what it would do to one definition.
+
 **Discovery**
 - `gettablesfrom(schema_path)` — every table/view under `schema_path`, recursing into
   subfolders; returns full dot-separated paths.
+- `getentriesfrom(schema_path)` — the same sweep, but each path carries whether it is a
+  `"TABLE"` or a `"VIEW"` (`CatalogEntry`), so a folder-level operation knows what each entry is
+  without a lookup per path.
 - `gettableitemsfrom(table_path)` — one table/view's schema (`{column: DATA_TYPE}`) and row
   count, without fetching any actual rows.
+- `entryexists(path)` — whether `path` is a table or view Dremio knows about. Fetches no rows.
+- `getviewsql(view_path)` — the SQL a view is defined by, as a `ViewDefinition(sql, context)`.
+  Read from Dremio's catalog entity where it answers (which also carries the `sqlContext` the
+  SQL was written against), falling back to `INFORMATION_SCHEMA."VIEWS"`, which has the text but
+  no context. Raises rather than guessing if neither answers.
+- `getfoldersfrom(path, recursive=True)` — the folders under `path`, shallowest first. REST-only:
+  folders are not in `INFORMATION_SCHEMA`, so an *empty* folder can only be found this way.
 
 **Wiki & tags** (Dremio's catalog collaboration API — REST-only, no SQL/Flight equivalent):
 - `getwikifrom(path)` / `setwikito(path, text, tags=None)` / `deletewiki(path)` — read,
@@ -379,6 +411,7 @@ context itself — raises `CatalogSessionError` if none is set yet:
 | `sdi/iso.py` | reads UUID, title, edition, dates and series children from ISO 19115-3 |
 | `catalog/client.py` | `Catalog` — two connections (REST + Flight), every operation as a method |
 | `catalog/operations.py` | the operations themselves (table2view, datacopy, createfolder, ...), as functions taking an executor and/or a `CatalogRestClient` |
+| `catalog/foldertree.py` | `folderscan`/`foldercopy`/`foldermove` — a whole folder at a time, with the view-SQL rewriter (`remap_view_sql`) that keeps a copied subtree self-contained |
 | `catalog/sql.py` | `SqlExecutor` protocol + REST/Flight implementations, `resolve_executor()` (transport env var) |
 | `catalog/rest.py` | `CatalogRestClient` — Dremio's native `/api/v3/catalog` for folders, wiki, and tags (none of which have a SQL/Flight equivalent) |
 | `catalog/retry_state.py` | persisted memory of stalled attempts, for `retry_pending()` |
