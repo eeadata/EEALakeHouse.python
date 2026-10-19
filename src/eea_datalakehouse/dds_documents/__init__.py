@@ -22,6 +22,7 @@ from .controller import (
     DdsFolder,
     DdsPushError,
     PushReport,
+    folder_name,
 )
 from .paths import path_segments, to_catalog_path, to_storage_path
 from .session import DdsSession, DdsSessionError
@@ -38,6 +39,7 @@ __all__ = [
     "DocumentsApiError",
     "DocumentsClient",
     "PushReport",
+    "folder_name",
     "path_segments",
     "to_catalog_path",
     "to_storage_path",

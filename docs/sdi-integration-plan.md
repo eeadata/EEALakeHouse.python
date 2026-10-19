@@ -110,7 +110,8 @@ team confirms them:
 > `MetadataSession` and the `%metadata` magic are gone. Any file — an SDI record
 > included — now goes to DDS through `dds_documents.DdsController.push(dds_path,
 > folder, files, overwrite=True)` and the `%dds` magic, into one of the dataset's
-> non-structured folders (`DdsFolder`: METADATA, ASSESSMENTS, DELIVERABLES). The
+> document folders (`DdsFolder`: DERIVED, METADATA, METHODOLOGY, ASSESSMENTS, ANALYSES,
+> REFERENCES, DELIVERABLES, OTHERS — compulsory; free-text folder names are refused). The
 > compare-before-upload rules of [Extract](#extract-sdi--dds) steps 4–6
 > (`unchanged` / `replaced` / `DdsCopyConflict`) and the Dremio catalog check
 > went with it: `overwrite` decides, and the target comes from `%catalog use(...)`,
@@ -283,15 +284,20 @@ record = %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
 %catalog use("catalog.water_management_resources.bathing_water.bwd")
 %dds help
 %dds push(METADATA, record)                       # .../bwd/metadata/<uuid>.xml
-%dds push(DELIVERABLES, ["report.pdf", "annex/*.xlsx"], overwrite=False)
+%dds push(DELIVERABLES, "report.pdf", "annex/*.xlsx", overwrite=False)
 ```
 
 - Each call runs immediately, like `%catalog`; there is nothing to commit.
-- `%dds push(folder, files, path=None, overwrite=True)` uploads to
+- `%dds push(folder, files..., path=None, overwrite=True, target_name="")` uploads to
   `{path}/{folder}/{file name}` with one `PUT` per file. `path` defaults to the
   `%catalog` context (looked up at push time) and is otherwise resolved like
-  any `%catalog` path. The folder names can be typed bare on a `%dds` line.
-- `files` takes local paths (globs too), a `%sdi get_xml` record, or a list.
+  any `%catalog` path. `folder` is compulsory and must be a `DdsFolder`
+  member, typed bare on a `%dds` line (`METADATA`, not `"metadata"`).
+- `files` are one or more, one after another or as a list: local paths
+  (globs too) or `%sdi get_xml` records. `target_name` renames them in DDS: a
+  string for a single file (`target_name="bwd_2025.xml"`), or a dict from each
+  file's own name to its new name (`{"draft_v3.pdf": "report_2025.pdf"}`).
+  Empty (the default), or a file the dict leaves out, keeps its own name.
   Every file is read and checked before the first upload; `overwrite=False`
   uploads nothing if any target is taken.
 - Every failure prints one `sdi error: …` / `dds error: …` line instead of a
@@ -317,9 +323,11 @@ Each step lands with its tests, mypy clean and ruff clean.
    - One live test, skipped unless `SDI_NETWORK_TESTS=1`.
 2. ✅ **`dds_documents/client.py`**, built like `IngestClient`: `put` / `get` /
    `exists` / `list` over the document endpoints. It makes no ingest calls.
-   - Written against the assumed contract; each endpoint, the `overwrite`
-     query parameter and the 409 conflict are module constants, to adjust
-     once step 0 confirms them. The size limit and path case wait for step 0.
+   - Written against the assumed contract; each endpoint, the overwrite
+     switch and the 409 conflict are module constants, to adjust once step 0
+     confirms them. `PUT /api/v1/files/{path}` with the `X-DDS-Overwrite`
+     header and `GET /api/v1/folders` now follow the Document Service's own
+     routes. The size limit (413) and path case wait for step 0.
    - The credential code stays in `dds_ingestion/credentials.py` for now and
      is imported from there.
 3. ✅ **`SdiController.get_xml()` / `push_to_dds()`**, all of Extract, plus

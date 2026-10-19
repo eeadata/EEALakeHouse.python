@@ -20,10 +20,18 @@ DOTENV_NAME = ".env"
 _F = TypeVar("_F", bound=Callable[..., Any])
 
 
+def plain_param(name: str, param: inspect.Parameter) -> str:
+    """One parameter as a notebook user reads it: ``name``, ``name=default``,
+    or ``name...`` for one that takes any number of values (``*name``)."""
+    if param.kind is inspect.Parameter.VAR_POSITIONAL:
+        return f"{name}..."
+    return name if param.default is inspect.Parameter.empty else f"{name}={param.default!r}"
+
+
 def call_usage(method: Callable[..., Any]) -> str:
     """``name(a, b=None, ...)`` — how to call ``method``, without ``self`` or type hints."""
     params = [
-        name if param.default is inspect.Parameter.empty else f"{name}={param.default!r}"
+        plain_param(name, param)
         for name, param in inspect.signature(method).parameters.items()
         if name != "self"
     ]

@@ -234,9 +234,11 @@ Environment: `SDI_API_URL` (empty means `https://sdi.eea.europa.eu/catalogue`), 
 
 ## DDS documents
 
-`eea_datalakehouse.dds_documents` uploads files to a dataset's non-structured DDS folders —
-`DdsFolder.METADATA`, `ASSESSMENTS`, `DELIVERABLES` — with one `PUT` per file. It is a
-**document upload**, not an ingest: nothing becomes a Dremio table.
+`eea_datalakehouse.dds_documents` uploads files to the document folders DDS shows under every
+catalog node, with one `PUT` per file. It is a **document upload**, not an ingest: nothing
+becomes a Dremio table. `DdsFolder` holds DDS's eight built-in folders — `DERIVED`, `METADATA`,
+`METHODOLOGY`, `ASSESSMENTS`, `ANALYSES`, `REFERENCES`, `DELIVERABLES`, `OTHERS` — and the target
+folder must always be one of them.
 
 ```python
 from eea_datalakehouse.dds_documents import DdsController, DdsFolder
@@ -247,14 +249,21 @@ with DdsController.from_env() as dds:
     report.paths   # (".../bwd/deliverables/report.pdf", ".../bwd/deliverables/annex1.xlsx", ...)
 ```
 
-- `push(dds_path, folder, files, overwrite=True)` puts each file at
+- `push(dds_path, folder, files, overwrite=True, target_name="")` puts each file at
   `{dds_path}/{folder}/{file name}`. `dds_path` is in catalog format (`a.b.c`; quoted names like
   `"v1.0"` lose their quotes and stay one segment) or storage format (`a/b/c`), below the
-  catalog root. `folder` is a `DdsFolder` or its name in any case.
+  catalog root. `folder` is compulsory and must be a `DdsFolder` member; anything else, a
+  string like `"metadata"` included, raises `TypeError` and uploads nothing.
 - `files` is one file or a list: local paths (a glob pattern too), `DdsFile(name, data)`, or
   any object with `filename` / `content` (an `SdiMetadata` record). Every file is read and
   checked before the first upload; the content type is guessed from the name.
-- `overwrite=True` replaces files already there. `overwrite=False` checks every target first and
+- `target_name` renames files in DDS: a string for the one file pushed
+  (`target_name="bwd_2025.xml"`), or a dict from a file's own name to its new name
+  (`target_name={"draft_v3.pdf": "report_2025.pdf"}`) when there are several. Files the dict
+  leaves out, or an empty `target_name` (the default), keep their own name; a key that matches no
+  file, or two files ending up with one name, uploads nothing.
+- `overwrite=True` replaces files already there (sent as DDS's `X-DDS-Overwrite: true` header).
+  `overwrite=False` checks every target first and
   raises `DdsFilesExistError`, uploading nothing, if any is taken. A failure part-way raises
   `DdsPushError`, whose `uploaded` lists what already went.
 - `target(dds_path, folder)` shows the folder without uploading.
@@ -274,7 +283,7 @@ can be typed bare on a `%dds` line (worked example: `debugger/sdi_session_exampl
 import eea_datalakehouse.notebook   # registers %catalog/%ingest/%sdi/%dds
 
 %catalog use("catalog.water_management_resources.bathing_water.bwd")
-%dds push(DELIVERABLES, ["report.pdf", "annex/*.xlsx"])
+%dds push(DELIVERABLES, "report.pdf", "annex/*.xlsx")
 record = %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
 %dds push(METADATA, record, overwrite=False)
 %dds target(ASSESSMENTS)       # where a push would go
@@ -396,7 +405,7 @@ context itself — raises `CatalogSessionError` if none is set yet:
 | `dds_ingestion/progress.py` | tqdm progress bar with graceful fallback |
 | `dds_ingestion/folder.py` | `FolderIngest` orchestration (scan/parallel/resume) |
 | `dds_documents/client.py` | `DocumentsClient` — put/get/list plain files in DDS folders (no ingest) |
-| `dds_documents/controller.py` | `DdsController` / `DdsFolder` — push files to a dataset's METADATA / ASSESSMENTS / DELIVERABLES folder |
+| `dds_documents/controller.py` | `DdsController` / `DdsFolder` — push files to a catalog node's DDS document folders (metadata, deliverables, ...) |
 | `dds_documents/paths.py` | catalog (`a.b.c`) ⇄ storage (`a/b/c`) path conversion |
 | `dds_documents/session.py` | `DdsSession` — what `%dds` dispatches onto |
 | `sdi/controller.py` | `SdiController` — `get_xml()`, `resolve_series()` |

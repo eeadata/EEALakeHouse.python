@@ -2,9 +2,9 @@
 
     dds = DdsSession(resolve_path=...)      # %dds — writes files to DDS
     dds.push(METADATA, "bwd_2025.xml")
-    dds.push(DELIVERABLES, ["report.pdf", "annex/*.xlsx"], overwrite=False)
+    dds.push(DELIVERABLES, "report.pdf", "annex/*.xlsx", overwrite=False)
 
-- **The target path is the `%catalog` context.** `push(folder, files)` puts
+- **The target path is the `%catalog` context.** `push(folder, *files)` puts
   the files in `{context}/{folder}/` — the dataset folder `%catalog use(...)`
   last set. `path=` picks another one, absolute or relative to the context,
   exactly as `%catalog` resolves paths. The resolution is the ``resolve_path``
@@ -44,7 +44,7 @@ from ..dds_ingestion.credentials import (
 )
 from ..session_utils import check_arg_types, find_dotenv, friendly_errors, read_dotenv_value
 from .client import DocumentsApiError, DocumentsClient
-from .controller import DdsController, DdsFolder, DdsPushError, PushReport
+from .controller import DdsController, DdsFolder, DdsPushError, PushReport, folder_name
 
 # What `%catalog` reads (see notebook/magics.py's _build_catalog_session).
 ENV_CATALOG_USER = "DREMIO_USERNAME"
@@ -118,33 +118,47 @@ class DdsSession:
     @_friendly
     def push(
         self,
-        folder: DdsFolder | str,
-        files: Any,
+        folder: DdsFolder,
+        *files: Any,
         path: str | None = None,
         overwrite: bool = True,
+        target_name: str | dict[str, str] = "",
     ) -> PushReport:
         """Upload `files` to `{path}/{folder}/` in DDS with PUT; `path` defaults
         to the `%catalog` context. `overwrite=False` uploads nothing if any
-        file is already there."""
+        file is already there. `target_name` renames files in DDS: a str for
+        the one file pushed, or a dict from a file's own name to its new name
+        (`{"draft_v3.pdf": "report_2025.pdf"}`); empty (the default) keeps
+        each file's own name.
+
+        `files` are given one after another, as lists, or both:
+        `push(METADATA, "a.xml", "b.xml")`, `push(METADATA, ["a.xml", "b.xml"])`
+        and `push(METADATA, "a.xml", ["b.xml"])` push the same two files."""
         # files is checked by collect_files, which knows every shape it takes.
+        folder_name(folder)  # a DdsFolder, nothing else; the error names the choices
         check_arg_types(
             "push",
-            ("folder", folder, str, False),
+            ("folder", folder, DdsFolder, False),
             ("path", path, str, True),
             ("overwrite", overwrite, bool, False),
+            ("target_name", target_name, (str, dict), False),
         )
         dds_path = self._dds_path(path)
         DdsController.target(dds_path, folder)  # bad folder or path: no settings needed
-        return self._dds().push(dds_path, folder, files, overwrite=overwrite)
+        flat = [f for item in files for f in (item if isinstance(item, (list, tuple)) else [item])]
+        return self._dds().push(
+            dds_path, folder, flat, overwrite=overwrite, target_name=target_name
+        )
 
     @_friendly
-    def target(self, folder: DdsFolder | str, path: str | None = None) -> str:
+    def target(self, folder: DdsFolder, path: str | None = None) -> str:
         """The DDS folder `push` would upload to, without uploading anything."""
-        check_arg_types("target", ("folder", folder, str, False), ("path", path, str, True))
+        folder_name(folder)
+        check_arg_types("target", ("folder", folder, DdsFolder, False), ("path", path, str, True))
         return DdsController.target(self._dds_path(path), folder)
 
     def folders(self) -> list[str]:
-        """The folder names `push` accepts."""
+        """The folders `push` accepts — the `DdsFolder` values, typed bare on a `%dds` line."""
         return [member.name for member in DdsFolder]
 
     @_friendly

@@ -21,17 +21,18 @@ In any cell, once loaded either way::
     %ingest commit(retry=True)
 
     %catalog use("catalog.water_management_resources.bathing_water.bwd")
-    %dds push(DELIVERABLES, ["report.pdf", "annex/*.xlsx"])
+    %dds push(DELIVERABLES, "report.pdf", "annex/*.xlsx")
     record = %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
     %dds push(METADATA, record)
 
 `%sdi` (`eea_datalakehouse.sdi.session.SdiSession`) only reads the SDI
 catalogue; `%dds` (`eea_datalakehouse.dds_documents.session.DdsSession`)
-uploads files to one of the `%catalog` context's non-structured DDS folders
-(`DdsFolder`: METADATA, ASSESSMENTS, DELIVERABLES — available by name on a
-`%dds` line). Both run each call immediately, like `%catalog`, and are built on
-first use, like `%ingest`'s session, from the kernel environment (see each
-module's docstring for the variables).
+uploads files to one of the `%catalog` context's document folders in DDS
+(`DdsFolder`: DERIVED, METADATA, METHODOLOGY, ASSESSMENTS, ANALYSES,
+REFERENCES, DELIVERABLES, OTHERS — compulsory, typed bare on a `%dds` line). Both run each call
+immediately, like `%catalog`, and are built on first use, like `%ingest`'s
+session, from the kernel environment (see each module's docstring for the
+variables).
 
 `%catalog` executes each call immediately — there's no queue and no separate
 commit step to remember. A `CatalogSession` still sits underneath it (to keep
@@ -105,6 +106,7 @@ from ..dds_documents.controller import DdsFolder, PushReport
 from ..dds_documents.session import DdsSession, DdsSessionError
 from ..dds_ingestion.session import IngestSession, IngestSessionError
 from ..sdi.session import SdiSession, SdiSessionError
+from ..session_utils import plain_param
 
 _USAGE = {
     "catalog": (
@@ -117,7 +119,7 @@ _USAGE = {
     ),
     "sdi": '%sdi get_xml("<uuid>")  |  %sdi resolve_series("<series uuid>")',
     "dds": (
-        '%dds push(DELIVERABLES, "report.pdf")  |  %dds push(METADATA, ["a.xml", "b.xml"])'
+        '%dds push(DELIVERABLES, "report.pdf")  |  %dds push(METADATA, "a.xml", "b.xml")'
         "  (into the %catalog use(...) folder)"
     ),
 }
@@ -317,14 +319,19 @@ _DDS_HELP = [
         "Upload files to path/folder/ in DDS with PUT, one request per file — a document "
         "upload, never an ingest. path defaults to the %catalog use(...) context and is "
         "resolved like any %catalog path (absolute, or relative to the context). folder is "
-        "one of METADATA, ASSESSMENTS, DELIVERABLES (typed bare, or as a string in any case). "
-        'files is one file or a list: a local path (a glob like "annex/*.pdf" too), or a '
-        "%sdi get_xml record (stored as <uuid>.xml). Every file is read and checked before the "
-        "first upload. overwrite=True (default) replaces a file already there; "
-        "overwrite=False uploads nothing if any is.",
+        "compulsory and must be one of DDS's document folders, typed bare (no quotes): DERIVED, "
+        "METADATA, METHODOLOGY, ASSESSMENTS, ANALYSES, REFERENCES, DELIVERABLES, OTHERS. "
+        "files are one or more, given one after another or as a list: local paths (globs like "
+        '"annex/*.pdf" too) or %sdi get_xml records (stored as <uuid>.xml). Every file is '
+        "read and checked before the first upload. target_name renames files in DDS: a string "
+        'for a single file (target_name="bwd_2025.xml"), or a dict from each file\'s own name to '
+        'its new name (target_name={"draft_v3.pdf": "report_2025.pdf"}); files left out, or an '
+        "empty target_name, keep their own name. "
+        "overwrite=True (default) replaces a file "
+        "already there; overwrite=False uploads nothing if any is.",
     ),
     ("target", "Show the DDS folder push would upload to, without uploading anything."),
-    ("folders", "List the folder names push accepts."),
+    ("folders", "List the folders push accepts."),
     ("dds_base_url", "Show the DDS URL push uses, and where it came from."),
 ]
 _DDS_HELP_NOTE = (
@@ -332,13 +339,47 @@ _DDS_HELP_NOTE = (
     '  %catalog use("catalog.water_management_resources.bathing_water.bwd")\n'
     '  %dds push(DELIVERABLES, "report.pdf")\n'
     "-> catalog/water_management_resources/bathing_water/bwd/deliverables/report.pdf\n"
+    "\n"
+    "push examples:\n"
+    "  files — one or more, one after another, as a list, or as a glob:\n"
+    '    %dds push(DELIVERABLES, "report.pdf", "annex.xlsx")\n'
+    '    %dds push(DELIVERABLES, ["report.pdf", "annex.xlsx"])\n'
+    '    %dds push(ANALYSES, "results/*.csv")\n'
+    "  an SDI record from %sdi get_xml (stored as <uuid>.xml):\n"
+    '    record = %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")\n'
+    "    %dds push(METADATA, record)\n"
+    "  folder — compulsory, one of DERIVED, METADATA, METHODOLOGY, ASSESSMENTS, ANALYSES,\n"
+    '  REFERENCES, DELIVERABLES, OTHERS, typed bare (a string like "methodology" is refused):\n'
+    '    %dds push(METHODOLOGY, "method.docx")\n'
+    "  path= — another dataset than the %catalog context, absolute or relative to it:\n"
+    '    %dds push(DELIVERABLES, "report.pdf", path="catalog.water_management_resources.wfd")\n'
+    '    %dds push(DELIVERABLES, "report.pdf", path="../wfd")\n'
+    "  overwrite= — True (default) replaces a file already there;\n"
+    "  False uploads nothing if any is:\n"
+    "    %dds push(METADATA, record, overwrite=False)\n"
+    "  target_name= — another name in DDS: a string for one file, a dict for several\n"
+    "  (files left out keep their name):\n"
+    '    %dds push(METADATA, record, target_name="bwd_2025.xml")\n'
+    '    %dds push(DELIVERABLES, "draft_v3.pdf", "annex.xlsx", '
+    'target_name={"draft_v3.pdf": "report_2025.pdf"})\n'
+    "  all together:\n"
+    '    %dds push(DELIVERABLES, "draft_v3.pdf", "annex/*.xlsx", path="../wfd", '
+    'overwrite=False, target_name={"draft_v3.pdf": "report_2025.pdf"})\n'
+    "  (a %dds call is one line — it cannot continue on the next one)\n"
+    "  check first, without uploading:  %dds target(DELIVERABLES)  or  "
+    '%dds target(DELIVERABLES, path="../wfd")\n'
+    "\n"
     "Environment: DDS_BASE_URL — read from the first .env found in the notebook's folder or "
     "a parent when %dds starts, else from the kernel environment — and a Dremio identity: "
     "_DREMIO_USER/_DREMIO_PWD (as %ingest) or DREMIO_USERNAME/DREMIO_TOKEN (as %catalog)."
 )
-# Folder names usable bare on a %dds line: `%dds push(METADATA, ...)`. The
-# notebook's own variables win over these, as Python scoping would have it.
-_DDS_NAMESPACE = {member.name: member for member in DdsFolder}
+# Folder names usable bare on a %dds line: `%dds push(METADATA, ...)`. They
+# win over a notebook variable of the same name, since folder must be one of
+# them (see _dispatch's extra_ns).
+_DDS_NAMESPACE: dict[str, Any] = {
+    "DdsFolder": DdsFolder,
+    **{member.name: member for member in DdsFolder},
+}
 
 
 def _build_catalog_session() -> CatalogSession:
@@ -374,13 +415,10 @@ def _plain_params(func: Any) -> str:
     `str | None` union means nothing to a data custodian, and would collide
     visually with the table's own `|` column separators anyway) and no `*`
     keyword-only marker. A parameter with a default is shown as `name=default`
-    so it still reads as optional; everything else is required, in order."""
+    so it still reads as optional, one taking any number of values (`*name`)
+    as `name...`; everything else is required, in order."""
     sig = inspect.signature(func)
-    parts = [
-        name if param.default is inspect.Parameter.empty else f"{name}={param.default!r}"
-        for name, param in sig.parameters.items()
-        if name != "self"
-    ]
+    parts = [plain_param(name, param) for name, param in sig.parameters.items() if name != "self"]
     return ", ".join(parts)
 
 
@@ -579,7 +617,9 @@ def _explain_syntax_error(session: Any, line: str, exc: SyntaxError) -> str:
             candidates = [
                 f"{p.name}={args[stray]}"
                 for p in params[first_keyword:]
-                if p.name not in named and _fits(p.annotation, args[stray])
+                if p.name not in named
+                and p.kind is not inspect.Parameter.VAR_POSITIONAL
+                and _fits(p.annotation, args[stray])
             ]
             hint = f" Did you mean {' or '.join(candidates)}?" if candidates else ""
             return (
@@ -616,7 +656,7 @@ def _dispatch(
         return None
     if line.isidentifier():  # bare "commit" (no parens) as a convenience
         line = f"{line}()"
-    namespace = {**(extra_ns or {}), **user_ns, "__session__": session}
+    namespace = {**user_ns, **(extra_ns or {}), "__session__": session}
     try:
         result = eval(f"__session__.{line}", namespace)  # see module docstring re: eval
         if auto_commit and result is session:
@@ -853,7 +893,7 @@ class EEALakehouseMagics(Magics):
         """`%dds` — upload files to the `%catalog` context's DDS folders, each
         call runs immediately::
 
-            %dds push(DELIVERABLES, ["report.pdf", "annex/*.xlsx"])
+            %dds push(DELIVERABLES, "report.pdf", "annex/*.xlsx")
             %dds push(METADATA, record, path="catalog.water.bwd", overwrite=False)
             %dds target(ASSESSMENTS)
         """

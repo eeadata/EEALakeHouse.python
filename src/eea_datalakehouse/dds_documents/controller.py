@@ -1,7 +1,10 @@
-"""Push files into a dataset's non-structured DDS folders.
+"""Push files into a catalog node's document folders in DDS.
 
-A dataset folder in DDS (``catalog/water/bwd``) has a few sub-folders for
-files that are not data: its metadata records, assessments, deliverables.
+Every catalog node in DDS (``catalog/water/bwd``) shows a set of document
+folders for files that are not data — metadata records, methodology,
+assessments, deliverables, ... They are not Dremio entities. The target
+folder is always one of :class:`DdsFolder`, DDS's eight built-in folders;
+free-text folder names are refused.
 :class:`DdsController` uploads files there with ``PUT``, one request per file::
 
     with DdsController.from_env() as dds:
@@ -23,7 +26,7 @@ import glob
 import mimetypes
 import os
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -39,25 +42,32 @@ _GLOB_CHARS = set("*?[")
 
 
 class DdsFolder(StrEnum):
-    """The non-structured folders a dataset has in DDS; the value is the folder's name."""
+    """DDS's built-in document folders; the value is the folder's name in DDS."""
 
+    DERIVED = "derived"
     METADATA = "metadata"
+    METHODOLOGY = "methodology"
     ASSESSMENTS = "assessments"
+    ANALYSES = "analyses"
+    REFERENCES = "references"
     DELIVERABLES = "deliverables"
+    OTHERS = "others"
 
-    @classmethod
-    def parse(cls, value: DdsFolder | str) -> DdsFolder:
-        """``value`` as a folder: a member, or its name in any case (``"Metadata"``)."""
-        if isinstance(value, cls):
-            return value
-        if not isinstance(value, str):
-            raise TypeError(f"folder must be a DdsFolder or str, not {type(value).__name__}")
-        try:
-            return cls(value.strip().strip("/").lower())
-        except ValueError:
-            raise ValueError(
-                f"unknown DDS folder {value!r}; use one of {', '.join(m.name for m in cls)}"
-            ) from None
+
+def folder_name(value: DdsFolder) -> str:
+    """``value``'s folder name in DDS. ``value`` must be a :class:`DdsFolder`:
+    the target folder is always one of the enumeration, never free text."""
+    if isinstance(value, DdsFolder):
+        return value.value
+    names = ", ".join(member.name for member in DdsFolder)
+    hint = ""
+    if isinstance(value, str):
+        match = next((m for m in DdsFolder if m.value == value.strip().strip("/").lower()), None)
+        hint = f" — write {match.name}, without quotes" if match else ""
+    raise TypeError(
+        f"folder must be one of the DdsFolder values {names}, "
+        f"not {type(value).__name__} {value!r}{hint}"
+    )
 
 
 @dataclass(frozen=True)
@@ -107,7 +117,7 @@ class DdsFilesExistError(DdsPushError):
 
 
 class DdsController:
-    """Uploads files to a dataset's non-structured DDS folders.
+    """Uploads files to a catalog node's document folders in DDS.
 
     ``documents`` is built from the environment (``DDS_BASE_URL``,
     ``_DREMIO_USER`` / ``_DREMIO_PWD``) on first use if not given.
@@ -144,7 +154,7 @@ class DdsController:
     # -- public API -------------------------------------------------------
 
     @staticmethod
-    def target(dds_path: str, folder: DdsFolder | str) -> str:
+    def target(dds_path: str, folder: DdsFolder) -> str:
         """``{dds_path}/{folder}`` in storage format — where :meth:`push` puts files.
 
         ``dds_path`` is the dataset's folder, in catalog (``a.b.c``) or storage
@@ -159,25 +169,37 @@ class DdsController:
                 f"{dds_path!r} is the catalog root, not a dataset folder; "
                 "pick one with %catalog use(...) or pass its path"
             )
-        return f"{to_storage_path(dds_path)}/{DdsFolder.parse(folder).value}"
+        return f"{to_storage_path(dds_path)}/{folder_name(folder)}"
 
     def push(
         self,
         dds_path: str,
-        folder: DdsFolder | str,
+        folder: DdsFolder,
         files: Any,
         *,
         overwrite: bool = True,
+        target_name: str | Mapping[str, str] = "",
     ) -> PushReport:
         """Upload ``files`` to ``{dds_path}/{folder}/{name}`` with ``PUT``.
+
+        ``name`` is each file's own name unless ``target_name`` renames it:
+
+        - a ``str`` is the new name of the one file being pushed (an error
+          with several files);
+        - a ``dict`` maps a file's own name to its new name
+          (``{"draft_v3.pdf": "report_2025.pdf"}``); files it leaves out keep
+          their name. A key that matches no file, or two files ending up
+          with one name, is an error.
+
+        Empty (the default) renames nothing.
 
         ``files`` is one file or a list of them, each a local path (``str`` or
         :class:`os.PathLike`; one with ``*``, ``?`` or ``[`` is a glob
         pattern, whose matching folders are skipped), a :class:`DdsFile`, or
         an object with ``filename`` and ``content`` attributes (an
-        ``SdiMetadata`` record, for instance). Every
-        file is read and checked before the first upload, so a typo uploads
-        nothing.
+        ``SdiMetadata`` record, for instance). Every file is read and checked
+        before the first upload, so a typo uploads nothing. ``folder`` must
+        be a :class:`DdsFolder` (``TypeError`` otherwise).
 
         ``overwrite=True`` (the default) replaces a file DDS already has.
         ``overwrite=False`` first checks every target and raises
@@ -186,7 +208,7 @@ class DdsController:
         uploaded.
         """
         target = self.target(dds_path, folder)
-        to_push = collect_files(files)
+        to_push = rename_files(collect_files(files), target_name)
         paths = [f"{target}/{item.name}" for item in to_push]
         documents = self._documents_client()
         if not overwrite:
@@ -220,7 +242,7 @@ def collect_files(files: Any) -> list[DdsFile]:
     matches nothing, an invalid name or two files with the same name, and
     ``TypeError`` for anything that is not a file.
     """
-    items = [files] if _is_single(files) else list(files) if files is not None else []
+    items = [] if files is None else [files] if _is_single(files) else list(files)
     collected: list[DdsFile] = []
     for item in items:
         collected.extend(_read(item))
@@ -233,8 +255,51 @@ def collect_files(files: Any) -> list[DdsFile]:
     return collected
 
 
+def rename_files(files: list[DdsFile], target_name: str | Mapping[str, str]) -> list[DdsFile]:
+    """``files`` with the names ``target_name`` gives them (see :meth:`DdsController.push`)."""
+    if isinstance(target_name, str):
+        if not target_name.strip():
+            return files
+        if len(files) != 1:
+            raise ValueError(
+                f"target_name as a str names one file, but {len(files)} would be pushed: "
+                f"{', '.join(f.name for f in files)} — pass a dict to rename several"
+            )
+        renames = {files[0].name: target_name}
+    elif isinstance(target_name, Mapping):
+        renames = {}
+        for source, new in target_name.items():
+            if not isinstance(source, str) or not isinstance(new, str):
+                raise TypeError("target_name maps file names (str) to new names (str)")
+            renames[source.strip()] = new
+    else:
+        raise TypeError(f"target_name must be a str or a dict, not {type(target_name).__name__}")
+    names = {f.name for f in files}
+    unknown = sorted(source for source in renames if source not in names)
+    if unknown:
+        raise ValueError(
+            f"target_name renames {', '.join(map(repr, unknown))}, but no file pushed has that "
+            f"name; the files are {', '.join(sorted(names))}"
+        )
+    renamed = [
+        DdsFile(require_file_name(renames[f.name]), f.data, f.content_type)
+        if renames.get(f.name, "").strip()
+        else f
+        for f in files
+    ]
+    counts = Counter(f.name for f in renamed)
+    clashes = sorted(name for name, count in counts.items() if count > 1)
+    if clashes:
+        raise ValueError(f"several files would be pushed as {', '.join(clashes)}")
+    return renamed
+
+
 def _is_single(files: Any) -> bool:
-    return isinstance(files, (str, os.PathLike, DdsFile, bytes)) or _is_in_memory(files)
+    return (
+        isinstance(files, (str, os.PathLike, DdsFile, bytes))
+        or _is_in_memory(files)
+        or not isinstance(files, Iterable)
+    )
 
 
 def _is_in_memory(item: Any) -> bool:
@@ -260,8 +325,9 @@ def _read(item: Any) -> list[DdsFile]:
         if not matches:
             raise ValueError(f"no file matches {text!r}")
         return [_read_path(Path(match)) for match in matches if not Path(match).is_dir()]
+    hint = f" — for overwrite, write overwrite={item}" if isinstance(item, bool) else ""
     raise TypeError(
-        f"cannot push a {type(item).__name__}; pass a file path, a DdsFile or a list of them"
+        f"cannot push a {type(item).__name__}; pass a file path, a DdsFile or a list of them{hint}"
     )
 
 
