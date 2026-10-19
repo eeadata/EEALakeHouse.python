@@ -99,6 +99,29 @@ class IngestOutcome:
     upload_mode: str = "direct"  # how the files went: "direct" (presigned S3) or "proxy" (DDS)
 
 
+@dataclass(frozen=True, slots=True)
+class _UploadFailure:
+    """Why the last :meth:`FolderIngest.run` stopped in the upload phase, kept for
+    :meth:`FolderIngest.retry` (PY-8)."""
+
+    error: Exception
+    session_id: str
+    cancelled: bool  # whether PY-2's cancel went through
+
+
+def _may_succeed_on_retry(err: Exception) -> bool:
+    """Whether a failed upload can succeed unchanged on a second attempt: a
+    network-layer error, or a 5xx from S3 or DDS. DDS's own ``retryable`` flag
+    decides where it gives one."""
+    if isinstance(err, httpx.TransportError):
+        return True
+    if isinstance(err, IngestApiError):
+        if err.retryable is not None:
+            return err.retryable
+        return err.status_code >= 500
+    return False
+
+
 def scan_folder(folder: Path, data_format: DataFormat) -> list[FileSpec]:
     """Recurse ``folder`` and return files matching ``data_format`` only.
 
@@ -217,6 +240,9 @@ class FolderIngest:
         # command below works from.
         self._session_id: str | None = None
         self._begin: BeginResult | None = None
+        # Set when run() cancelled its session after a failed upload; what
+        # retry() goes by once there is no session left (PY-8).
+        self._upload_failure: _UploadFailure | None = None
 
         # The client owns the credentials; if the caller did not inject one we
         # build it from the kernel environment. Creds never leave the client.
@@ -277,11 +303,13 @@ class FolderIngest:
         :meth:`status`, :meth:`retry` or :meth:`cancel` the transfer. Use it as a
         context manager (or call :meth:`close`) to release it.
         """
+        self._upload_failure = None
         begin = self.begin()
         try:
             etags, multipart_etags, uploaded, skipped = self._upload_all(begin)
         except Exception as err:
-            self._cancel_after_failure(err)
+            cancelled = self._cancel_after_failure(err)
+            self._upload_failure = _UploadFailure(err, begin.session_id, cancelled)
             raise
         try:
             commit = self.commit(multipart_etags=multipart_etags or None)
@@ -559,6 +587,11 @@ class FolderIngest:
           staged copy is gone. A fresh session is opened and the folder is
           uploaded again. Any ``idempotency_key`` is dropped for that attempt, or
           the server would just replay the failed session.
+        * **An upload of this object's own** :meth:`run` **failed**, so that run
+          cancelled its session (PY-2) and there is none left to resume. The
+          folder is uploaded again under a new session if the failure can pass
+          (a network error, a 5xx) and the cancel went through; otherwise this
+          raises :class:`IngestStateError` quoting the upload error.
 
         **A transfer whose files are stored permanently is never re-uploaded
         blindly.** There the upload landed in the table's own folder and stayed,
@@ -572,6 +605,10 @@ class FolderIngest:
         Raises :class:`IngestStateError` if there is nothing to retry — no
         session, one that is still running, or one that already succeeded.
         """
+        if self._upload_failure is not None:
+            # Whether or not its cancel went through, that session never got all
+            # its files: the server has nothing to resume (PY-8).
+            return self._rerun_after_failed_upload(self._upload_failure)
         if self._session_id is None:
             raise IngestStateError("no session to retry — call run() first")
         status = self._client.get_status(self._session_id)
@@ -614,6 +651,35 @@ class FolderIngest:
         self.idempotency_key = None
         return self.run()
 
+    def _rerun_after_failed_upload(self, failure: _UploadFailure) -> IngestOutcome:
+        """:meth:`retry` once :meth:`run` cancelled its session after a failed
+        upload (PY-8). Uploads again only when a second attempt can succeed and
+        nothing of the first is left behind; otherwise raises, quoting the upload
+        error, so a caller that retries (``IngestSession.commit(retry=True)``)
+        shows the cause instead of "no session"."""
+        if not failure.cancelled:
+            raise IngestStateError(
+                f"the upload failed ({failure.error}) and session {failure.session_id} "
+                "could not be cancelled, so files it uploaded may still be in place; "
+                "uploading again could add a second copy. Cancel it with "
+                "FolderIngest.attach(...).cancel(), or wait for the server's sweep, "
+                "then run the ingest again."
+            ) from failure.error
+        if not _may_succeed_on_retry(failure.error):
+            raise IngestStateError(
+                f"the upload failed ({failure.error}); its session was cancelled, and "
+                "uploading again would fail the same way. Fix the cause, then run the "
+                "ingest again."
+            ) from failure.error
+        logger.info(
+            "the upload of session %s failed (%s); uploading again under a new session",
+            failure.session_id,
+            failure.error,
+        )
+        self._begin = None
+        self.idempotency_key = None
+        return self.run()
+
     # -- upload phase -----------------------------------------------------
 
     def _after_failed_commit(self, err: IngestApiError) -> None:
@@ -635,8 +701,9 @@ class FolderIngest:
         if self.cleanup_on_failure and err.retryable is True:
             self._cancel_after_failure(err)
 
-    def _cancel_after_failure(self, err: Exception) -> None:
-        """Cancel the session after a failure, and say so on ``err``.
+    def _cancel_after_failure(self, err: Exception) -> bool:
+        """Cancel the session after a failure, say so on ``err``, and return
+        whether the cancel went through.
 
         After a failed upload (PY-2): an incomplete client upload cannot be
         resumed — the server only re-runs the load (:meth:`retry`) — and the
@@ -649,7 +716,7 @@ class FolderIngest:
         """
         session_id = self._session_id
         if session_id is None:
-            return
+            return False
         try:
             self.cancel()
         except Exception as cancel_err:  # noqa: BLE001 — reported on err instead
@@ -658,11 +725,12 @@ class FolderIngest:
                 f"DDS could not cancel session {session_id} ({cancel_err}); the "
                 "server's sweep removes its uploaded files after the session's TTL."
             )
-        else:
-            err.add_note(
-                f"Session {session_id} was cancelled and the files it had uploaded "
-                "were deleted; run the ingest again."
-            )
+            return False
+        err.add_note(
+            f"Session {session_id} was cancelled and the files it had uploaded "
+            "were deleted; run the ingest again."
+        )
+        return True
 
     def _already_done(self, session_id: str) -> set[str]:
         """Return rel_paths already uploaded for this session (resume support).
