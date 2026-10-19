@@ -206,8 +206,9 @@ class BeginResult:
     ``upload_mode`` is the server's hint for how to send the files:
     ``"proxy"`` means upload through DDS (``POST /api/v1/ingest/stage``)
     because the presigned S3 targets are not usable from the client — e.g. the
-    storage's TLS certificate doesn't match the endpoint's name. ``None`` (no
-    hint, or a server predating it) means the presigned targets, as before.
+    storage's TLS certificate doesn't match the endpoint's name. No hint (or
+    a server predating it) reads as ``"direct"``: the presigned targets, as
+    before.
     Read from the top level of the response, or from inside ``s3``.
     """
 
@@ -227,12 +228,14 @@ class BeginResult:
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> BeginResult:
         plan = data.get("plan")
+        s3 = data["s3"]
+        mode = data.get("upload_mode") or (s3.get("upload_mode") if isinstance(s3, dict) else None)
         return cls(
             session_id=data["session_id"],
             status=data["status"],
             s3=S3Plan.from_json(s3),
             collision=data.get("collision"),
-            upload_mode=str(data.get("upload_mode") or "direct"),
+            upload_mode=str(mode or "direct"),
             plan=BeginPlan.from_json(plan) if isinstance(plan, Mapping) else None,
         )
 
