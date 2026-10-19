@@ -327,7 +327,8 @@ _DDS_HELP = [
         "compulsory and must be one of DDS's document folders, typed bare (no quotes): DERIVED, "
         "METADATA, METHODOLOGY, ASSESSMENTS, ANALYSES, REFERENCES, DELIVERABLES, OTHERS. "
         "files are one or more, given one after another or as a list: local paths (globs like "
-        '"annex/*.pdf" too) or %sdi get_xml records (stored as <uuid>.xml). Every file is '
+        '"annex/*.pdf" too), %sdi get_xml records (stored as <uuid>.xml) or %gpkg export '
+        "reports (the .gpkg written). Every file is "
         "read and checked before the first upload. target_name renames files in DDS: a string "
         'for a single file (target_name="bwd_2025.xml"), or a dict from each file\'s own name to '
         'its new name (target_name={"draft_v3.pdf": "report_2025.pdf"}); files left out, or an '
@@ -350,6 +351,9 @@ _DDS_HELP_NOTE = (
     '    %dds push(DELIVERABLES, "report.pdf", "annex.xlsx")\n'
     '    %dds push(DELIVERABLES, ["report.pdf", "annex.xlsx"])\n'
     '    %dds push(ANALYSES, "results/*.csv")\n'
+    "  a GeoPackage from %gpkg export (the report is the file):\n"
+    "    report = %gpkg export()\n"
+    "    %dds push(DELIVERABLES, report)\n"
     "  an SDI record from %sdi get_xml (stored as <uuid>.xml):\n"
     '    record = %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")\n'
     "    %dds push(METADATA, record)\n"
@@ -410,6 +414,8 @@ _GPKG_HELP_NOTE = (
     "Streaming: rows are read over Arrow Flight a batch at a time — workers tables at once, "
     "each on its own channel — decoded and encoded in those workers, and written by one "
     "thread; memory stays a few batches per worker whatever the table size.\n"
+    "Progress: a line as each table/view is written (✓ rows, seconds) or fails (✗ with the "
+    "table's name — the export then stops and no file is written), and a total at the end.\n"
     "\n"
     "export examples:\n"
     "    %gpkg export()\n"
@@ -420,6 +426,10 @@ _GPKG_HELP_NOTE = (
     '    %gpkg export(path="../wfd", filename="wfd_2025.gpkg", output_dir="exports")\n'
     '    %gpkg export(path="catalog.water.bwd", tables=["stations"], limit=100, srid="EPSG:4326", '
     "overwrite=False, workers=2)\n"
+    "\n"
+    "then push the file to DDS — the returned report is the file:\n"
+    "    report = %gpkg export()\n"
+    "    %dds push(DELIVERABLES, report)\n"
     "\n"
     "Reads with %catalog's connection: DREMIO_BASE_URL / DREMIO_TOKEN. Written with sqlite3, "
     "shapely and pyproj (no GDAL)."

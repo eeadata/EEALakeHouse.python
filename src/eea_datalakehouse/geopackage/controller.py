@@ -34,13 +34,15 @@ table with no known CRS at all gets GeoPackage's "undefined" SRS (-1).
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
+import time
 import uuid
 from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Protocol
@@ -173,14 +175,25 @@ class GpkgLayer:
     geometry_type: str | None = None
     srs_id: int | None = None
     notes: tuple[str, ...] = ()
+    seconds: float = 0.0  # from the first query to the last row handed to the writer
 
 
 @dataclass(frozen=True)
 class GpkgReport:
-    """What :meth:`GpkgController.export` wrote."""
+    """What :meth:`GpkgController.export` wrote.
+
+    It is also the written file's path (``os.PathLike``), so it can be handed
+    to anything that takes one — `%dds push` included::
+
+        report = %gpkg export()
+        %dds push(DELIVERABLES, report)
+    """
 
     path: Path
     layers: tuple[GpkgLayer, ...] = field(default_factory=tuple)
+
+    def __fspath__(self) -> str:
+        return os.fspath(self.path)
 
     def __repr__(self) -> str:
         lines = [f"wrote {self.path} — {len(self.layers)} layer(s):"]
@@ -242,6 +255,7 @@ class GpkgController:
         srid: int | str | None = None,
         overwrite: bool = True,
         workers: int = DEFAULT_WORKERS,
+        progress: Callable[[str], None] | None = None,
     ) -> GpkgReport:
         """Write the tables and views under ``catalog_path`` to ``output``.
 
@@ -255,6 +269,9 @@ class GpkgController:
           ``False`` an existing file is an error.
         - ``workers``: how many tables are read from Dremio at once, each over
           its own Flight channel.
+        - ``progress``: called with one line of text as the export starts, as
+          each table or view is written, if one fails (naming it), and at the
+          end — ``print`` in a notebook. Default: log only.
         """
         if limit is not None and (
             isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
@@ -274,15 +291,27 @@ class GpkgController:
             _Job(i, path, kind, name, limit, target)
             for i, ((path, kind), name) in enumerate(zip(datasets, names, strict=True))
         ]
-        layers = self._run(jobs, output, min(workers, len(jobs)))
+        workers = min(workers, len(jobs))
+        say = _Progress(progress)
+        say(
+            f"exporting {len(jobs)} table(s)/view(s) from {catalog_path} to {output}, "
+            f"{workers} at a time"
+        )
+        started = time.perf_counter()
+        layers = self._run(jobs, output, workers, say)
+        rows = sum(layer.rows for layer in layers)
+        say(
+            f"done: {output} — {len(layers)} layer(s), {rows:,} rows "
+            f"in {time.perf_counter() - started:.1f}s"
+        )
         return GpkgReport(output, tuple(layers))
 
     # -- the pipeline -----------------------------------------------------
 
-    def _run(self, jobs: list[_Job], output: Path, workers: int) -> list[GpkgLayer]:
+    def _run(self, jobs: list[_Job], output: Path, workers: int, say: _Progress) -> list[GpkgLayer]:
         stop = threading.Event()
         inbox: queue.Queue[Any] = queue.Queue(maxsize=BATCHES_AHEAD * workers)
-        errors: list[BaseException] = []  # a failed worker's error, for the writer
+        errors: list[tuple[_Job, BaseException]] = []  # a failed worker's, for the writer
 
         def send(message: Any) -> None:
             while True:
@@ -295,26 +324,39 @@ class GpkgController:
                     continue
 
         def work(job: _Job) -> None:
+            started = time.perf_counter()
+
+            def send_timed(message: Any) -> None:
+                if isinstance(message, _Done):
+                    seconds = round(time.perf_counter() - started, 2)
+                    message = _Done(message.index, replace(message.layer, seconds=seconds))
+                send(message)
+
             try:
-                _produce(self._source, job, send, stop)
+                _produce(self._source, job, send_timed, stop)
             except _Stopped:
                 pass
             except BaseException as exc:  # noqa: BLE001 — handed to the writer thread
-                errors.append(exc)
+                errors.append((job, exc))
                 stop.set()
 
         results: dict[int, GpkgLayer] = {}
+        by_name = {job.name: job for job in jobs}
+        writing: _Job | None = None  # the table the writer is busy with, for an error message
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gpkg") as pool:
             futures = [pool.submit(work, job) for job in jobs]
             try:
                 with GeoPackageWriter(output) as gpkg:
                     while len(results) < len(jobs):
                         if errors:
-                            raise errors[0]
+                            failed, error = errors[0]
+                            say.failed(failed, error, output)
+                            raise error
                         try:
                             message = inbox.get(timeout=0.1)
                         except queue.Empty:
                             continue
+                        writing = by_name.get(getattr(message, "name", ""))
                         if isinstance(message, _Create):
                             gpkg.create_table(
                                 message.name,
@@ -327,15 +369,46 @@ class GpkgController:
                             gpkg.insert_encoded(message.name, message.rows, message.encoded)
                         else:
                             results[message.index] = message.layer
-                            logger.info(
-                                "wrote %s (%d rows)", message.layer.layer, message.layer.rows
-                            )
+                            say.done(message.layer, len(results), len(jobs))
+            except BaseException as exc:
+                if not errors and writing is not None:
+                    say.failed(writing, exc, output)  # SQLite refused what a worker sent
+                raise
             finally:
                 stop.set()
                 _drain(inbox)  # unblock any worker still waiting to send
                 for future in futures:
                     future.result()
         return [results[job.index] for job in jobs]
+
+
+class _Progress:
+    """The ``progress`` callback (and the log), one line per event."""
+
+    def __init__(self, callback: Callable[[str], None] | None) -> None:
+        self._callback = callback
+
+    def __call__(self, line: str) -> None:
+        logger.info("%s", line)
+        if self._callback is not None:
+            self._callback(line)
+
+    def done(self, layer: GpkgLayer, count: int, total: int) -> None:
+        if layer.kind == "features":
+            what = f"features, {layer.geometry_type}, SRS {layer.srs_id}"
+        else:
+            what = "attributes"
+        line = (
+            f"✓ {count}/{total} {layer.layer} ← {layer.source}: {what}, "
+            f"{layer.rows:,} rows, {layer.seconds:.1f}s"
+        )
+        self(line + "".join(f"\n    note: {note}" for note in layer.notes))
+
+    def failed(self, job: _Job, error: BaseException, output: Path) -> None:
+        self(
+            f"✗ {job.name} ← {job.path}: {type(error).__name__}: {error}\n"
+            f"    export stopped: the other tables were cancelled and {output} was not written"
+        )
 
 
 @dataclass(frozen=True)

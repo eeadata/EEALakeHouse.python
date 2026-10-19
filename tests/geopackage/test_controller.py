@@ -315,3 +315,85 @@ def test_dremio_source_gives_each_open_stream_its_own_channel_and_reuses_idle_on
         assert source.columns("a.b") == [("id", "BIGINT")]
 
     assert all(channel.closed for channel in catalog.opened)
+
+
+# -- progress messages ------------------------------------------------------------
+
+
+def test_a_line_per_table_as_it_is_written_and_at_the_end(out: Path) -> None:
+    lines: list[str] = []
+
+    report = GpkgController(_source()).export(DATASET, out, workers=2, progress=lines.append)
+
+    assert lines[0] == f"exporting 4 table(s)/view(s) from {DATASET} to {out}, 2 at a time"
+    done = [line for line in lines if line.startswith("✓")]
+    assert len(done) == 4
+    assert sorted(line.split()[1] for line in done) == ["1/4", "2/4", "3/4", "4/4"]
+    assert any(
+        line.startswith("✓")
+        and f"stations ← {DATASET}.stations: features, POINT, SRS 4326, 3 rows" in line
+        for line in done
+    )
+    assert any(
+        "empty" in line and "attributes, 0 rows" in line and "note: no rows" in line
+        for line in done
+    )
+    assert lines[-1].startswith(f"done: {out} — 4 layer(s), 7 rows in ")
+    assert all(layer.seconds >= 0 for layer in report.layers)
+
+
+def test_a_failing_table_is_named_in_a_line(out: Path) -> None:
+    source = _big_source()
+    source.fail = {f"{DATASET}.t2": RuntimeError("stream broke")}
+    lines: list[str] = []
+
+    with pytest.raises(RuntimeError, match="stream broke"):
+        GpkgController(source).export(DATASET, out, workers=3, progress=lines.append)
+
+    (failed,) = [line for line in lines if line.startswith("✗")]
+    assert failed.startswith(f"✗ t2 ← {DATASET}.t2: RuntimeError: stream broke")
+    assert f"the other tables were cancelled and {out} was not written" in failed
+    assert not lines[-1].startswith("done:")
+
+
+def test_a_write_failure_names_the_table_being_written(
+    out: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eea_datalakehouse.geopackage.writer import GeoPackageWriter
+
+    def broken(self: Any, name: str, rows: Any, encoded: Any = None) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(GeoPackageWriter, "insert_encoded", broken)
+    lines: list[str] = []
+    source = FakeSource({f"{DATASET}.codes": [CODES]})
+
+    with pytest.raises(OSError, match="disk full"):
+        GpkgController(source).export(DATASET, out, progress=lines.append)
+
+    assert lines[-1].startswith(f"✗ codes ← {DATASET}.codes: OSError: disk full")
+
+
+def test_without_a_callback_nothing_is_printed(
+    out: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    GpkgController(_source()).export(DATASET, out)
+
+    assert capsys.readouterr().out == ""
+
+
+# -- the report is the file, for %dds push -------------------------------------------
+
+
+def test_the_report_is_the_written_files_path(out: Path) -> None:
+    import os
+
+    from eea_datalakehouse.dds_documents.controller import collect_files
+
+    report = GpkgController(_source()).export(DATASET, out)
+
+    assert os.fspath(report) == str(out)
+    (pushed,) = collect_files(report)
+    assert pushed.name == "out.gpkg"
+    assert pushed.data == out.read_bytes()
+    assert pushed.data.startswith(b"SQLite format 3")

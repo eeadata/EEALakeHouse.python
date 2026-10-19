@@ -779,3 +779,46 @@ def test_gpkg_without_dremio_settings_is_printed_not_raised(
     assert ip.run_line_magic("gpkg", f'export(output_dir="{tmp_path}")') is None
 
     assert "gpkg error: %catalog needs DREMIO_BASE_URL and DREMIO_TOKEN" in capsys.readouterr().out
+
+
+def test_a_gpkg_export_can_be_pushed_with_dds(
+    ip: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    import httpx
+    import pyarrow as pa
+    import respx
+    from tests.geopackage.conftest import FakeSource
+
+    from eea_datalakehouse.dds_documents.session import DdsSession
+    from eea_datalakehouse.geopackage import GpkgController, GpkgSession
+
+    dataset = "catalog.water.bwd"
+    source = FakeSource({f"{dataset}.codes": [pa.record_batch({"code": ["a"]})]})
+    monkeypatch.setattr(
+        magics_module,
+        "_build_gpkg_session",
+        lambda resolve, catalog: GpkgSession(
+            resolve_path=resolve, controller=GpkgController(source)
+        ),
+    )
+    env = {"DDS_BASE_URL": "https://dds.test", "_DREMIO_USER": "u", "_DREMIO_PWD": "p"}
+    monkeypatch.setattr(
+        magics_module,
+        "_build_dds_session",
+        lambda resolve: DdsSession(resolve_path=resolve, env=env, dotenv_path=tmp_path / "none"),
+    )
+    monkeypatch.setattr(magics_module, "_notify_dds_pushed", lambda shell, path: None)
+    _magics_instance(ip)._pending_context = dataset
+
+    ip.user_ns["report"] = ip.run_line_magic("gpkg", f'export(output_dir="{tmp_path}")')
+    with respx.mock:
+        put = respx.put(
+            "https://dds.test/api/v1/files/catalog/water/bwd/deliverables/bwd.gpkg"
+        ).mock(return_value=httpx.Response(201))
+        pushed = ip.run_line_magic("dds", "push(DELIVERABLES, report)")
+
+    assert pushed.paths == ("catalog/water/bwd/deliverables/bwd.gpkg",)
+    request = put.calls.last.request
+    assert request.content == (tmp_path / "bwd.gpkg").read_bytes()
+    assert request.headers["Content-Type"] == "application/geopackage+sqlite3"
+    del ip.user_ns["report"]

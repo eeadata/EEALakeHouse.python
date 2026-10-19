@@ -345,8 +345,21 @@ Against a remote Dremio the parallel channels hide the network wait (about 2× f
 workers in a simulated 50 ms/batch test); without network wait, Python's per-row work caps the
 export at roughly 50–60k rows/s whatever the number of workers.
 
+**Progress.** `%gpkg export` prints a line as each table or view is written (`✓ 3/4 areas ←
+catalog...areas: features, POINT, SRS 3035, 1,500 rows, 0.1s`), or as one fails (`✗` with its
+name and the error — the export then stops and no file is written), and a total at the end.
+
+**Then push it to DDS.** The report `%gpkg export` returns is also the written file's path
+(`os.PathLike`), so `%dds push` takes it like any file — uploaded as
+`application/geopackage+sqlite3` to the same dataset's folder:
+
+```python
+report = %gpkg export(srid=3035)
+%dds push(DELIVERABLES, report)        # -> catalog/.../bwd/deliverables/bwd.gpkg
+```
+
 In Python: `GpkgController(DremioSource(catalog)).export(catalog_path, "out.gpkg", tables=...,
-limit=..., srid=..., workers=...)` returns a `GpkgReport` listing each layer, its geometry
+limit=..., srid=..., workers=..., progress=print)` returns a `GpkgReport` listing each layer, its geometry
 source, type, SRS and row count. `Catalog.stream_rows(sql, idempotency_key=...)` streams any
 SELECT as Arrow batches the same way.
 

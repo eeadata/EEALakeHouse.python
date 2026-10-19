@@ -32,6 +32,15 @@ def test_export_defaults_to_the_context_and_the_notebook_folder(
     assert report.path.is_file()
 
 
+def test_export_prints_a_line_per_table(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _session().export(output_dir=str(tmp_path))
+
+    out = capsys.readouterr().out.splitlines()
+    assert out[0].startswith(f"exporting 1 table(s)/view(s) from {DATASET}")
+    assert out[1].startswith(f"✓ 1/1 t ← {DATASET}.t: attributes, 1 rows")
+    assert out[2].startswith(f"done: {tmp_path / 'bwd.gpkg'} — 1 layer(s), 1 rows")
+
+
 def test_filename_and_output_dir(tmp_path: Path) -> None:
     report = _session().export(filename="mine", output_dir=str(tmp_path), workers=1)
 
