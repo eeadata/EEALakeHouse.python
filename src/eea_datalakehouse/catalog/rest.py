@@ -1,7 +1,10 @@
 """Dremio's own REST Catalog API (v3) — used for folder existence/creation/
 deletion and for reading an entity's wiki/tags, none of which have a SQL or
 Flight equivalent (this is the one place in `catalog` that isn't
-transport-agnostic through SqlExecutor).
+transport-agnostic through SqlExecutor) — except `delete_folder`'s cascade,
+which accepts an optional SQL-backed callback for its dataset children (see
+that method, and `operations.deletefolder`, which supplies one) rather than
+trusting this API's own generic delete to drop a *physical* table's data.
 
 Unverified against a real Dremio deployment: the v3 catalog API's by-path
 lookup, folder-creation, wiki/tag-collaboration, and folder-deletion
@@ -14,11 +17,13 @@ assumes a container child's JSON carries ``type="CONTAINER"`` /
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
-from .errors import CatalogOperationError, EngineStartingError
+from .errors import CatalogAuthError, CatalogOperationError, EngineStartingError
 
 DEFAULT_TIMEOUT = 60.0
 
@@ -54,15 +59,99 @@ class CatalogRestClient:
 
     def _lookup_by_path(self, path: str) -> dict[str, Any] | None:
         """The catalog entity's own JSON (id, type, ...) at `path`, or None if absent."""
-        encoded = "/".join(path.split("."))
+        return self._lookup_encoded("/".join(path.split(".")), path)
+
+    def get_entity(self, segments: Sequence[str]) -> dict[str, Any] | None:
+        """The catalog entity's JSON at the path made of `segments`, or None if absent.
+
+        One item per path level, each a name exactly as it appears in the
+        catalog — unlike the dot-separated `path` every other method takes, a
+        name here may itself contain dots, spaces or brackets (each segment is
+        URL-encoded on its own). Not best-effort: a lookup failure other than
+        404 raises `CatalogOperationError` (or `EngineStartingError` on a
+        timeout) rather than reading as "absent".
+        """
+        if not segments:
+            raise CatalogOperationError("cannot look up an empty catalog path")
+        encoded = "/".join(quote(segment, safe="") for segment in segments)
+        return self._lookup_encoded(encoded, ".".join(segments))
+
+    def list_datasets(self, segments: Sequence[str]) -> list[str]:
+        """Full dot-paths of every table and view under the path made of
+        `segments` — `list_dataset_kinds` without the kinds."""
+        return [path for path, _ in self.list_dataset_kinds(segments)]
+
+    def list_dataset_kinds(self, segments: Sequence[str]) -> list[tuple[str, str]]:
+        """``(full dot-path, "TABLE" or "VIEW")`` for every table and view
+        under the path made of `segments`, sorted by path, found by walking
+        the catalog tree: the folder's children, then each child folder's
+        children, and so on, at any depth.
+
+        Uses the REST catalog API only — every level is read with the same
+        by-path lookup Dremio's UI uses, following `nextPageToken` when a
+        folder's children come in pages — so it sees exactly what the catalog
+        holds, independent of how (or whether) a source reports its tables in
+        ``INFORMATION_SCHEMA``. The kind comes from the same JSON: a child's
+        ``datasetType`` (``VIRTUAL`` is a view, anything else a table), or the
+        entity's own ``type`` (``VIRTUAL_DATASET``) for a path that names a
+        table or view itself — which lists just that. Raises
+        `CatalogOperationError` if the path doesn't exist, `CatalogAuthError`
+        if Dremio refuses the token.
+        """
+        root = self.get_entity(segments)
+        if root is None:
+            raise CatalogOperationError(f"{'.'.join(segments)!r} does not exist")
+        if root.get("entityType") == "dataset":
+            kind = "VIEW" if root.get("type") == "VIRTUAL_DATASET" else "TABLE"
+            return [(".".join(segments), kind)]
+        found: list[tuple[str, str]] = []
+        pending: list[tuple[list[str], dict[str, Any]]] = [(list(segments), root)]
+        while pending:
+            folder, entity = pending.pop()
+            for child in self._all_children(folder, entity):
+                child_path = [str(part) for part in child.get("path") or []]
+                if not child_path:
+                    continue
+                if child.get("type") == "DATASET":
+                    kind = "VIEW" if child.get("datasetType") == "VIRTUAL" else "TABLE"
+                    found.append((".".join(child_path), kind))
+                elif child.get("type") == "CONTAINER":
+                    sub_entity = self.get_entity(child_path)
+                    if sub_entity is not None:
+                        pending.append((child_path, sub_entity))
+        return sorted(found)
+
+    def _all_children(self, segments: list[str], entity: dict[str, Any]) -> list[dict[str, Any]]:
+        """`entity`'s children, following Dremio's `nextPageToken` pages."""
+        children: list[dict[str, Any]] = list(entity.get("children") or [])
+        token = entity.get("nextPageToken")
+        encoded = "/".join(quote(segment, safe="") for segment in segments)
+        while token:
+            page = self._lookup_encoded(encoded, ".".join(segments), params={"pageToken": token})
+            if page is None:
+                break
+            children.extend(page.get("children") or [])
+            token = page.get("nextPageToken")
+        return children
+
+    def _lookup_encoded(
+        self, encoded: str, path: str, *, params: dict[str, str] | None = None
+    ) -> dict[str, Any] | None:
         try:
             resp = self._http.get(
-                f"{self._base_url}/api/v3/catalog/by-path/{encoded}", headers=self._headers
+                f"{self._base_url}/api/v3/catalog/by-path/{encoded}",
+                headers=self._headers,
+                params=params,
             )
         except httpx.TimeoutException as exc:
             raise EngineStartingError(f"catalog lookup for {path!r} timed out") from exc
         if resp.status_code == 404:
             return None
+        if resp.status_code in (401, 403):
+            raise CatalogAuthError(
+                f"Dremio refused the lookup of {path!r} ({resp.status_code}) — the token is "
+                "invalid or expired, or has no access to this path"
+            )
         if resp.status_code >= 400:
             raise CatalogOperationError(
                 f"could not look up {path!r} ({resp.status_code}): {resp.text[:300]}"
@@ -70,8 +159,29 @@ class CatalogRestClient:
         return resp.json()
 
     def exists(self, path: str) -> bool:
-        """Whether `path` (dot-separated) is any entity in the catalog."""
-        return self._lookup_by_path(path) is not None
+        """Whether `path` (dot-separated) is any entity in the catalog.
+
+        Best-effort, same reasoning as `is_folder`/`is_table_or_view`: some
+        Dremio source types reject a by-path lookup into a nested item that
+        doesn't exist outright (a 400, not a 404) rather than answering
+        "not found", so any lookup failure here is treated the same as
+        "not found", never raised — most visibly, this is what lets
+        `CatalogSession.create_folder` check whether a not-yet-created
+        folder is already there without that check itself blowing up the
+        creation it's only meant to make undoable.
+
+        The one exception is Dremio refusing the request itself (401/403 — an
+        invalid or expired token, or no access): that raises
+        `CatalogAuthError` rather than reading as "not found", so an expired
+        token is never reported as a missing path. Same for `is_folder` and
+        `is_table_or_view`.
+        """
+        try:
+            return self._lookup_by_path(path) is not None
+        except CatalogAuthError:
+            raise
+        except CatalogOperationError:
+            return False
 
     def is_folder(self, path: str) -> bool:
         """Whether `path` names an existing folder — not a table/view/space/source.
@@ -92,6 +202,8 @@ class CatalogRestClient:
         """
         try:
             entity = self._lookup_by_path(path)
+        except CatalogAuthError:
+            raise
         except CatalogOperationError:
             return False
         return entity is not None and entity.get("entityType") == "folder"
@@ -112,6 +224,8 @@ class CatalogRestClient:
         """
         try:
             entity = self._lookup_by_path(path)
+        except CatalogAuthError:
+            raise
         except CatalogOperationError:
             return False
         return entity is not None and entity.get("entityType") == "dataset"
@@ -254,7 +368,13 @@ class CatalogRestClient:
 
     def create_folder(self, path: str) -> bool:
         """POST `path` into existence. Returns whether it was newly created
-        (False on 409 — it was already there)."""
+        (False on 409 — it was already there).
+
+        A 403 on a folder that already exists also returns False: Dremio
+        checks ALTER before it checks existence, so a caller without ALTER on
+        a level it only passes through (a domain or subdomain, which only
+        `catalog_admin` can alter) is refused even though nothing needs
+        creating. A 403 on a folder that doesn't exist is still raised."""
         try:
             resp = self._http.post(
                 f"{self._base_url}/api/v3/catalog",
@@ -266,11 +386,21 @@ class CatalogRestClient:
         # 409: it was already there (either from before this call, or a
         # concurrent creation) — the post-condition ("it exists now") still
         # holds either way.
+        if resp.status_code == 403 and self._exists_quietly(path):
+            return False
         if resp.status_code not in (200, 201, 409):
             raise CatalogOperationError(
                 f"could not create folder {path!r} ({resp.status_code}): {resp.text[:300]}"
             )
         return resp.status_code != 409
+
+    def _exists_quietly(self, path: str) -> bool:
+        """`exists`, but a refused lookup reads as "not found" — for
+        `create_folder`'s 403 check, where the 403 itself is what gets raised."""
+        try:
+            return self.exists(path)
+        except CatalogAuthError:
+            return False
 
     def ensure_folder_path(self, path: str) -> list[str]:
         """Create every missing folder level of `path`. Returns the levels
@@ -337,17 +467,33 @@ class CatalogRestClient:
                 f"could not delete {what} ({resp.status_code}): {resp.text[:300]}"
             )
 
-    def delete_folder(self, path: str, *, cascade: bool = False) -> None:
+    def delete_folder(
+        self,
+        path: str,
+        *,
+        cascade: bool = False,
+        delete_dataset: Callable[[str], None] | None = None,
+    ) -> None:
         """Delete the folder at `path`. Idempotent — a folder that's
         already gone is not an error, same as `deleteview`'s
         ``DROP VIEW IF EXISTS``.
 
         `cascade=False` (the default) raises `CatalogOperationError` if the
         folder still has contents — `rmdir` vs `rm -r`. `cascade=True`
-        deletes every table/view and subfolder inside first, depth-first
-        (each straight through this same catalog API — Dremio supports
-        deleting a dataset by id here too, not just via SQL DROP), then the
-        folder itself.
+        deletes every table/view and subfolder inside first, depth-first,
+        then the folder itself. A subfolder child always recurses through
+        this same catalog API (folder deletion has no SQL equivalent); a
+        dataset child (table or view) goes through `delete_dataset(
+        child_path)` if given — `operations.deletefolder` passes one that
+        runs the same SQL `DROP TABLE`/`DROP VIEW` `deletetable`/
+        `deleteview` themselves use, since this project has never confirmed
+        that deleting a dataset by id through this catalog API actually
+        drops a *physical* table's underlying data, rather than just
+        forgetting its catalog entry (the same reason `deletetable`/
+        `deleteview` don't use this API for that either). With no
+        `delete_dataset` — a caller using this client directly, with no SQL
+        executor available — falls back to that same generic catalog
+        delete.
         """
         entity = self._lookup_by_path(path)
         if entity is None:
@@ -367,7 +513,9 @@ class CatalogRestClient:
                 if not child_path:
                     continue
                 if self._child_is_folder(child):
-                    self.delete_folder(child_path, cascade=True)
+                    self.delete_folder(child_path, cascade=True, delete_dataset=delete_dataset)
+                elif delete_dataset is not None:
+                    delete_dataset(child_path)
                 else:
                     self._delete_entity(child["id"], what=f"{child_path!r}")
 

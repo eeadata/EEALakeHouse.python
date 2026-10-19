@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -72,7 +73,8 @@ class FakeCatalogRest:
     should succeed rather than raise on a missing space. `folders` seeds
     which of those paths are specifically folders (for `is_folder`) —
     independent of `existing`, since a real entity could be a table/view
-    instead.
+    instead. `views` seeds which table/view paths `list_dataset_kinds`
+    reports as views (the rest are tables).
     """
 
     def __init__(
@@ -87,9 +89,12 @@ class FakeCatalogRest:
         raise_on_set_tags: Exception | None = None,
         raise_on_create_folder: Exception | None = None,
         raise_on_delete_folder: Exception | None = None,
+        raise_on_exists: Exception | None = None,
+        views: set[str] | None = None,
     ) -> None:
         self.existing = set(existing or set())
         self.folders = set(folders or set())
+        self.views = set(views or set())
         self.created: list[str] = []
         self.deleted: list[str] = []
         self._wikis = dict(wikis or {})
@@ -100,12 +105,39 @@ class FakeCatalogRest:
         self._raise_on_set_tags = raise_on_set_tags
         self._raise_on_create_folder = raise_on_create_folder
         self._raise_on_delete_folder = raise_on_delete_folder
+        self._raise_on_exists = raise_on_exists
 
     def exists(self, path: str) -> bool:
+        if self._raise_on_exists is not None:
+            raise self._raise_on_exists
         return path in self.existing
 
     def is_folder(self, path: str) -> bool:
         return path in self.folders
+
+    def list_datasets(self, segments: list[str]) -> list[str]:
+        """Every seeded table/view (an `existing` path that isn't a folder)
+        under `segments`, at any depth — the REST tree walk, in memory."""
+        from eea_datalakehouse.catalog.errors import CatalogOperationError
+
+        if self._raise_on_exists is not None:
+            raise self._raise_on_exists
+        path = ".".join(segments)
+        if path not in self.existing:
+            raise CatalogOperationError(f"{path!r} does not exist")
+        if path not in self.folders:  # a table/view itself
+            return [path]
+        return sorted(
+            p for p in self.existing if p.startswith(f"{path}.") and p not in self.folders
+        )
+
+    def list_dataset_kinds(self, segments: list[str]) -> list[tuple[str, str]]:
+        """`list_datasets`, each path paired with "VIEW" if seeded in `views`,
+        else "TABLE"."""
+        return [
+            (path, "VIEW" if path in self.views else "TABLE")
+            for path in self.list_datasets(segments)
+        ]
 
     def is_table_or_view(self, path: str) -> bool:
         # Every seeded path is either a folder (if also in self.folders) or,
@@ -186,7 +218,13 @@ class FakeCatalogRest:
         depth = path.count(".") + 1
         return [p for p in self.existing if p.startswith(prefix) and p.count(".") == depth]
 
-    def delete_folder(self, path: str, *, cascade: bool = False) -> None:
+    def delete_folder(
+        self,
+        path: str,
+        *,
+        cascade: bool = False,
+        delete_dataset: Callable[[str], None] | None = None,
+    ) -> None:
         from eea_datalakehouse.catalog.errors import CatalogOperationError
 
         if self._raise_on_delete_folder is not None:
@@ -204,7 +242,9 @@ class FakeCatalogRest:
         if cascade:
             for child in children:
                 if child in self.folders:
-                    self.delete_folder(child, cascade=True)
+                    self.delete_folder(child, cascade=True, delete_dataset=delete_dataset)
+                elif delete_dataset is not None:
+                    delete_dataset(child)
                 else:
                     self.existing.discard(child)
                     self.deleted.append(child)

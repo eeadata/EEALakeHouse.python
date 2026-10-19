@@ -13,6 +13,9 @@ from typing import Any, Literal
 
 Intent = Literal["read_only", "editable"]
 DataFormat = Literal["parquet", "csv", "json"]
+# How FolderIngest sends the bytes: "direct" to the presigned S3 targets, or
+# "proxy" through DDS (POST /api/v1/ingest/stage); "auto" follows begin's hint.
+UploadMode = Literal["auto", "direct", "proxy"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,7 +201,15 @@ class BeginPlan:
 
 @dataclass(frozen=True, slots=True)
 class BeginResult:
-    """Response from ``POST /api/v1/ingest/begin``."""
+    """Response from ``POST /api/v1/ingest/begin``.
+
+    ``upload_mode`` is the server's hint for how to send the files:
+    ``"proxy"`` means upload through DDS (``POST /api/v1/ingest/stage``)
+    because the presigned S3 targets are not usable from the client — e.g. the
+    storage's TLS certificate doesn't match the endpoint's name. ``None`` (no
+    hint, or a server predating it) means the presigned targets, as before.
+    Read from the top level of the response, or from inside ``s3``.
+    """
 
     session_id: str
     status: str
@@ -219,7 +230,7 @@ class BeginResult:
         return cls(
             session_id=data["session_id"],
             status=data["status"],
-            s3=S3Plan.from_json(data["s3"]),
+            s3=S3Plan.from_json(s3),
             collision=data.get("collision"),
             upload_mode=str(data.get("upload_mode") or "direct"),
             plan=BeginPlan.from_json(plan) if isinstance(plan, Mapping) else None,

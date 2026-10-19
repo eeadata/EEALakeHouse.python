@@ -1,0 +1,10 @@
+#!/bin/sh
+# Installed by `git config core.hooksPath .githooks` — see .githooks/redmine.py.
+# Never blocks the commit-msg: any failure is only a warning.
+PY=$(command -v python3 || command -v python)
+if [ -z "$PY" ]; then
+    echo "redmine: python3 not found, skipping commit-msg hook" >&2
+    exit 0
+fi
+"$PY" "$(dirname "$0")/redmine.py" commit-msg "$@" || echo "redmine: commit-msg hook failed (see above), continuing" >&2
+exit 0

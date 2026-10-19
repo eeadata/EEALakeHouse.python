@@ -19,10 +19,12 @@ rather manage the executor yourself.
 from __future__ import annotations
 
 from .client import Catalog
-from .errors import CatalogOperationError, EngineStartingError
+from .errors import CatalogAuthError, CatalogOperationError, EngineStartingError
 from .operations import (
     TableInfo,
+    VersionResult,
     createfolder,
+    createversion,
     datacopy,
     datamove,
     deletefolder,
@@ -30,12 +32,12 @@ from .operations import (
     deleteview,
     deletewiki,
     draft2version,
+    getmetafromwiki,
     gettableitemsfrom,
     gettablesfrom,
     gettagsfrom,
     getwikifrom,
     publishversion,
-    getmetafromwiki,
     retry_pending,
     setmeta2wiki,
     settagsto,
@@ -43,6 +45,13 @@ from .operations import (
     table2view,
 )
 from .rest import CatalogRestClient
+from .session import (
+    CatalogCommitError,
+    CatalogListing,
+    CatalogSession,
+    CatalogSessionError,
+    CommitReport,
+)
 from .sql import (
     FLIGHT_LOCATION_ENV_VAR,
     TRANSPORT_ENV_VAR,
@@ -57,15 +66,23 @@ __all__ = [
     "FLIGHT_LOCATION_ENV_VAR",
     "TRANSPORT_ENV_VAR",
     "Catalog",
+    "CatalogAuthError",
+    "CatalogCommitError",
+    "CatalogListing",
     "CatalogOperationError",
     "CatalogRestClient",
+    "CatalogSession",
+    "CatalogSessionError",
+    "CommitReport",
     "EngineStartingError",
     "FlightSqlExecutor",
     "RestSqlExecutor",
     "SqlExecutor",
     "SqlResult",
     "TableInfo",
+    "VersionResult",
     "createfolder",
+    "createversion",
     "datacopy",
     "datamove",
     "deletefolder",

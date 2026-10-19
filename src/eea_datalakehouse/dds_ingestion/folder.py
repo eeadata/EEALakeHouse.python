@@ -74,6 +74,7 @@ class IngestOutcome:
     files_skipped: int
     etags: dict[str, str] = field(default_factory=dict)
     resumed: bool = False
+    upload_mode: str = "direct"  # how the files went: "direct" (presigned S3) or "proxy" (DDS)
 
 
 def scan_folder(folder: Path, data_format: DataFormat) -> list[FileSpec]:
@@ -148,12 +149,17 @@ class FolderIngest:
         json_options: Mapping[str, Any] | None = None,
         infer_schema: bool = True,
         show_progress: bool = True,
+        upload_mode: UploadMode = "auto",
         client: IngestClient | None = None,
         base_url: str | None = None,
         creds: DremioCreds | None = None,
     ) -> None:
         if parallelism < 1:
             raise ValueError("parallelism must be >= 1")
+        if upload_mode not in ("auto", "direct", "proxy"):
+            raise ValueError(
+                f"upload_mode must be 'auto', 'direct' or 'proxy', not {upload_mode!r}"
+            )
         self.folder = Path(folder)
         if not self.folder.is_dir():
             raise NotADirectoryError(f"not a directory: {self.folder}")
@@ -183,6 +189,7 @@ class FolderIngest:
         # server that did not take it on begin gets it again on commit.
         self._sent_definition: TableDefinition | Mapping[str, Any] | None = None
         self.show_progress = show_progress
+        self.upload_mode = upload_mode
 
         # Set once ``begin`` runs (or by ``attach``); the handle every session
         # command below works from.
@@ -265,7 +272,16 @@ class FolderIngest:
             files_uploaded=uploaded,
             files_skipped=skipped,
             etags=etags,
+            upload_mode="proxy" if self._uses_proxy(begin) else "direct",
         )
+
+    def _uses_proxy(self, begin: BeginResult) -> bool:
+        """Whether to send the files through DDS rather than to S3 directly:
+        always with ``upload_mode="proxy"``, never with ``"direct"``, and with
+        ``"auto"`` when ``begin`` says ``upload_mode: "proxy"``."""
+        if self.upload_mode == "auto":
+            return begin.upload_mode == "proxy"
+        return self.upload_mode == "proxy"
 
     def begin(self) -> BeginResult:
         """Open the transfer and get the presigned upload targets (step 1 of 3).
@@ -591,6 +607,9 @@ class FolderIngest:
         self, begin: BeginResult
     ) -> tuple[dict[str, str], list[dict[str, object]], int, int]:
         targets = list(begin.s3.uploads)
+        proxy = self._uses_proxy(begin)
+        if proxy:
+            logger.info("uploading through DDS (proxy), not to the presigned S3 targets")
         done = self._already_done(begin.session_id)
         pending = [t for t in targets if t.rel_path not in done]
         skipped = len(targets) - len(pending)

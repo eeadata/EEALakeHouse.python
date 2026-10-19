@@ -36,7 +36,7 @@ pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@staging"    
 ```
 
 # staging's latest release (early access) — pin to the tag the "staging" badge above shows
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.10-staging"
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.30-staging"
 ```
 
 ## Usage
@@ -100,6 +100,42 @@ exact same arguments.
   `CREATE VIEW` transition for a location that started as a physical table (straight off ingest)
   and is moving to being a view. Checks `source_path` exists first; by default also creates
   `view_path`'s containing folder if missing.
+- `createview(source_path, target_path, overwrite=False, create_target_folder=False)` —
+  `CREATE VIEW ... AS SELECT * FROM source_path`, leaving `source_path` untouched (unlike
+  `datamove`). No data of its own — a view is a saved query — so this runs over REST like
+  every other metadata-only operation, not Arrow Flight. Same folder-append and `overwrite`
+  behavior as `datacopy`/`datamove`.
+- `createversion(source_path, version_name, tables=None, target_path=..., overwrite=False,
+  create_target_folder=True)` — copies the listed `tables` into a new folder
+  `target_path.version_name`, one `datacopy` snapshot each, keeping their sub-folders.
+  `source_path` and `version_name` must not be blank; `tables` omitted or empty copies everything
+  under `source_path`. Each entry is a table or a folder (every table under it), named as under
+  `source_path` or as a full path. A missing `target_path` is created, every level, unless
+  `create_target_folder=False`. Reference and vocabulary tables (a folder named
+  `reference(s)`/`vocabulary(ies)` in the path) and views are skipped and listed in
+  `VersionResult.skipped` — views are copied as tables instead with `include_views=True`
+  (listed in `VersionResult.from_views`). Entries missing from the source (all named at once) or an existing
+  version folder without `overwrite=True` raise before anything is written. On failure it
+  removes what it created. `%catalog create_version(source_path, version_name, tables)` uses the
+  current context as `target_path` when it's omitted.
+- `%catalog draft_to_version(version_name, tables=None, overwrite=False)` — `create_version`
+  from the dataflow's `draft` folder without typing any path: the source is the `draft` folder
+  the context is in (or the `draft` inside the context), the target is
+  `{draft's parent}.versions.{version_name}` (`versions` is created if missing). `tables` works
+  as in `create_version`. Unlike `create_version`, views in `draft` are not skipped: each one is
+  copied into the version as a table — a snapshot of what the view returns — and the commit
+  report's notes list them.
+- `%catalog update_latest_release(version_name, overwrite=True)` — a view at the Area's root for
+  every table in `{context}.versions.{version_name}`, keeping its sub-folders
+  (`versions.v1.eu_sdg_06_30.monitoringsites` gets the view `eu_sdg_06_30.monitoringsites`;
+  missing folders are created). The context, set with `use`, must be the Area folder — one with
+  `draft` and `versions` folders just below it, typically
+  `catalog.<domain>.<subdomain>.<area>` — and `versions.{version_name}` must exist —
+  checked when the call is made. Views in the version
+  are skipped. Every target is checked before any view is created: an existing view is dropped
+  and created again over the version (`overwrite=True`, the default — re-pointing the views at a
+  new version is the normal use; it can't be undone), `overwrite=False` makes it an error
+  instead, and an existing table is always an error.
 - `draft2version(draft_path, version_path)` / `publishversion(consumer_view_path, version_path)`
   — **not implemented yet** (both raise `NotImplementedError`); promoting a draft table into a
   permanent version and repointing a consumer-facing view at it.
@@ -169,6 +205,164 @@ exact same arguments.
 - `catalog.close()` (or `with Catalog(...) as catalog:`) — disposes the REST/Flight session(s).
   Idempotent, and covered by a process-exit/SIGTERM fallback if you forget.
 
+## SDI metadata
+
+`eea_datalakehouse.sdi` copies a dataset's ISO 19115-3 metadata record from the EEA SDI
+catalogue (GeoNetwork) into the dataset's `metadata` folder in DDS. The XML is a **document
+upload**, not an ingest: nothing becomes a Dremio table. The calling code always passes the
+SDI UUID. See `docs/sdi-integration-plan.md`.
+
+```python
+from eea_datalakehouse.sdi import SdiController
+
+with SdiController.from_env() as sdi:
+    metadata = sdi.get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")   # SDI -> bytes
+    result = sdi.push_to_dds(metadata, "catalog/water_management_resources/bathing_water/bwd")
+    result.dds_path   # ".../bwd/metadata/070d9baa-448d-4168-8514-7dadb3ad876d.xml"
+    result.action     # "uploaded" | "unchanged" | "replaced"
+```
+
+- `get_xml(uuid)` checks the response is `mdb:MD_Metadata` and identifies `uuid`
+  (`NotIso19115_3`, `UuidMismatch`; `SdiNotFound` / `SdiAuthError` for 404 / 401-403).
+- `push_to_dds(metadata, dds_path, target_name=None, folder="metadata", force=False)` names the
+  file `{uuid}.xml` unless `target_name` is given (`.xml` is added if missing), and takes `dds_path` in catalog
+  format (`a.b.c`, sent to DDS as `a/b/c`; quoted names like `"v1.0"` lose their quotes and stay
+  one segment) or storage format (`a/b/c`). It first checks `dds_path` exists in the Dremio
+  catalog when the controller has a catalog client (`CatalogPathNotFound` otherwise), then
+  compares with the copy
+  already in DDS: same bytes is `unchanged`; an older copy is `replaced`; a copy that is newer or
+  undated (someone edited it in DDS) raises `DdsCopyConflict` unless `force=True`.
+- `resolve_series(series_uuid)` returns the one release of a series that is not superseded, or
+  raises `NotCurrentError` listing every release.
+- `metadata.provenance_tags()` gives `sdi_record_uuid` / `sdi_edition` / `sdi_date_stamp` in
+  `Catalog.setmeta2wiki`'s `tags=` shape, if you want them on the dataset's wiki.
+
+Environment: `SDI_API_URL` (empty means `https://sdi.eea.europa.eu/catalogue`), optional
+`SDI_USERNAME` / `SDI_PASSWORD` for non-public records, and for the upload `DDS_BASE_URL` plus
+`_DREMIO_USER` / `_DREMIO_PWD`, as for ingest. The DDS document endpoints
+(`dds_documents/client.py`) are still assumptions to confirm with the DDS team.
+
+In a notebook, two magics split the work: `%sdi` (`SdiSession`) reads SDI, and `%metadata`
+(`MetadataSession`) pushes metadata files to DDS. Both are built on first use from the kernel
+environment like `%catalog`'s and `%ingest`'s sessions. `%metadata push_to_dds` uploads the
+record `%sdi get_xml` fetched last, so it needs only the path (worked example:
+`debugger/sdi_session_example.ipynb`):
+
+```python
+import eea_datalakehouse.notebook   # registers %catalog/%ingest/%sdi/%metadata
+
+%sdi help
+%sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
+%metadata push_to_dds("catalog/water_management_resources/bathing_water/bwd")
+```
+
+For the push, `DDS_BASE_URL` and `DREMIO_BASE_URL` are read from the first `.env` in the
+notebook's folder or a parent when `%metadata` builds its session (the kernel environment's
+value only applies if that `.env` doesn't set one; `%metadata dds_base_url()` /
+`dremio_base_url()` show which is in use). `%metadata push_to_dds` first checks that `dds_path`
+exists in the Dremio catalog (a `/` path is converted to `a.b.c` for that) and uploads nothing
+if it doesn't; `%metadata check_catalog_path(path)` runs the check alone, and
+`check_catalog=False` skips it. The Dremio identity is `_DREMIO_USER` /
+`_DREMIO_PWD` (as `%ingest`), falling back to `DREMIO_USERNAME` / `DREMIO_TOKEN` (as `%catalog`).
+
+## Notebook facade (`%catalog` / `%ingest`)
+
+For interactive use in JupyterLab, `eea_datalakehouse.notebook` registers two line magics
+aimed at data custodians rather than application developers, thin wrappers over
+`CatalogSession`/`IngestSession`. `%catalog` runs each call **immediately** — no commit
+step to remember. `%ingest` still queues and needs an explicit `commit()`, since a catalog
+operation can't run before its target has actually been ingested. See
+`docs/notebook-facade-for-data-scientists.md` for the full design, and
+`docs/notebooks/catalog_session_example.ipynb` / `ingest_session_example.ipynb` for worked
+examples. Install the extra this needs once: `pip install "EEADataLakehouse[notebook]"`.
+
+```python
+import eea_datalakehouse.notebook  # registers %catalog/%ingest — no %load_ext needed
+
+%catalog data_copy("draft.raw_2026", "bwd.reference.water_temperature")
+%catalog set_tags("bwd.reference.water_temperature", ["reviewed"])
+
+%ingest ingest(folder="./bw_2026", target_catalog_path="bwd.reference",
+                data_format="parquet", table_name="water_temperature")
+%ingest commit(retry=True)
+```
+
+`%catalog help` (or `%catalog help()`) renders every command as an HTML table — name,
+parameters, description — rather than a raw Python signature, since its audience is a data
+custodian, not necessarily a developer. `%ingest help` does the same for `IngestSession`'s
+(fewer) methods — handy when you don't remember an exact parameter name mid-notebook.
+
+A freshly created session already has a context — it starts at `"catalog"` (the catalog
+root), not empty — so a relative path works even before the first `use()` call.
+`use(None)`/`use("")` reset it back to `"catalog"` the same way; `set_context(None)` (the
+lower-level primitive `use` wraps, not normally called directly) is the one way left to
+clear it to no context at all.
+
+`%%catalog` (the cell-magic form) sets the context once, with `use(path)` on its magic line,
+then runs every other line of the cell in order under that context, without repeating the full
+path on each line. `use` is the *only* way context ever changes — no other verb touches it as
+a side effect of running, even one whose own `path` fully resolves to something that could
+sensibly become the new context (`create_folder`, notably, used to leave its own path as the
+new context; it no longer does — every verb only *reads* context, never writes it). `use`'s
+own `path` must always be a whole, absolute path — unlike every other verb, it's never
+resolved against whatever context already exists, and never accepts a leading `.`/`../`. It
+does make a live check that `path` actually exists in the catalog first, raising if it
+doesn't, rather than silently pointing context somewhere later calls would fail against
+anyway; `use(None)`/`use("")` skip that check and reset context to `"catalog"` instead.
+Every other verb's own `path`/`source_path`/
+`target_path` — including `data_copy`/`data_move`/`create_view`'s two, each resolved
+independently against that same context — still resolves against the current context once
+one is set — with or without a leading `.` (`"2027"` and `".2027"` mean the same thing) —
+unless it already starts with `catalog` (this deployment's one real root source), in which
+case it's always taken literally as absolute rather than appended to the context, dot or
+not. That's what makes pairing a relative `source_path` with a genuinely unrelated absolute
+`target_path` in the same `data_copy`/`data_move`/`create_view` call unambiguous without
+needing a dot on the absolute side: a real absolute path here always starts with `catalog`.
+One or more leading `../` (or a bare `..`) instead walks up that many levels of the context
+first, everywhere a relative path is understood except inside `use` itself —
+`"../water_temperature"` is a sibling of the context, `"../../water_temperature"` a level
+further up; `"."`/`"./"` alone (no name after either) mean the context itself. `get_context()`
+shows what the context currently is — always exactly what `use`/`set_context` last stored —
+and `use(path)` prints the same thing itself (`context set to <path>`), since there's nothing
+to commit — `use` never queues anything, so `%catalog`'s usual auto-commit would otherwise
+have nothing to show:
+
+```python
+%%catalog use("bwd.reference")
+set_tags("water_temperature", ["reviewed"])  # bare, no dot — same as ".water_temperature"
+create_folder(".2027")   # creates bwd.reference.2027 for real, but leaves context untouched
+
+%catalog get_context()               # -> 'bwd.reference' — still what use() set, not create_folder
+%catalog use("bwd.reference.2027")   # prints: context set to 'bwd.reference.2027'
+%catalog get_context()               # -> 'bwd.reference.2027'
+%catalog list(".")   # '.' alone -> the context itself: same as list("bwd.reference.2027")
+%catalog set_tags("../water_temperature", ["archived"])  # ../ works for any verb except use()
+%catalog get_tags("catalog.other_root.assessments")  # starts with 'catalog' — absolute, not appended
+%catalog data_copy(".water_temperature", "catalog.other_root.archive.water_temperature_2027")
+#                                          ^ starts with 'catalog' — absolute, not appended either
+%catalog data_copy(".water_temperature", "archive")
+#                                          ^ bare, no dot — relative too, appends to the context
+```
+
+`get_wiki(path)`, `get_tags(path)`, `list(path)` (every table/view under `path`, at any depth)
+and `schema(path)` (column types + row count) answer immediately, like `get_context()` — nothing
+to commit or undo. `delete_view(path)`/`delete_table(path)` queue like every other write, but —
+unlike the idempotent `DROP ... IF EXISTS` `Catalog.deleteview`/`deletetable` wrap — require
+`path` to already exist, and (like `delete_folder`) can never be undone. Every one of these
+raises `CatalogOperationError` if `path` doesn't exist; `schema` also requires it to be a table
+or view, not a folder. `list`'s `path` may also be omitted (or `""`) to list the current
+context itself — raises `CatalogSessionError` if none is set yet:
+
+```python
+%catalog get_wiki("bwd.reference.water_temperature")
+%catalog get_tags("bwd.reference.water_temperature")
+%catalog list("bwd.reference")      # -> ['bwd.reference.water_temperature', ...]
+%catalog use("bwd.reference")
+%catalog list()                     # same result — path omitted, lists the context itself
+%catalog schema("bwd.reference.water_temperature")   # -> TableInfo(schema={...}, row_count=...)
+%catalog delete_view("bwd.reference.old_view")
+```
+
 ## Layout
 
 | Path | Purpose |
@@ -178,6 +372,11 @@ exact same arguments.
 | `dds_ingestion/client.py` | thin, unit-testable HTTP client (`IngestClient`) |
 | `dds_ingestion/progress.py` | tqdm progress bar with graceful fallback |
 | `dds_ingestion/folder.py` | `FolderIngest` orchestration (scan/parallel/resume) |
+| `dds_documents/client.py` | `DocumentsClient` — put/get/list plain files in DDS folders (no ingest) |
+| `sdi/controller.py` | `SdiController` — `get_xml()`, `push_to_dds()`, `resolve_series()` |
+| `sdi/catalogue.py` | `SdiCatalogue` — read-only GeoNetwork REST client |
+| `sdi/session.py` | `SdiSession` / `MetadataSession` — what `%sdi` / `%metadata` dispatch onto |
+| `sdi/iso.py` | reads UUID, title, edition, dates and series children from ISO 19115-3 |
 | `catalog/client.py` | `Catalog` — two connections (REST + Flight), every operation as a method |
 | `catalog/operations.py` | the operations themselves (table2view, datacopy, createfolder, ...), as functions taking an executor and/or a `CatalogRestClient` |
 | `catalog/sql.py` | `SqlExecutor` protocol + REST/Flight implementations, `resolve_executor()` (transport env var) |
@@ -191,6 +390,25 @@ exact same arguments.
 pip install -e ".[dev]"
 pytest
 ```
+
+### Redmine (taskman) notes
+
+A commit whose message references an issue as `refs #1234` or `fixes #1234`
+(not a bare `#1234`) is posted as a note on that issue when you push, under
+your own Redmine account. This only adds a note; it never changes the issue's
+status. It runs from git hooks on your machine using your own API key, so the
+key never goes to GitHub. One-time setup per clone:
+
+```bash
+git config core.hooksPath .githooks   # VS Code's "Install git hooks" task does this on folder open
+echo "REDMINE_API_KEY=<your key>" >> debugger/.env   # taskman > My account > API access key
+```
+
+CI ("Redmine hook check") fails for any commit that references an issue but
+was made without the hooks or without a key. To fix one, set up the hooks as
+above, then run
+`git rebase --exec 'git commit --amend --no-edit' <base-branch>` and
+force-push.
 
 ## Releasing a new version
 
@@ -238,10 +456,10 @@ To pin to one specific release instead, use the exact tag the live badges under
 [Releasing a new version](#releasing-a-new-version)):
 
 ```python
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.10"
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.30"
 
 # staging's latest release (early access)
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.10-staging"
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.30-staging"
 ```
 
 Use the `%pip` magic rather than `!pip` — it installs into the kernel the
