@@ -215,11 +215,10 @@ class BeginResult:
     status: str
     s3: S3Plan
     collision: Any = None
-    # How the server wants the bytes sent (DDS_INGEST_UPLOAD_MODE): ``direct`` —
-    # presigned only; ``proxy`` — through ``POST /ingest/stage``; ``auto`` —
-    # presigned, then the proxy on a network failure. Absent on older servers,
-    # which never offered a choice: ``direct``.
-    upload_mode: str = "direct"
+    # The values a server sends (DDS_INGEST_UPLOAD_MODE): ``direct`` — presigned
+    # only; ``proxy`` — through ``POST /ingest/stage``; ``auto`` — presigned,
+    # then the proxy on a network failure (see `FolderIngest._upload_one`).
+    upload_mode: str | None = None
     # What commit will do (DI-12.2). ``None`` from a server predating it — which
     # is also how a client knows that server ignored a definition sent on begin.
     plan: BeginPlan | None = None
@@ -227,12 +226,14 @@ class BeginResult:
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> BeginResult:
         plan = data.get("plan")
+        s3 = data["s3"]
+        mode = data.get("upload_mode") or (s3.get("upload_mode") if isinstance(s3, dict) else None)
         return cls(
             session_id=data["session_id"],
             status=data["status"],
             s3=S3Plan.from_json(s3),
             collision=data.get("collision"),
-            upload_mode=str(data.get("upload_mode") or "direct"),
+            upload_mode=str(mode) if mode else None,
             plan=BeginPlan.from_json(plan) if isinstance(plan, Mapping) else None,
         )
 
