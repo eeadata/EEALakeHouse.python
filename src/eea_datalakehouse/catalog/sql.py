@@ -21,12 +21,16 @@ want that choice honoured without an ``if`` in the caller.
 from __future__ import annotations
 
 import os
+import queue
+import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 import httpx
+import pyarrow as pa
 
 from .errors import CatalogOperationError, EngineStartingError
 
@@ -285,6 +289,9 @@ class FlightSqlExecutor:
         self._owns_client = flight_client is None
         self._client = flight_client
         self._auth_header: tuple[bytes, bytes] | None = None
+        # One executor may serve several threads (parallel endpoint reads,
+        # or a caller's own workers): connecting and the login happen once.
+        self._lock = threading.RLock()
 
     def __repr__(self) -> str:
         return f"FlightSqlExecutor(location={self._location!r}, username={self._username!r})"
@@ -295,17 +302,35 @@ class FlightSqlExecutor:
             self._client = None
         self._auth_header = None
 
+    def fork(self) -> FlightSqlExecutor:
+        """A new executor with its **own gRPC channel**, reusing this one's
+        login (the bearer token from the handshake is valid on any channel).
+
+        One channel multiplexes every call over a single HTTP/2 connection;
+        several large result streams read at once go faster each on their own.
+        The caller closes the fork.
+        """
+        twin = FlightSqlExecutor(self._location, self._username, self._token, timeout=self._timeout)
+        with self._lock:
+            twin._auth_header = self._auth_header
+        return twin
+
     def _get_client(self):
         import pyarrow.flight as flight
 
-        if self._client is None:
-            self._client = flight.FlightClient(self._location)
-        return self._client
+        with self._lock:
+            if self._client is None:
+                self._client = flight.FlightClient(self._location)
+            return self._client
 
     def _authenticate(self, idempotency_key: str | None):
         """The basic-auth handshake's bearer-token header, done once and
         cached — reused by every call for this executor's whole lifetime,
         same reasoning as `_get_client()` reusing one `FlightClient`."""
+        with self._lock:
+            return self._authenticate_locked(idempotency_key)
+
+    def _authenticate_locked(self, idempotency_key: str | None):
         import pyarrow.flight as flight
 
         if self._auth_header is None:
@@ -388,3 +413,114 @@ class FlightSqlExecutor:
                     idempotency_key=idempotency_key,
                 ) from exc
         return rows
+
+    def stream_batches(
+        self, sql: str, *, idempotency_key: str | None = None, max_queued: int = 4
+    ) -> Iterator[pa.RecordBatch]:
+        """Run a SELECT and yield each Arrow `RecordBatch` as it arrives.
+
+        Nothing is gathered into memory: a whole table can be read through
+        this a batch at a time. Planning the query (``GetFlightInfo``) keeps
+        this executor's timeout — that is where a cold engine makes Dremio
+        wait — but reading the result has no overall deadline, so a long
+        stream is never cut off part-way. When Dremio splits the result into
+        several endpoints, they are read at once, each in its own thread, at
+        most ``max_queued`` batches ahead per endpoint; the batches then come
+        in arrival order. Stopping early (``close()`` on this generator, or
+        breaking out of the loop) cancels the reads still running.
+        """
+        import pyarrow.flight as flight
+
+        client, options, info = self._get_flight_info(sql, idempotency_key)
+        stream_options = flight.FlightCallOptions(headers=options.headers)
+        tickets = [endpoint.ticket for endpoint in info.endpoints]
+        if len(tickets) <= 1:
+            for ticket in tickets:
+                yield from self._read_endpoint(client, ticket, stream_options, sql, idempotency_key)
+            return
+        yield from self._read_endpoints(
+            client, tickets, stream_options, sql, idempotency_key, max_queued
+        )
+
+    def _read_endpoint(
+        self,
+        client: Any,
+        ticket: Any,
+        options: Any,
+        sql: str,
+        idempotency_key: str | None,
+        stop: threading.Event | None = None,
+    ) -> Iterator[pa.RecordBatch]:
+        import pyarrow.flight as flight
+
+        reader = None
+        try:
+            reader = client.do_get(ticket, options)
+            for chunk in reader:
+                if stop is not None and stop.is_set():
+                    return
+                if chunk.data is not None and chunk.data.num_rows:
+                    yield chunk.data
+            reader = None  # read to the end: nothing to cancel
+        except flight.FlightTimedOutError as exc:
+            raise EngineStartingError(
+                f"Flight SQL stream timed out (likely a starting engine): {sql!r}",
+                idempotency_key=idempotency_key,
+            ) from exc
+        except flight.FlightServerError as exc:
+            raise CatalogOperationError(f"Flight SQL error while reading results: {exc}") from exc
+        finally:
+            if reader is not None:
+                reader.cancel()
+
+    def _read_endpoints(
+        self,
+        client: Any,
+        tickets: list[Any],
+        options: Any,
+        sql: str,
+        idempotency_key: str | None,
+        max_queued: int,
+    ) -> Iterator[pa.RecordBatch]:
+        """Every endpoint at once, one thread each, into one bounded queue."""
+        done = object()
+        stop = threading.Event()
+        batches: queue.Queue[Any] = queue.Queue(maxsize=max_queued * len(tickets))
+
+        def put(item: Any) -> bool:
+            while not stop.is_set():
+                try:
+                    batches.put(item, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def read(ticket: Any) -> None:
+            try:
+                stream = self._read_endpoint(client, ticket, options, sql, idempotency_key, stop)
+                for batch in stream:
+                    if not put(batch):
+                        return
+            except BaseException as exc:  # noqa: BLE001 — handed to the consumer below
+                put(exc)
+            finally:
+                put(done)
+
+        threads = [threading.Thread(target=read, args=(t,), daemon=True) for t in tickets]
+        for thread in threads:
+            thread.start()
+        try:
+            running = len(threads)
+            while running:
+                item = batches.get()
+                if item is done:
+                    running -= 1
+                elif isinstance(item, BaseException):
+                    raise item
+                else:
+                    yield item
+        finally:
+            stop.set()
+            for thread in threads:
+                thread.join(timeout=5)
