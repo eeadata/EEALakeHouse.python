@@ -272,6 +272,11 @@ def test_ingest_magic_queues_onto_one_shared_session(ip: Any) -> None:
     assert repr(session) == "IngestSession(pending=1)"
 
 
+def test_ingest_diagnose_with_nothing_queued(ip: Any, capsys: pytest.CaptureFixture[str]) -> None:
+    ip.run_line_magic("ingest", "diagnose")  # bare name, like commit
+    assert "nothing queued" in capsys.readouterr().out
+
+
 def test_empty_line_prints_usage(ip: Any, capsys: pytest.CaptureFixture[str]) -> None:
     # No credentials needed to reach the usage message — it's printed before
     # a session is ever built.
@@ -398,8 +403,12 @@ def test_ingest_help_lists_methods(
     table_html = displayed[0].data
     assert "Command" in table_html and "Parameters" in table_html and "Description" in table_html
     assert ">ingest<" in table_html and ">commit<" in table_html
+    assert ">diagnose<" in table_html
     assert "folder, target_catalog_path" in table_html
     assert "retry=False, max_retries=3" in table_html
+    # PY-11: the one-line options show, with their defaults.
+    assert "csv_options=None" in table_html and "upload_mode=&#x27;auto&#x27;" in table_html
+    assert "cleanup_on_failure=False" in table_html
     assert "str | None" not in table_html  # no Python type-hint syntax leaking into the table
     assert _magics_instance(ip)._ingest_session is None
 

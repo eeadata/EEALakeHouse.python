@@ -112,6 +112,23 @@ def test_a_failed_commit_is_described_like_the_transfers_panel(data_folder: Path
     assert client.cancelled == []  # kept for retry by default
 
 
+def test_a_failed_commit_carries_its_stage(data_folder: Path) -> None:
+    # PY-13: the stage is an attribute too, not only part of the note.
+    with pytest.raises(IngestApiError) as exc:
+        _job(data_folder, FailingCommitClient(retryable=True)).run()
+    assert exc.value.failed_stage == "load"
+
+
+@respx.mock
+def test_an_api_error_has_no_stage_of_its_own(creds: DremioCreds) -> None:
+    respx.post(f"{BASE_URL}/api/v1/ingest/commit").mock(
+        return_value=httpx.Response(400, json={"error": "bad_request", "message": "no"})
+    )
+    with IngestClient(BASE_URL, creds) as client, pytest.raises(IngestApiError) as exc:
+        client.commit(session_id="s")
+    assert exc.value.failed_stage is None
+
+
 @pytest.mark.parametrize(
     ("retryable", "cleanup", "cancelled"),
     [(True, True, True), (False, True, False), (True, False, False)],
@@ -123,3 +140,57 @@ def test_cleanup_on_failure(
     with pytest.raises(IngestApiError):
         _job(data_folder, client, cleanup_on_failure=cleanup).run()
     assert (client.cancelled == ["sess-X"]) is cancelled
+
+
+# --- a retry after cleanup_on_failure (PY-8) -----------------------------------------
+
+
+class FlakyCommitClient(FailingCommitClient):
+    """Fails its first commit (retryable), then commits."""
+
+    def __init__(self) -> None:
+        super().__init__(retryable=True)
+        self.commits = 0
+
+    def commit(self, *, session_id: str, **kwargs: object) -> CommitResult:
+        self.commits += 1
+        if self.commits == 1:
+            return super().commit(session_id=session_id, **kwargs)
+        return FakeClient.commit(self, session_id=session_id, **kwargs)
+
+
+def test_a_retry_after_a_cleanup_uploads_again(data_folder: Path) -> None:
+    client = FlakyCommitClient()
+    job = _job(data_folder, client, cleanup_on_failure=True)
+    with pytest.raises(IngestApiError):
+        job.run()
+    assert client.cancelled == ["sess-X"]
+
+    outcome = job.retry()
+
+    assert outcome.commit.status == "committed"
+    assert len(client.begin_calls) == 2  # the upload was gone with the session
+
+
+def test_a_cleanup_whose_cancel_failed_is_resumed_on_the_server(data_folder: Path) -> None:
+    class CancelFailsClient(FailingCommitClient):
+        def __init__(self) -> None:
+            super().__init__(retryable=True)
+            self.retried: list[str] = []
+
+        def cancel(self, session_id: str) -> None:
+            raise RuntimeError("DDS unreachable")
+
+        def retry(self, session_id: str) -> StatusResult:
+            self.retried.append(session_id)
+            return StatusResult.from_json({"session_id": session_id, "status": "done"})
+
+    client = CancelFailsClient()
+    job = _job(data_folder, client, cleanup_on_failure=True)
+    with pytest.raises(IngestApiError):
+        job.run()
+
+    outcome = job.retry()
+
+    assert outcome.resumed and client.retried == ["sess-X"]
+    assert len(client.begin_calls) == 1
