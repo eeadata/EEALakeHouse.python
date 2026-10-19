@@ -38,18 +38,6 @@ class UuidMismatch(SdiError):
     """The XML's ``metadataIdentifier`` is not the UUID that was asked for."""
 
 
-class CatalogPathNotFound(SdiError):
-    """The dataset path to push metadata under does not exist in the Dremio catalog."""
-
-
-class DdsCopyConflict(SdiError):
-    """The copy already in DDS differs and is not older than the SDI record.
-
-    Someone probably edited it in DDS. Extract never silently overwrites that;
-    pass ``force=True`` to replace it anyway.
-    """
-
-
 @dataclass(frozen=True)
 class SeriesCandidate:
     """One release of a series, as SDI's search index describes it."""

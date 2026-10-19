@@ -31,7 +31,20 @@ def test_put_sends_body_type_and_bearer(client: DocumentsClient) -> None:
     assert request.content == b"<x/>"
     assert request.headers["Content-Type"] == "application/xml"
     assert request.headers["Authorization"] == "Bearer s3cr3t-pwd"
-    assert request.url.params["overwrite"] == "false"
+    assert request.headers["X-DDS-Overwrite"] == "false"
+    assert "overwrite" not in request.url.params
+
+
+@respx.mock
+def test_folders_reads_the_live_list(client: DocumentsClient) -> None:
+    respx.get(f"{BASE_URL}/api/v1/folders").mock(
+        return_value=httpx.Response(
+            200,
+            json={"folders": [{"key": "metadata", "role": "x"}, {"key": "maps"}], "is_admin": 0},
+        )
+    )
+
+    assert client.folders() == ["metadata", "maps"]
 
 
 @respx.mock
