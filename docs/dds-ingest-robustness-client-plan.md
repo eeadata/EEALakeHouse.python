@@ -1,9 +1,9 @@
 # DDS ingest robustness — the client half (DI-12) — plan
 
 > Status: **PY-1 … PY-7 implemented** (2026-10-16). Reviewed against the code on
-> 2026-10-19 (§5); the follow-up tasks **PY-8, PY-9, PY-10, PY-12 and PY-13
-> implemented** the same day. Open: the §5.1 repair reaching `main`, and PY-11,
-> which is Oskar's decision. Date: 2026-10-16.
+> 2026-10-19 (§5); the follow-up tasks **PY-8 … PY-13 implemented** the same day,
+> PY-11 with the scope agreed with Oskar. Open: the §5.1 repair reaching `main`
+> (PR #97, left to the user and Oskar). Date: 2026-10-16.
 
 Companion plan for **this** repository. The design, the server work and the
 release schedule live with DDS:
@@ -276,9 +276,9 @@ the server sends none, as in `774691a`). The whole suite passes. This has to rea
 | PY-7 | done | — | — |
 | §4 | met | `docs/python-client-guide.md` described none of the new options | PY-12 — done |
 
-Beyond the tasks: `IngestSession.ingest`, behind `%ingest`, passes `FolderIngest` a
-fixed set of options, so none of the options above reaches a notebook user (PY-11,
-open).
+Beyond the tasks: `IngestSession.ingest`, behind `%ingest`, passed `FolderIngest` a
+fixed set of options, so none of the options above reached a notebook user (PY-11 —
+done).
 
 ### 5.3 Follow-up tasks
 
@@ -354,7 +354,7 @@ open).
 > sizes" step after the credential step: a file over `max_bytes` fails it, one
 > over `stage_max_bytes` fails it only with `upload_mode="proxy"`.
 
-#### PY-11 The new options in `%ingest` — Oskar's decision
+#### PY-11 The new options in `%ingest` — Oskar's decision — **DONE**
 
 - `IngestSession.ingest` (`dds_ingestion/session.py`) passes `FolderIngest` seven
   options: `intent`, `conflict_mode`, `table_name`, `sub_path`, `parallelism`,
@@ -367,6 +367,17 @@ open).
   commit today, and at begin once `DDS_INGEST_SCHEMA_AT_BEGIN` is on.
 - **Owner:** Oskar Esparza — it is his module; nothing changes there without him.
 - **Server:** none.
+
+> Landed `e1c262d` and `a02a561`. Scope set on 2026-10-19 after talking to Oskar:
+> keep `IngestSession`'s logic and queue-then-commit concept, and add only what a
+> one-off user can give on the **one** `%ingest` line — what cannot be, stays out.
+> As built: `upload_mode`, `csv_options`, `json_options` and `table_definition` (a
+> dict on that line) are forwarded. `infer_schema` and `cleanup_on_failure` are
+> left out: turning inference off only makes DDS ask for the columns, which
+> `table_definition` gives anyway, and a cleanup after a failed commit would leave
+> `commit(retry=True)` nothing to retry. One verb, `%ingest diagnose`, runs
+> `FolderIngest.diagnose()` for every queued ingest and keeps the queue; no
+> `dry_run` verb, since `diagnose` ends with one.
 
 #### PY-12 Client guide — the open part of §4 — **DONE**
 
@@ -405,18 +416,18 @@ open).
 
 | Step | What | Why first | State |
 |---|---|---|---|
-| 1 | §5.1 to `main`, with Oskar | every Python ingest from `@main` fails today | on `eea_bliki` (`60cad54`), not yet on `main` |
+| 1 | §5.1 to `main`, with Oskar | every Python ingest from `@main` fails today | on `eea_bliki` (`60cad54`); PR #97 into `main` is open, and merging it is left to the user and Oskar |
 | 2 | PY-8, PY-12, PY-13 | fix and document what is already shipped | done 2026-10-19 |
 | 3 | PY-9, PY-10 | use server features that are already deployed | done 2026-10-19 |
-| 4 | PY-11 | when Oskar agrees | open |
+| 4 | PY-11 | when Oskar agrees | done 2026-10-19 |
 
 Steps 2 and 3 were built in the order PY-8, PY-13, PY-9, PY-10, PY-12, so the guide
 documents all of them at once.
 
 ### 5.6 Coordination
 
-- Oskar Esparza reviews the §5.1 repair, which restores his `774691a`, and decides
-  PY-11.
+- Oskar Esparza reviews the §5.1 repair (PR #97), which restores his `774691a`.
+  PY-11's scope was agreed with him.
 - The DI-12 plan (§7.2) cites PY-7 as `8d79542`; that commit was rebased before it
   was pushed and is `c1149d5`.
 
