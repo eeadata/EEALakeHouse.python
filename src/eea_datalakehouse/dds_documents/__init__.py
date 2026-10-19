@@ -3,14 +3,42 @@
 Unlike :mod:`eea_datalakehouse.dds_ingestion`, nothing here creates a dataset:
 a document is uploaded as-is and never becomes a Dremio table::
 
-    from eea_datalakehouse.dds_documents import DocumentsClient
+    from eea_datalakehouse.dds_documents import DdsController, DdsFolder
 
-    with DocumentsClient.from_env() as docs:
-        docs.put("a/b/metadata/x.xml", xml_bytes, content_type="application/xml")
+    with DdsController.from_env() as dds:
+        dds.push("catalog.water.bwd", DdsFolder.DELIVERABLES, ["report.pdf"])
+
+:class:`DocumentsClient` is the HTTP layer underneath, one method per DDS
+endpoint; :class:`DdsSession` is what the `%dds` magic dispatches onto.
 """
 
 from __future__ import annotations
 
 from .client import DocumentExistsError, DocumentsApiError, DocumentsClient
+from .controller import (
+    DdsController,
+    DdsFile,
+    DdsFilesExistError,
+    DdsFolder,
+    DdsPushError,
+    PushReport,
+)
+from .paths import path_segments, to_catalog_path, to_storage_path
+from .session import DdsSession, DdsSessionError
 
-__all__ = ["DocumentExistsError", "DocumentsApiError", "DocumentsClient"]
+__all__ = [
+    "DdsController",
+    "DdsFile",
+    "DdsFilesExistError",
+    "DdsFolder",
+    "DdsPushError",
+    "DdsSession",
+    "DdsSessionError",
+    "DocumentExistsError",
+    "DocumentsApiError",
+    "DocumentsClient",
+    "PushReport",
+    "path_segments",
+    "to_catalog_path",
+    "to_storage_path",
+]

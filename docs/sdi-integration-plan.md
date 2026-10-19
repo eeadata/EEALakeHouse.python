@@ -106,20 +106,35 @@ team confirms them:
 
 ## Design
 
+> **Change: pushing moved out of `sdi`.** `SdiController.push_to_dds`,
+> `MetadataSession` and the `%metadata` magic are gone. Any file — an SDI record
+> included — now goes to DDS through `dds_documents.DdsController.push(dds_path,
+> folder, files, overwrite=True)` and the `%dds` magic, into one of the dataset's
+> non-structured folders (`DdsFolder`: METADATA, ASSESSMENTS, DELIVERABLES). The
+> compare-before-upload rules of [Extract](#extract-sdi--dds) steps 4–6
+> (`unchanged` / `replaced` / `DdsCopyConflict`) and the Dremio catalog check
+> went with it: `overwrite` decides, and the target comes from `%catalog use(...)`,
+> which already checks the path exists. The rest of this section is the original
+> design, kept for the record.
+
 ### Layout
 
 ```
 src/eea_datalakehouse/
   sdi/
-    __init__.py      # public API: SdiController, SdiMetadata, PushResult, errors
+    __init__.py      # public API: SdiController, SdiMetadata, errors
     config.py        # SDI_API_URL (+ optional SDI_USERNAME / SDI_PASSWORD), from env
     catalogue.py     # read-only SDI REST client: get_xml(), search(), site()
     iso.py           # ISO 19115-3 read: uuid, title, edition, dates, hierarchy level
-    controller.py    # SdiController.get_xml(), push_to_dds(), resolve_series()
+    controller.py    # SdiController.get_xml(), resolve_series()
+    session.py       # SdiSession, behind %sdi
     errors.py        # SdiError, SdiNotFound, SdiAuthError, UuidMismatch, NotIso19115_3, NotCurrentError
   dds_documents/
     __init__.py
     client.py        # DocumentsClient: put(), get(), exists(), list()
+    controller.py    # DdsController.push(), target(); DdsFolder, DdsFile, PushReport
+    paths.py         # catalog (a.b.c) <-> storage (a/b/c) paths
+    session.py       # DdsSession, behind %dds
 ```
 
 - **`dds_documents` is its own package**, next to `dds_ingestion`, and the XML
@@ -257,35 +272,34 @@ Two magics in `notebook/magics.py`, next to `%catalog` / `%ingest`, one session
 per kernel each, built on first use from the kernel environment:
 
 - **`%sdi`** (`SdiSession`) reads SDI: `get_xml`, `resolve_series`.
-- **`%metadata`** (`MetadataSession`) pushes metadata files to DDS:
-  `push_to_dds`, `dds_base_url`.
+- **`%dds`** (`DdsSession`) pushes files to DDS: `push`, `target`, `folders`,
+  `dds_base_url`.
 
 ```
 %sdi help
-%sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
+record = %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
 %sdi resolve_series("c3858959-90da-4c1b-b9ca-492db0e514df")
 
-%metadata help
-%metadata dds_base_url()
-%metadata push_to_dds("catalog/water_management_resources/bathing_water/bwd")
+%catalog use("catalog.water_management_resources.bathing_water.bwd")
+%dds help
+%dds push(METADATA, record)                       # .../bwd/metadata/<uuid>.xml
+%dds push(DELIVERABLES, ["report.pdf", "annex/*.xlsx"], overwrite=False)
 ```
 
 - Each call runs immediately, like `%catalog`; there is nothing to commit.
-- `%metadata push_to_dds` uploads the record `%sdi get_xml` fetched last
-  (looked up at push time) unless `metadata=` is given.
-- Every failure prints one `sdi error: …` / `metadata error: …` line instead
-  of a traceback.
-- `DDS_BASE_URL` and `DREMIO_BASE_URL` are read, when `%metadata` builds its
-  session, from the first `.env` in the notebook's folder or a parent; the
-  kernel environment's value applies only if that `.env` doesn't set one.
-  `%metadata dds_base_url()` / `dremio_base_url()` show which is in use.
-- **`push_to_dds` checks the Dremio catalog first**: `dds_path` (without the
-  `metadata` folder) must exist there, looked up with Dremio's
-  `/api/v3/catalog/by-path` and the same PAT; otherwise nothing is uploaded
-  (`CatalogPathNotFound`). A path with `/` separators is converted to the
-  catalog path structure (`a.b.c`, quoting names that need it) for the check
-  and the messages. `%metadata check_catalog_path(path)` runs the check alone;
-  `check_catalog=False` skips it.
+- `%dds push(folder, files, path=None, overwrite=True)` uploads to
+  `{path}/{folder}/{file name}` with one `PUT` per file. `path` defaults to the
+  `%catalog` context (looked up at push time) and is otherwise resolved like
+  any `%catalog` path. The folder names can be typed bare on a `%dds` line.
+- `files` takes local paths (globs too), a `%sdi get_xml` record, or a list.
+  Every file is read and checked before the first upload; `overwrite=False`
+  uploads nothing if any target is taken.
+- Every failure prints one `sdi error: …` / `dds error: …` line instead of a
+  traceback.
+- `DDS_BASE_URL` is read, when `%dds` builds its session, from the first
+  `.env` in the notebook's folder or a parent; the kernel environment's value
+  applies only if that `.env` doesn't set one. `%dds dds_base_url()` shows
+  which is in use.
 - The DDS upload's Dremio identity is `_DREMIO_USER` / `_DREMIO_PWD` (as
   `%ingest`), falling back to `DREMIO_USERNAME` / `DREMIO_TOKEN` (as
   `%catalog`).
@@ -317,10 +331,11 @@ Each step lands with its tests, mypy clean and ruff clean.
      release (extracts for real; uploads only with `DRY_RUN = False`).
 4. **Prove Extract against a DDS test instance.** Extract the bathing water
    release, and check the file appears in the dataset's `metadata/` folder.
-5. ✅ **`%sdi` and `%metadata` magics** over `sdi/session.py`'s `SdiSession`
-   (`get_xml`, `resolve_series`) and `MetadataSession` (`push_to_dds`, which
-   defaults to the last `%sdi` record, and `dds_base_url`). Built on first use
-   from the kernel environment like `%catalog` / `%ingest`.
+5. ✅ **`%sdi` and `%dds` magics** over `sdi/session.py`'s `SdiSession`
+   (`get_xml`, `resolve_series`) and `dds_documents/session.py`'s `DdsSession`
+   (`push`, `target`, `folders`, `dds_base_url`). Built on first use from the
+   kernel environment like `%catalog` / `%ingest`. (`%metadata` /
+   `MetadataSession.push_to_dds` came first and were replaced by `%dds`.)
    Worked example: `debugger/sdi_session_example.ipynb`. The README
    section, Layout rows, docstrings and `.env.example` entries are done.
 6. **Dependencies.**
