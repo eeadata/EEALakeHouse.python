@@ -87,6 +87,7 @@ def ip(shell: Any) -> Any:
     instance._ingest_session = None
     instance._sdi_session = None
     instance._dds_session = None
+    instance._gpkg_session = None
     return shell
 
 
@@ -510,7 +511,9 @@ def test_dds_folder_names_win_over_notebook_variables(
     ]
 
 
-def test_dds_target_resolves_path_like_catalog(ip: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_context_target_resolves_path_like_catalog(
+    ip: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from eea_datalakehouse.catalog.session import CatalogSession
 
     real = CatalogSession.__new__(CatalogSession)
@@ -519,17 +522,17 @@ def test_dds_target_resolves_path_like_catalog(ip: Any, monkeypatch: pytest.Monk
     instance = _magics_instance(ip)
     instance._catalog_session = real
 
-    assert instance._dds_target(None) == "catalog.water.bwd"
-    assert instance._dds_target("../other") == "catalog.water.other"
-    assert instance._dds_target("catalog/air/aq") == "catalog.air.aq"
+    assert instance._context_target(None) == "catalog.water.bwd"
+    assert instance._context_target("../other") == "catalog.water.other"
+    assert instance._context_target("catalog/air/aq") == "catalog.air.aq"
 
 
-def test_dds_target_before_any_catalog_session(ip: Any) -> None:
+def test_context_target_before_any_catalog_session(ip: Any) -> None:
     instance = _magics_instance(ip)
     instance._pending_context = "catalog.from.tree"
 
-    assert instance._dds_target(None) == "catalog.from.tree"
-    assert instance._dds_target("catalog.x") == "catalog.x"
+    assert instance._context_target(None) == "catalog.from.tree"
+    assert instance._context_target("catalog.x") == "catalog.x"
 
 
 def test_sdi_empty_line_prints_usage(ip: Any, capsys: pytest.CaptureFixture[str]) -> None:
@@ -711,3 +714,131 @@ def test_a_type_error_inside_a_method_keeps_its_traceback(ip: Any) -> None:
 
     with pytest.raises(TypeError, match="bug inside the method"):
         ip.run_line_magic("catalog", "broken()")
+
+
+# -- %gpkg ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("line", ["help", "help()"])
+def test_gpkg_help_lists_export_without_building_a_session(
+    ip: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], line: str
+) -> None:
+    displayed = []
+    monkeypatch.setattr(magics_module, "display", displayed.append)
+
+    ip.run_line_magic("gpkg", line)
+
+    out = capsys.readouterr().out
+    assert "%gpkg methods" in out and "export examples:" in out and "Streaming:" in out
+    table_html = displayed[0].data
+    assert ">export<" in table_html
+    assert (
+        "path=None, tables=None, limit=None, srid=None, filename=None, output_dir=None, "
+        "overwrite=True, workers=4" in table_html
+    )
+    assert _magics_instance(ip)._gpkg_session is None
+
+
+def test_gpkg_help_examples_fit_the_signature() -> None:
+    import ast
+    import inspect
+    import re
+
+    from eea_datalakehouse.geopackage import GpkgSession
+
+    calls = re.findall(r"%gpkg (export\(.*\))\s*$", magics_module._GPKG_HELP_NOTE, re.MULTILINE)
+    assert len(calls) >= 6
+    for call in calls:
+        tree = ast.parse(call, mode="eval").body
+        assert isinstance(tree, ast.Call)
+        inspect.signature(GpkgSession.export).bind(
+            None, *[None] * len(tree.args), **{k.arg: None for k in tree.keywords if k.arg}
+        )
+
+
+def test_gpkg_exports_the_catalog_context(ip: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str | None, dict[str, Any]]] = []
+
+    class _FakeGpkgSession:
+        def __init__(self, resolve_path: Any, catalog: Any) -> None:
+            self._resolve_path = resolve_path
+
+        def export(self, path: str | None = None, **kwargs: Any) -> str:
+            calls.append((self._resolve_path(path), kwargs))
+            return "written"
+
+    fake = _FakeCatalogSession()
+    monkeypatch.setattr(magics_module, "_build_catalog_session", lambda: fake)
+    monkeypatch.setattr(magics_module, "_build_gpkg_session", _FakeGpkgSession)
+
+    ip.run_line_magic("catalog", 'use("catalog.water.bwd")')
+    result = ip.run_line_magic("gpkg", 'export(tables=["stations"], limit=10, workers=8)')
+
+    assert result == "written"
+    assert calls == [("catalog.water.bwd", {"tables": ["stations"], "limit": 10, "workers": 8})]
+
+
+def test_gpkg_without_dremio_settings_is_printed_not_raised(
+    ip: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Any
+) -> None:
+    for var in ("DREMIO_BASE_URL", "DREMIO_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    _magics_instance(ip)._pending_context = "catalog.water.bwd"
+
+    assert ip.run_line_magic("gpkg", f'export(output_dir="{tmp_path}")') is None
+
+    assert "gpkg error: %catalog needs DREMIO_BASE_URL and DREMIO_TOKEN" in capsys.readouterr().out
+
+
+def test_a_gpkg_export_can_be_pushed_with_dds(
+    ip: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    import httpx
+    import pyarrow as pa
+    import respx
+
+    from eea_datalakehouse.dds_documents.session import DdsSession
+    from eea_datalakehouse.geopackage import GpkgController, GpkgSession
+
+    dataset = "catalog.water.bwd"
+    codes = pa.record_batch({"code": ["a"]})
+
+    class _OneTableSource:  # a DatasetSource with one attributes table
+        def datasets(self, path: str) -> list[tuple[str, str]]:
+            return [(f"{dataset}.codes", "TABLE")]
+
+        def batches(self, sql: str) -> Any:
+            yield codes
+
+        def columns(self, path: str) -> list[tuple[str, str]]:
+            return []
+
+    source = _OneTableSource()
+    monkeypatch.setattr(
+        magics_module,
+        "_build_gpkg_session",
+        lambda resolve, catalog: GpkgSession(
+            resolve_path=resolve, controller=GpkgController(source)
+        ),
+    )
+    env = {"DDS_BASE_URL": "https://dds.test", "_DREMIO_USER": "u", "_DREMIO_PWD": "p"}
+    monkeypatch.setattr(
+        magics_module,
+        "_build_dds_session",
+        lambda resolve: DdsSession(resolve_path=resolve, env=env, dotenv_path=tmp_path / "none"),
+    )
+    monkeypatch.setattr(magics_module, "_notify_dds_pushed", lambda shell, path: None)
+    _magics_instance(ip)._pending_context = dataset
+
+    ip.user_ns["report"] = ip.run_line_magic("gpkg", f'export(output_dir="{tmp_path}")')
+    with respx.mock:
+        put = respx.put(
+            "https://dds.test/api/v1/files/catalog/water/bwd/deliverables/bwd.gpkg"
+        ).mock(return_value=httpx.Response(201))
+        pushed = ip.run_line_magic("dds", "push(DELIVERABLES, report)")
+
+    assert pushed.paths == ("catalog/water/bwd/deliverables/bwd.gpkg",)
+    request = put.calls.last.request
+    assert request.content == (tmp_path / "bwd.gpkg").read_bytes()
+    assert request.headers["Content-Type"] == "application/geopackage+sqlite3"
+    del ip.user_ns["report"]

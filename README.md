@@ -36,7 +36,7 @@ pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@staging"    
 ```
 
 # staging's latest release (early access) — pin to the tag the "staging" badge above shows
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.33-staging"
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.34-staging"
 ```
 
 ## Usage
@@ -329,6 +329,72 @@ builds its session (the kernel environment's value only applies if that `.env` d
 After each push, `%dds` tells an integrated JupyterLab panel which files changed (comm target
 `eea_datalakehouse.dds_pushed`, one message per file).
 
+## GeoPackage export (`%gpkg`)
+
+`eea_datalakehouse.geopackage` writes the tables and views under a Dremio catalog path to one
+OGC GeoPackage (`.gpkg`) file: each spatial one as a feature layer, each other one as an
+attributes table. Written with `sqlite3`, `shapely` and `pyproj` — no GDAL.
+
+```python
+import eea_datalakehouse.notebook   # registers %gpkg with the other magics
+
+%catalog use("catalog.water_management_resources.bathing_water.bwd")
+%gpkg export()                                   # every table and view -> ./bwd.gpkg
+%gpkg export(tables=["stations", "areas"], limit=1000, srid=3035)
+%gpkg export(path="../wfd", filename="wfd_2025.gpkg", output_dir="exports", overwrite=False)
+%gpkg export(workers=8)                          # more tables streamed at once
+%gpkg help
+```
+
+- `path` defaults to the `%catalog use(...)` context and is resolved like any `%catalog` path;
+  it can also name a single table or view.
+- `tables` picks some, by name below `path` (`"stations"`, `"sub.areas"`); default all, at any
+  depth. Two with the same name become `sub_a_stations` / `sub_b_stations`.
+- `limit` caps the rows per table; `srid` (`3035`, `"EPSG:3035"`) reprojects every layer to that
+  CRS; `filename` / `output_dir` default to `<dataset>.gpkg` in the notebook's folder.
+- **Spatial or tabular** is decided from the data: a column whose values decode as WKB/EWKB,
+  WKT/EWKT, hex WKB or GeoJSON is the geometry (columns named `geom`, `geometry`, `wkt`,
+  `shape`, ... are tried first); failing that, latitude/longitude columns make points.
+- **CRS** per row: the SRID inside the geometry (EWKB/EWKT), else a CRS column (`srid`,
+  `sr_id`, `epsg`, `crs`, ...: `3035`, `"EPSG:3035"`, an EPSG URN or a CRS name), else EPSG:4326
+  for latitude/longitude. A layer takes `srid`, or its first rows' CRS; rows in another CRS are
+  reprojected to it. A layer with no CRS at all is written with the undefined SRS (-1), and the
+  report says so.
+- **CRS definitions** come from `geopackage/epsg_definitions.json` (`{code: {name, wkt}}`, shipped
+  with the package): both ends of every reprojection and the `gpkg_spatial_ref_sys` rows are built
+  from it, so the coordinates and the SRS that describes them agree. A code the file lacks falls
+  back to pyproj's EPSG database; codes and CRS names in the file (`900913`, `"ETRS89 / UTM zone
+  32N"`) are accepted for `srid` and in CRS columns.
+
+**Streaming.** Nothing is read whole. `workers` tables (default 4) are read at once, each over
+its own Arrow Flight gRPC channel (`Catalog.open_flight_channel`, one login shared), a batch at
+a time with no overall deadline on the stream. Each worker decodes, reprojects and encodes its
+batches; one thread owns the SQLite file and only inserts, fed through a bounded queue — a few
+batches per worker — so memory stays flat whatever the table size. The file is built under a
+temporary name with no journal or fsync in one transaction, and renamed into place only when
+every table succeeded; a failure in any table stops the others and leaves no partial file.
+Against a remote Dremio the parallel channels hide the network wait (about 2× faster with 4
+workers in a simulated 50 ms/batch test); without network wait, Python's per-row work caps the
+export at roughly 50–60k rows/s whatever the number of workers.
+
+**Progress.** `%gpkg export` prints a line as each table or view is written (`✓ 3/4 areas ←
+catalog...areas: features, POINT, SRS 3035, 1,500 rows, 0.1s`), or as one fails (`✗` with its
+name and the error — the export then stops and no file is written), and a total at the end.
+
+**Then push it to DDS.** The report `%gpkg export` returns is also the written file's path
+(`os.PathLike`), so `%dds push` takes it like any file — uploaded as
+`application/geopackage+sqlite3` to the same dataset's folder:
+
+```python
+report = %gpkg export(srid=3035)
+%dds push(DELIVERABLES, report)        # -> catalog/.../bwd/deliverables/bwd.gpkg
+```
+
+In Python: `GpkgController(DremioSource(catalog)).export(catalog_path, "out.gpkg", tables=...,
+limit=..., srid=..., workers=..., progress=print)` returns a `GpkgReport` listing each layer, its geometry
+source, type, SRS and row count. `Catalog.stream_rows(sql, idempotency_key=...)` streams any
+SELECT as Arrow batches the same way.
+
 ## Notebook facade (`%catalog` / `%ingest`)
 
 For interactive use in JupyterLab, `eea_datalakehouse.notebook` registers two line magics
@@ -447,6 +513,10 @@ context itself — raises `CatalogSessionError` if none is set yet:
 | `dds_documents/controller.py` | `DdsController` / `DdsFolder` — push files to a catalog node's DDS document folders (metadata, deliverables, ...) |
 | `dds_documents/paths.py` | catalog (`a.b.c`) ⇄ storage (`a/b/c`) path conversion |
 | `dds_documents/session.py` | `DdsSession` — what `%dds` dispatches onto |
+| `geopackage/controller.py` | `GpkgController` — Dremio tables/views to a GeoPackage, streamed over parallel Flight channels |
+| `geopackage/spatial.py` | spatial-or-tabular detection, geometry decoding, CRS lookup and reprojection |
+| `geopackage/writer.py` | `GeoPackageWriter` — the `.gpkg` file itself, with `sqlite3`, bulk-loaded |
+| `geopackage/session.py` | `GpkgSession` — what `%gpkg` dispatches onto |
 | `sdi/controller.py` | `SdiController` — `get_xml()`, `resolve_series()` |
 | `sdi/catalogue.py` | `SdiCatalogue` — read-only GeoNetwork REST client |
 | `sdi/session.py` | `SdiSession` — what `%sdi` dispatches onto |
@@ -535,7 +605,7 @@ To pin to one specific release instead, use the exact tag the live badges under
 %pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.33"
 
 # staging's latest release (early access)
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.33-staging"
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.34-staging"
 ```
 
 Use the `%pip` magic rather than `!pip` — it installs into the kernel the
