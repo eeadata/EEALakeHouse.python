@@ -37,6 +37,8 @@ from .client import DocumentsClient
 from .paths import path_segments, to_storage_path
 
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
+# Not in every platform's MIME table; %gpkg export's files are pushed here.
+mimetypes.add_type("application/geopackage+sqlite3", ".gpkg")
 _INVALID_NAME_CHARS = set('<>:"|?*')
 _GLOB_CHARS = set("*?[")
 
