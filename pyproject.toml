@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "EEADataLakehouse"
-version = "0.1.33"
+version = "0.1.34"
 description = "Data preparation and validation utilities for the EEA data lakehouse pipeline."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -50,6 +50,9 @@ Repository = "https://github.com/eeadata/EEALakeHouse.python"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"eea_datalakehouse.geopackage" = ["epsg_definitions.json"]  # CRS definitions for reprojection
+
 [tool.ruff]
 target-version = "py311"
 line-length = 100
@@ -64,7 +67,7 @@ strict = true
 warn_return_any = false
 
 [[tool.mypy.overrides]]
-module = ["respx.*", "pyarrow.*"]  # neither ships type stubs
+module = ["respx.*", "pyarrow.*", "shapely.*"]  # none ships type stubs
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
