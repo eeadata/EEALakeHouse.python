@@ -36,7 +36,7 @@ pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@staging"    
 ```
 
 # staging's latest release (early access) — pin to the tag the "staging" badge above shows
-pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.35-staging"
+pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.36-staging"
 ```
 
 ## Usage
@@ -305,11 +305,15 @@ endpoints (`dds_documents/client.py`) are still assumptions to confirm with the 
 
 ## Notebook magics for SDI and DDS (`%sdi` / `%dds`)
 
-`%sdi` (`SdiSession`) reads SDI and `%dds` (`DdsSession`) pushes files to DDS. Both are built
-on first use from the kernel environment like `%catalog`'s and `%ingest`'s sessions. `%dds
-push` puts files in a folder of the dataset `%catalog use(...)` last selected; `path=` picks
-another one, absolute or relative to that context, as any `%catalog` path. The folder names
-can be typed bare on a `%dds` line (worked example: `debugger/sdi_session_example.ipynb`):
+`%sdi` (`SdiSession`) reads SDI and `%dds` (`DdsSession`) pushes files to DDS, lists them and
+gets them back. Both are built on first use from the kernel environment like `%catalog`'s and
+`%ingest`'s sessions. `%dds push` puts files in a folder of the dataset `%catalog use(...)` last
+selected, `%dds list` shows the file names already in one, and `%dds get` downloads one of them
+into the notebook's folder (`output_dir=` for another; a missing file is an error). `path=`
+picks another dataset, absolute or relative to that context, as any `%catalog` path. The folder
+is compulsory and is one of DDS's eight document folders, typed bare on a `%dds` line; a
+misspelt, quoted or missing folder is an error that lists the valid ones (worked example:
+`debugger/sdi_session_example.ipynb`):
 
 ```python
 import eea_datalakehouse.notebook   # registers %catalog/%ingest/%sdi/%dds
@@ -318,6 +322,9 @@ import eea_datalakehouse.notebook   # registers %catalog/%ingest/%sdi/%dds
 %dds push(DELIVERABLES, "report.pdf", "annex/*.xlsx")
 record = %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
 %dds push(METADATA, record, overwrite=False)
+%dds list(DELIVERABLES)        # report.pdf and the annexes, sorted
+%dds list(DELIVERABLES, "*.pdf")   # filter: a wildcard, ".xlsx", "report", or a list of them
+f = %dds get(DELIVERABLES, "report.pdf")   # -> ./report.pdf; f is the local file
 %dds target(ASSESSMENTS)       # where a push would go
 %dds help
 ```
@@ -510,7 +517,7 @@ context itself — raises `CatalogSessionError` if none is set yet:
 | `dds_ingestion/progress.py` | tqdm progress bar with graceful fallback |
 | `dds_ingestion/folder.py` | `FolderIngest` orchestration (scan/parallel/resume) |
 | `dds_documents/client.py` | `DocumentsClient` — put/get/list plain files in DDS folders (no ingest) |
-| `dds_documents/controller.py` | `DdsController` / `DdsFolder` — push files to a catalog node's DDS document folders (metadata, deliverables, ...) |
+| `dds_documents/controller.py` | `DdsController` / `DdsFolder` — push, list and get files in a catalog node's DDS document folders (metadata, deliverables, ...) |
 | `dds_documents/paths.py` | catalog (`a.b.c`) ⇄ storage (`a/b/c`) path conversion |
 | `dds_documents/session.py` | `DdsSession` — what `%dds` dispatches onto |
 | `geopackage/controller.py` | `GpkgController` — Dremio tables/views to a GeoPackage, streamed over parallel Flight channels |
@@ -605,7 +612,7 @@ To pin to one specific release instead, use the exact tag the live badges under
 %pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.35"
 
 # staging's latest release (early access)
-%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.35-staging"
+%pip install "git+https://github.com/eeadata/EEALakeHouse.python.git@v0.1.36-staging"
 ```
 
 Use the `%pip` magic rather than `!pip` — it installs into the kernel the
