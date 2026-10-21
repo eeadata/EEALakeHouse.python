@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from eea_datalakehouse.catalog.session import CatalogCommitError
+from eea_datalakehouse.dds_documents import DdsSession
 from eea_datalakehouse.dds_ingestion.session import IngestSession
 from eea_datalakehouse.notebook import magics as magics_module
 from eea_datalakehouse.notebook.magics import EEALakehouseMagics
@@ -467,6 +468,20 @@ class _FakeDdsSession:
             f"{target}/x", (f"{target}/x/a.pdf", f"{target}/x/b.pdf"), overwrite
         )
 
+    def list(self, folder: object, pattern: object = None, path: str | None = None) -> object:
+        target = self._resolve_path(path)
+        self.calls.append((folder, (), target, True))
+        matching = f" matching {pattern}" if pattern else ""
+        return f"listed {folder}{matching} in {target}"
+
+    def get(self, folder: object, filename: str, path: str | None = None) -> object:
+        target = self._resolve_path(path)
+        self.calls.append((folder, (filename,), target, True))
+        return f"got {filename} from {target}/{folder}"
+
+    def target(self, folder: object, path: str | None = None) -> object:
+        return f"{self._resolve_path(path)}/{folder}"
+
 
 def test_dds_pushes_to_the_catalog_context_with_bare_folder_names(
     ip: Any, monkeypatch: pytest.MonkeyPatch
@@ -509,6 +524,113 @@ def test_dds_folder_names_win_over_notebook_variables(
         magics_module.DdsFolder.METADATA,
         magics_module.DdsFolder.OTHERS,
     ]
+
+
+def test_dds_list_shows_the_catalog_context_folder(
+    ip: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(magics_module, "_build_dds_session", _FakeDdsSession)
+    _magics_instance(ip)._pending_context = "catalog.water.bwd"
+
+    assert ip.run_line_magic("dds", "list(DELIVERABLES)") == (
+        "listed deliverables in catalog.water.bwd"
+    )
+    assert ip.run_line_magic("dds", 'list(METADATA, path="catalog.air")') == (
+        "listed metadata in catalog.air"
+    )
+    assert ip.run_line_magic("dds", 'list(DELIVERABLES, ["*.pdf", ".docx"])') == (
+        "listed deliverables matching ['*.pdf', '.docx'] in catalog.water.bwd"
+    )
+
+
+_VALID_FOLDERS = (
+    "valid folders are DERIVED, METADATA, METHODOLOGY, ASSESSMENTS, ANALYSES, REFERENCES, "
+    "DELIVERABLES, OTHERS"
+)
+
+
+@pytest.mark.parametrize(
+    ("line", "message"),
+    [
+        (
+            'push(DELIVERABLE, "a.pdf")',
+            "DELIVERABLE is not a DDS folder (did you mean DELIVERABLES?); ",
+        ),
+        ("list(deliverables)", "deliverables is not a DDS folder (did you mean DELIVERABLES?); "),
+        ("target(REPORTS)", "REPORTS is not a DDS folder; "),
+        ("list(DdsFolder.REPORTS)", "REPORTS is not a DDS folder; "),
+        (
+            'push(folder=Metadata, files="a")',
+            "Metadata is not a DDS folder (did you mean METADATA?); ",
+        ),
+        ("list()", "list needs a folder first, e.g. list(DELIVERABLES); "),
+        ("get()", 'get needs a folder first, e.g. get(DELIVERABLES, "report.pdf"); '),
+        (
+            'get(Deliverables, "a.pdf")',
+            "Deliverables is not a DDS folder (did you mean DELIVERABLES?); ",
+        ),
+        ("list", "list needs a folder first"),
+        ('push(path="catalog.x")', "push needs a folder first"),
+    ],
+)
+def test_dds_a_wrong_or_missing_folder_lists_the_valid_ones(
+    ip: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    line: str,
+    message: str,
+) -> None:
+    monkeypatch.setattr(magics_module, "_build_dds_session", _FakeDdsSession)
+    _magics_instance(ip)._pending_context = "catalog.water.bwd"
+
+    assert ip.run_line_magic("dds", line) is None
+
+    out = capsys.readouterr().out.strip()
+    assert out.startswith(f"dds error: {message}")
+    assert out.endswith(_VALID_FOLDERS)
+    session = _magics_instance(ip)._dds_session
+    assert session is None or session.calls == []
+
+
+def test_dds_get_downloads_from_the_catalog_context_folder(
+    ip: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(magics_module, "_build_dds_session", _FakeDdsSession)
+    _magics_instance(ip)._pending_context = "catalog.water.bwd"
+
+    assert ip.run_line_magic("dds", 'get(DELIVERABLES, "report.pdf")') == (
+        "got report.pdf from catalog.water.bwd/deliverables"
+    )
+    assert ip.run_line_magic("dds", 'get(METADATA, "a.xml", path="catalog.air")') == (
+        "got a.xml from catalog.air/metadata"
+    )
+
+
+def test_dds_get_without_a_filename_shows_the_usage(
+    ip: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        magics_module,
+        "_build_dds_session",
+        lambda resolve: DdsSession(resolve_path=resolve, env={}, dotenv_path="/nonexistent/.env"),
+    )
+    _magics_instance(ip)._pending_context = "catalog.water.bwd"
+
+    assert ip.run_line_magic("dds", "get(DELIVERABLES)") is None
+
+    out = capsys.readouterr().out
+    assert "dds error:" in out and "filename" in out
+    assert "get(folder, filename, path=None, output_dir=None, overwrite=True)" in out
+
+
+def test_dds_an_undefined_file_variable_keeps_its_name_error(
+    ip: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(magics_module, "_build_dds_session", _FakeDdsSession)
+    _magics_instance(ip)._pending_context = "catalog.water.bwd"
+
+    with pytest.raises(NameError, match="no_such_record"):
+        ip.run_line_magic("dds", "push(METADATA, no_such_record)")
 
 
 def test_context_target_resolves_path_like_catalog(
@@ -577,8 +699,12 @@ def test_dds_help_lists_methods_without_building_a_session(
         assert any(option in line or option.strip('"') in line for line in examples), option
     assert all(line.count("(") == line.count(")") for line in examples)  # each fits on one line
     table_html = displayed[0].data
-    for name in ("push", "target", "folders", "dds_base_url"):
+    for name in ("push", "list", "get", "target", "folders", "dds_base_url"):
         assert f">{name}<" in table_html
+    assert "%dds list(DELIVERABLES)" in out
+    assert '%dds get(DELIVERABLES, "report.pdf")' in out
+    for example in ('"*.pdf"', '".xlsx"', '"report"', '["*.pdf", "*.docx"]'):
+        assert f"%dds list(DELIVERABLES, {example}" in out
     assert "folder, files..., path=None, overwrite=True, target_name=&#x27;&#x27;" in table_html
     assert "DERIVED, METADATA, METHODOLOGY, ASSESSMENTS, ANALYSES" in table_html
     assert _magics_instance(ip)._dds_session is None
