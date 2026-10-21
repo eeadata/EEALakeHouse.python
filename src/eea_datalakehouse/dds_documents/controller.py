@@ -2,17 +2,26 @@
 
 Every catalog node in DDS (``catalog/water/bwd``) shows a set of document
 folders for files that are not data — metadata records, methodology,
-assessments, deliverables, ... They are not Dremio entities. The target
-folder is always one of :class:`DdsFolder`, DDS's eight built-in folders;
-free-text folder names are refused.
-:class:`DdsController` uploads files there with ``PUT``, one request per file::
+assessments, deliverables, ... They are not Dremio entities. The folder is
+always one of :class:`DdsFolder`, DDS's eight built-in folders; free-text
+folder names are refused, and the error names the valid ones.
+:class:`DdsController` uploads files there with ``PUT``, one request per file,
+lists what a folder holds and fetches a file back::
 
     with DdsController.from_env() as dds:
         dds.push("catalog.water.bwd", DdsFolder.DELIVERABLES, ["report.pdf", "annex.xlsx"])
         # -> catalog/water/bwd/deliverables/report.pdf, .../annex.xlsx
+        dds.list("catalog.water.bwd", DdsFolder.DELIVERABLES)
+        # -> 2 file(s) in catalog/water/bwd/deliverables: annex.xlsx, report.pdf
+        dds.list("catalog.water.bwd", DdsFolder.DELIVERABLES, "*.pdf")
+        # -> 1 file(s) matching '*.pdf' in catalog/water/bwd/deliverables: report.pdf
+        dds.get("catalog.water.bwd", DdsFolder.DELIVERABLES, "report.pdf")
+        # -> DdsFile(name='report.pdf', data=<... bytes>)
 
 =================================  ==============================================
 :meth:`DdsController.push`         upload files to ``{dds_path}/{folder}/{name}``
+:meth:`DdsController.list`         the names of the files in ``{dds_path}/{folder}``
+:meth:`DdsController.get`          one file of ``{dds_path}/{folder}``, as a :class:`DdsFile`
 :meth:`DdsController.target`       the folder they would go to, without uploading
 =================================  ==============================================
 
@@ -22,11 +31,12 @@ calls the ingest API: nothing pushed here becomes a Dremio table.
 
 from __future__ import annotations
 
+import fnmatch
 import glob
 import mimetypes
 import os
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -55,20 +65,40 @@ class DdsFolder(StrEnum):
     DELIVERABLES = "deliverables"
     OTHERS = "others"
 
+    @classmethod
+    def _missing_(cls, value: object) -> DdsFolder:
+        # DdsFolder("deliverable"): say which values exist, not just that this one doesn't.
+        raise ValueError(f"{value!r} is not a DDS folder; {valid_folders_hint()}")
+
+
+def valid_folders_hint() -> str:
+    """The clause every folder error carries: which values are valid."""
+    return "valid folders are " + ", ".join(member.name for member in DdsFolder)
+
+
+def closest_folder(text: str) -> DdsFolder | None:
+    """The :class:`DdsFolder` ``text`` most likely meant (any case, singular or
+    plural, a leading/trailing slash), or ``None``."""
+    key = text.strip().strip("/").lower()
+    for member in DdsFolder:
+        if key in (member.value, member.value.removesuffix("s")):
+            return member
+    return None
+
 
 def folder_name(value: DdsFolder) -> str:
     """``value``'s folder name in DDS. ``value`` must be a :class:`DdsFolder`:
-    the target folder is always one of the enumeration, never free text."""
+    the folder is always one of the enumeration, never free text. The
+    ``TypeError`` otherwise lists the valid values."""
     if isinstance(value, DdsFolder):
         return value.value
-    names = ", ".join(member.name for member in DdsFolder)
     hint = ""
     if isinstance(value, str):
-        match = next((m for m in DdsFolder if m.value == value.strip().strip("/").lower()), None)
-        hint = f" — write {match.name}, without quotes" if match else ""
+        match = closest_folder(value)
+        hint = f" (did you mean {match.name}, without quotes?)" if match else ""
     raise TypeError(
-        f"folder must be one of the DdsFolder values {names}, "
-        f"not {type(value).__name__} {value!r}{hint}"
+        f"folder must be a DdsFolder, not {type(value).__name__} {value!r}{hint}; "
+        f"{valid_folders_hint()}"
     )
 
 
@@ -82,6 +112,74 @@ class DdsFile:
 
     def __repr__(self) -> str:
         return f"DdsFile(name={self.name!r}, data=<{len(self.data)} bytes>)"
+
+
+@dataclass(frozen=True)
+class DdsListing:
+    """The files :meth:`DdsController.list` found in one folder, sorted by name.
+
+    ``patterns`` are the filters the names matched (empty: no filter).
+    Iterates, indexes and ``in``-tests like the tuple of names it holds.
+    """
+
+    target: str
+    names: tuple[str, ...]
+    patterns: tuple[str, ...] = ()
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.names)
+
+    def __len__(self) -> int:
+        return len(self.names)
+
+    def __getitem__(self, index: int) -> str:
+        return self.names[index]
+
+    def __contains__(self, name: object) -> bool:
+        return name in self.names
+
+    def __repr__(self) -> str:
+        matching = f" matching {' or '.join(map(repr, self.patterns))}" if self.patterns else ""
+        if not self.names:
+            return f"no files{matching} in {self.target}"
+        lines = "".join(f"\n  {name}" for name in self.names)
+        return f"{len(self.names)} file(s){matching} in {self.target}:{lines}"
+
+
+def name_patterns(pattern: str | Iterable[str] | None) -> tuple[str, ...]:
+    """``pattern`` (see :meth:`DdsController.list`) as a tuple of non-empty patterns."""
+    if pattern is None:
+        return ()
+    items = [pattern] if isinstance(pattern, str) else list(pattern)
+    for item in items:
+        if not isinstance(item, str):
+            raise TypeError(f"pattern must be a str or a list of str, not {type(item).__name__}")
+    return tuple(dict.fromkeys(item.strip() for item in items if item.strip()))
+
+
+def matches(name: str, patterns: tuple[str, ...]) -> bool:
+    """Whether ``name`` matches any of ``patterns``, ignoring case (no patterns: all do).
+
+    - with ``*``, ``?`` or ``[...]`` it is a wildcard, matched against the
+      whole name and against the part after the last ``/``;
+    - starting with ``.`` it is an extension (``.pdf``, ``.tar.gz``);
+    - anything else is text the name contains (``report``).
+    """
+    if not patterns:
+        return True
+    lowered = name.lower()
+    base = lowered.rsplit("/", 1)[-1]
+    for pattern in patterns:
+        wanted = pattern.lower()
+        if _GLOB_CHARS & set(wanted):
+            if fnmatch.fnmatchcase(lowered, wanted) or fnmatch.fnmatchcase(base, wanted):
+                return True
+        elif wanted.startswith("."):
+            if base.endswith(wanted):
+                return True
+        elif wanted in lowered:
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -116,6 +214,14 @@ class DdsFilesExistError(DdsPushError):
             "already in DDS: " + ", ".join(self.existing) + "; pass overwrite=True to replace "
             "them. Nothing was uploaded."
         )
+
+
+class DdsFileNotFoundError(LookupError):
+    """:meth:`DdsController.get` asked for a file the folder does not have."""
+
+    def __init__(self, path: str, target: str) -> None:
+        self.path = path
+        super().__init__(f"no file {path.removeprefix(target + '/')!r} in {target}")
 
 
 class DdsController:
@@ -229,6 +335,53 @@ class DdsController:
             uploaded.append(path)
         return PushReport(target, tuple(uploaded), overwrite)
 
+    def list(
+        self,
+        dds_path: str,
+        folder: DdsFolder,
+        pattern: str | Iterable[str] | None = None,
+    ) -> DdsListing:
+        """The names of the files in ``{dds_path}/{folder}``, sorted.
+
+        ``dds_path`` and ``folder`` are checked as for :meth:`push`. A file in
+        a subfolder is named by its path below ``folder`` (``annex/a.pdf``).
+        A folder DDS has nothing in — or does not have yet — lists empty.
+
+        ``pattern`` keeps only the names that match it, ignoring case; a list
+        of them keeps a name matching any (see :func:`matches`):
+        ``"*.pdf"`` / ``"report_202?.*"`` / ``"[ab]*"`` are wildcards,
+        ``".xlsx"`` an extension, ``"report"`` text in the name.
+        """
+        patterns = name_patterns(pattern)
+        target = self.target(dds_path, folder)
+        prefix = f"{target}/"
+        names = set()
+        for path in self._documents_client().list(target):
+            cleaned = path.strip().strip("/")
+            name = cleaned[len(prefix) :] if cleaned.startswith(prefix) else cleaned
+            if name and name != target and matches(name, patterns):
+                names.add(name)
+        return DdsListing(target, tuple(sorted(names)), patterns)
+
+    def get(self, dds_path: str, folder: DdsFolder, filename: str) -> DdsFile:
+        """The file ``filename`` of ``{dds_path}/{folder}``, with its bytes.
+
+        ``dds_path`` and ``folder`` are checked as for :meth:`push`.
+        ``filename`` is a name :meth:`list` shows — a file in a subfolder is
+        ``annex/a.xlsx``. The :class:`DdsFile` is named after the file itself
+        (``a.xlsx``), so it can be pushed on as it is. A file DDS does not have
+        raises :class:`DdsFileNotFoundError`.
+        """
+        target = self.target(dds_path, folder)
+        relative = require_relative_name(filename)
+        path = f"{target}/{relative}"
+        documents = self._documents_client()
+        data = documents.get(path)
+        if data is None:
+            raise DdsFileNotFoundError(path, target)
+        name = relative.rsplit("/", 1)[-1]
+        return DdsFile(name, data, mimetypes.guess_type(name)[0] or DEFAULT_CONTENT_TYPE)
+
     # -- internals --------------------------------------------------------
 
     def _documents_client(self) -> DocumentsClient:
@@ -339,6 +492,18 @@ def _read_path(path: Path) -> DdsFile:
     if not path.is_file():
         raise ValueError(f"no such file: {str(path)!r}")
     return DdsFile(require_file_name(path.name), path.read_bytes())
+
+
+def require_relative_name(name: str) -> str:
+    """``name`` as a file name, or a path of file names below a folder
+    (``annex/a.xlsx``): every ``/``-separated part must be a valid file name
+    (see :func:`require_file_name`)."""
+    if not isinstance(name, str):
+        raise TypeError(f"file name must be a str, not {type(name).__name__}")
+    cleaned = name.strip().strip("/")
+    if not cleaned:
+        raise ValueError("file name must not be empty")
+    return "/".join(require_file_name(part) for part in cleaned.split("/"))
 
 
 def require_file_name(name: str) -> str:
