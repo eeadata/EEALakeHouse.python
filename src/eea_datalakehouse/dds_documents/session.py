@@ -3,13 +3,17 @@
     dds = DdsSession(resolve_path=...)      # %dds — writes files to DDS
     dds.push(METADATA, "bwd_2025.xml")
     dds.push(DELIVERABLES, "report.pdf", "annex/*.xlsx", overwrite=False)
+    dds.list(DELIVERABLES)                  # the file names already there
+    dds.list(DELIVERABLES, "*.pdf")         # only some of them
+    dds.get(DELIVERABLES, "report.pdf")     # saved into the notebook's folder
 
 - **The target path is the `%catalog` context.** `push(folder, *files)` puts
-  the files in `{context}/{folder}/` — the dataset folder `%catalog use(...)`
-  last set. `path=` picks another one, absolute or relative to the context,
-  exactly as `%catalog` resolves paths. The resolution is the ``resolve_path``
-  callable the magic hands in; without one, `path=` is required and taken as
-  given.
+  the files in `{context}/{folder}/`, `list(folder)` shows the files there
+  and `get(folder, filename)` downloads one — the dataset folder
+  `%catalog use(...)` last set. `path=` picks
+  another one, absolute or relative to the context, exactly as `%catalog`
+  resolves paths. The resolution is the ``resolve_path`` callable the magic
+  hands in; without one, `path=` is required and taken as given.
 - **Every failure is a `DdsSessionError`**, so the magic can print it as one
   short line instead of a traceback (the original error is ``__cause__``).
 
@@ -28,8 +32,10 @@ which URL is in use and where it came from.
 
 from __future__ import annotations
 
+import builtins
 import os
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +50,17 @@ from ..dds_ingestion.credentials import (
 )
 from ..session_utils import check_arg_types, find_dotenv, friendly_errors, read_dotenv_value
 from .client import DocumentsApiError, DocumentsClient
-from .controller import DdsController, DdsFolder, DdsPushError, PushReport, folder_name
+from .controller import (
+    DdsController,
+    DdsFileNotFoundError,
+    DdsFolder,
+    DdsListing,
+    DdsPushError,
+    PushReport,
+    folder_name,
+    name_patterns,
+    require_relative_name,
+)
 
 # What `%catalog` reads (see notebook/magics.py's _build_catalog_session).
 ENV_CATALOG_USER = "DREMIO_USERNAME"
@@ -53,6 +69,7 @@ ENV_CATALOG_TOKEN = "DREMIO_TOKEN"  # noqa: S105 — env var name, not a secret 
 # Failures a notebook user can act on; anything else is a bug and keeps its traceback.
 _EXPECTED = (
     DdsPushError,
+    DdsFileNotFoundError,
     DocumentsApiError,
     MissingCredentialsError,
     ValueError,
@@ -60,6 +77,37 @@ _EXPECTED = (
     OSError,
     httpx.HTTPError,
 )
+
+
+@dataclass(frozen=True)
+class DdsDownload:
+    """A file `DdsSession.get` saved: where it came from in DDS and where it is now.
+
+    It is the local file (``os.PathLike``), so ``open(download)``,
+    ``pd.read_csv(download)`` or ``%dds push(..., download)`` take it as is.
+    """
+
+    path: Path
+    source: str
+    size: int
+    content_type: str
+
+    def __fspath__(self) -> str:
+        return os.fspath(self.path)
+
+    def __repr__(self) -> str:
+        return f"got {self.source} ({_size_text(self.size)}) -> {self.path}"
+
+
+def _size_text(size: int) -> str:
+    if size < 1024:
+        return f"{size} bytes"
+    value = size / 1024
+    for unit in ("KB", "MB"):
+        if value < 1024:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
 
 
 class DdsSessionError(RuntimeError):
@@ -83,7 +131,7 @@ def load_dds_creds(env: Mapping[str, str] | None = None) -> DremioCreds:
 
 
 class DdsSession:
-    """`push` / `target` / `folders` / `dds_base_url` for a notebook — what
+    """`push` / `list` / `get` / `target` / `folders` / `dds_base_url` for a notebook — what
     `%dds` dispatches onto.
 
     ``resolve_path(path)`` turns the ``path`` argument into the dataset's
@@ -151,14 +199,88 @@ class DdsSession:
         )
 
     @_friendly
+    def list(
+        self,
+        folder: DdsFolder,
+        pattern: str | builtins.list[str] | tuple[str, ...] | None = None,
+        path: str | None = None,
+    ) -> DdsListing:
+        """The names of the files in `{path}/{folder}/` in DDS, sorted; `path`
+        defaults to the `%catalog` context. `folder` is compulsory.
+
+        `pattern` keeps only the names that match it, ignoring case: a
+        wildcard (`"*.pdf"`, `"report_202?.*"`, `"[ab]*"`), an extension
+        (`".xlsx"`) or text in the name (`"report"`). A list keeps the names
+        matching any of them (`["*.pdf", "*.docx"]`)."""
+        folder_name(folder)
+        check_arg_types(
+            "list",
+            ("folder", folder, DdsFolder, False),
+            ("pattern", pattern, (str, builtins.list, tuple), True),
+            ("path", path, str, True),
+        )
+        name_patterns(pattern)  # a list of anything but str: no settings needed to say so
+        dds_path = self._dds_path(path)
+        DdsController.target(dds_path, folder)  # bad folder or path: no settings needed
+        return self._dds().list(dds_path, folder, pattern)
+
+    @_friendly
+    def get(
+        self,
+        folder: DdsFolder,
+        filename: str,
+        path: str | None = None,
+        output_dir: str | None = None,
+        overwrite: bool = True,
+    ) -> DdsDownload:
+        """Download `filename` from `{path}/{folder}/` in DDS into `output_dir`
+        (default: the notebook's folder) and return the local file; `path`
+        defaults to the `%catalog` context. `folder` and `filename` are
+        compulsory. A file DDS does not have at `{path}/{folder}/filename` is an
+        error. `overwrite=False` refuses to replace a local file of that
+        name (checked before downloading)."""
+        folder_name(folder)
+        check_arg_types(
+            "get",
+            ("folder", folder, DdsFolder, False),
+            ("filename", filename, str, False),
+            ("path", path, str, True),
+            ("output_dir", output_dir, str, True),
+            ("overwrite", overwrite, bool, False),
+        )
+        dds_path = self._dds_path(path)
+        target = DdsController.target(dds_path, folder)  # bad folder or path: no settings needed
+        relative = require_relative_name(filename)
+        local = (Path(output_dir).expanduser() if output_dir else Path.cwd()) / relative.rsplit(
+            "/", 1
+        )[-1]
+        if local.is_dir():
+            raise ValueError(f"{str(local)!r} is a folder; pass output_dir= to save elsewhere")
+        if local.exists() and not overwrite:
+            raise FileExistsError(
+                f"{str(local)!r} already exists; pass overwrite=True to replace it, "
+                "or output_dir= to save elsewhere"
+            )
+        got = self._dds().get(dds_path, folder, relative)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(got.data)
+        return DdsDownload(
+            local.resolve(),
+            f"{target}/{relative}",
+            len(got.data),
+            got.content_type or "application/octet-stream",
+        )
+
+    @_friendly
     def target(self, folder: DdsFolder, path: str | None = None) -> str:
         """The DDS folder `push` would upload to, without uploading anything."""
         folder_name(folder)
         check_arg_types("target", ("folder", folder, DdsFolder, False), ("path", path, str, True))
         return DdsController.target(self._dds_path(path), folder)
 
-    def folders(self) -> list[str]:
-        """The folders `push` accepts — the `DdsFolder` values, typed bare on a `%dds` line."""
+    def folders(self) -> builtins.list[str]:
+        """The folders `push` and `list` accept — the `DdsFolder` values, typed
+        bare on a `%dds` line."""
         return [member.name for member in DdsFolder]
 
     @_friendly

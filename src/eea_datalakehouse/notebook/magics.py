@@ -103,7 +103,7 @@ from IPython.display import HTML, display
 
 from ..catalog import Catalog
 from ..catalog.session import CatalogSession, CatalogSessionError
-from ..dds_documents.controller import DdsFolder, PushReport
+from ..dds_documents.controller import DdsFolder, PushReport, closest_folder, valid_folders_hint
 from ..dds_documents.session import DdsSession, DdsSessionError
 from ..dds_ingestion.session import IngestSession, IngestSessionError
 from ..geopackage.session import GpkgSession, GpkgSessionError
@@ -126,7 +126,8 @@ _USAGE = {
     ),
     "dds": (
         '%dds push(DELIVERABLES, "report.pdf")  |  %dds push(METADATA, "a.xml", "b.xml")'
-        "  (into the %catalog use(...) folder)"
+        '  |  %dds list(DELIVERABLES)  |  %dds get(DELIVERABLES, "report.pdf")'
+        "  (in the %catalog use(...) folder)"
     ),
 }
 
@@ -348,8 +349,27 @@ _DDS_HELP = [
         "overwrite=True (default) replaces a file "
         "already there; overwrite=False uploads nothing if any is.",
     ),
+    (
+        "list",
+        "Show the names of the files in path/folder/ in DDS, sorted. folder is compulsory, "
+        "as for push; path defaults to the %catalog use(...) context. pattern (optional) keeps "
+        'only the names that match it, ignoring case: a wildcard ("*.pdf", "report_202?.*", '
+        '"[ab]*"), an extension (".xlsx") or text in the name ("report"); a list keeps the '
+        'names matching any (["*.pdf", "*.docx"]). The result iterates '
+        'like a list of names, so `"report.pdf" in %dds list(DELIVERABLES)` works.',
+    ),
+    (
+        "get",
+        "Download one file from path/folder/ in DDS and return the local file. folder and "
+        'filename are compulsory (filename as list shows it, e.g. "annex/a.xlsx" for a '
+        "subfolder); path defaults to the %catalog use(...) context. The file is saved in "
+        "output_dir (default: the notebook's folder) under its own name; overwrite=True "
+        "(default) replaces a local file of that name, overwrite=False refuses. A file DDS does "
+        "not have there is an error. The result is the local path, "
+        "so open(f), pd.read_csv(f) or %dds push(OTHERS, f) take it as is.",
+    ),
     ("target", "Show the DDS folder push would upload to, without uploading anything."),
-    ("folders", "List the folders push accepts."),
+    ("folders", "List the folders push, list and get accept."),
     ("dds_base_url", "Show the DDS URL push uses, and where it came from."),
 ]
 _DDS_HELP_NOTE = (
@@ -390,6 +410,25 @@ _DDS_HELP_NOTE = (
     "  check first, without uploading:  %dds target(DELIVERABLES)  or  "
     '%dds target(DELIVERABLES, path="../wfd")\n'
     "\n"
+    "list examples — folder is compulsory, path= as for push:\n"
+    "    %dds list(DELIVERABLES)\n"
+    '    %dds list(METADATA, path="../wfd")\n'
+    "    names = %dds list(ASSESSMENTS)\n"
+    "  pattern — optional, ignores case; a wildcard, an extension, text in the name, or a list:\n"
+    '    %dds list(DELIVERABLES, "*.pdf")\n'
+    '    %dds list(DELIVERABLES, ".xlsx")\n'
+    '    %dds list(DELIVERABLES, "report")\n'
+    '    %dds list(DELIVERABLES, "report_202?.*")\n'
+    '    %dds list(DELIVERABLES, ["*.pdf", "*.docx"], path="../wfd")\n'
+    "\n"
+    "get examples — folder and filename are compulsory, path= as for push:\n"
+    '    %dds get(DELIVERABLES, "report.pdf")              # -> ./report.pdf\n'
+    '    f = %dds get(METADATA, "bwd.xml", path="../wfd", output_dir="downloads")\n'
+    '    %dds get(DELIVERABLES, "annex/a.xlsx", overwrite=False)\n'
+    "\n"
+    'A folder that is not one of the eight (DELIVERABLE, "deliverables", left out) is an '
+    "error that lists the valid ones.\n"
+    "\n"
     "Environment: DDS_BASE_URL — read from the first .env found in the notebook's folder or "
     "a parent when %dds starts, else from the kernel environment — and a Dremio identity: "
     "_DREMIO_USER/_DREMIO_PWD (as %ingest) or DREMIO_USERNAME/DREMIO_TOKEN (as %catalog)."
@@ -401,6 +440,71 @@ _DDS_NAMESPACE: dict[str, Any] = {
     "DdsFolder": DdsFolder,
     **{member.name: member for member in DdsFolder},
 }
+
+
+# %dds methods whose first argument is the compulsory DdsFolder.
+_DDS_FOLDER_METHODS = {
+    "push": 'push(DELIVERABLES, "report.pdf")',
+    "list": "list(DELIVERABLES)",
+    "get": 'get(DELIVERABLES, "report.pdf")',
+    "target": "target(DELIVERABLES)",
+}
+
+
+def _dds_folder_call(line: str) -> tuple[str, ast.expr | None] | None:
+    """``(method, folder argument)`` if ``line`` calls a %dds method that takes a
+    folder (the argument is ``None`` when it is left out), else ``None``."""
+    text = line.strip()
+    if text.isidentifier():
+        text = f"{text}()"
+    try:
+        call = ast.parse(text, mode="eval").body
+    except SyntaxError:
+        return None  # _dispatch explains it
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id in _DDS_FOLDER_METHODS
+    ):
+        return None
+    folder = next((kw.value for kw in call.keywords if kw.arg == "folder"), None)
+    if folder is None and call.args and not isinstance(call.args[0], ast.Starred):
+        folder = call.args[0]
+    return call.func.id, folder
+
+
+def _dds_missing_folder(line: str) -> str | None:
+    """The error for a %dds call that leaves out its compulsory folder, else ``None``."""
+    found = _dds_folder_call(line)
+    if found is None or found[1] is not None:
+        return None
+    example = _DDS_FOLDER_METHODS[found[0]]
+    return f"{found[0]} needs a folder first, e.g. {example}; {valid_folders_hint()}"
+
+
+def _dds_unknown_folder(line: str, exc: NameError | AttributeError) -> str | None:
+    """The error for a %dds folder that names no DdsFolder member —
+    ``push(DELIVERABLE, ...)`` or ``push(DdsFolder.REPORTS, ...)`` — else
+    ``None`` (the undefined name is something other than the folder)."""
+    found = _dds_folder_call(line)
+    if found is None or found[1] is None:
+        return None
+    node = found[1]
+    if isinstance(exc, NameError) and isinstance(node, ast.Name) and node.id == exc.name:
+        typed = node.id
+    elif (
+        isinstance(exc, AttributeError)
+        and isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "DdsFolder"
+        and node.attr == exc.name
+    ):
+        typed = node.attr
+    else:
+        return None
+    match = closest_folder(typed)
+    hint = f" (did you mean {match.name}?)" if match else ""
+    return f"{typed} is not a DDS folder{hint}; {valid_folders_hint()}"
 
 
 _GPKG_HELP = [
@@ -966,22 +1070,35 @@ class EEALakehouseMagics(Magics):
 
             %dds push(DELIVERABLES, "report.pdf", "annex/*.xlsx")
             %dds push(METADATA, record, path="catalog.water.bwd", overwrite=False)
+            %dds list(DELIVERABLES)
+            %dds get(DELIVERABLES, "report.pdf")
             %dds target(ASSESSMENTS)
         """
         if _is_help(line):
             _print_help_table(DdsSession, _DDS_HELP, "dds", note=_DDS_HELP_NOTE)
             return None
+        missing = _dds_missing_folder(line)
+        if missing is not None:
+            print(f"dds error: {missing}")
+            return None
         if self._dds_session is None:
             # Looked up at push time, so a `use` run after %dds started still counts.
             self._dds_session = _build_dds_session(self._context_target)
-        result = _dispatch(
-            self._dds_session,
-            line,
-            self.shell.user_ns,
-            "dds",
-            DdsSessionError,
-            extra_ns=_DDS_NAMESPACE,
-        )
+        try:
+            result = _dispatch(
+                self._dds_session,
+                line,
+                self.shell.user_ns,
+                "dds",
+                DdsSessionError,
+                extra_ns=_DDS_NAMESPACE,
+            )
+        except (NameError, AttributeError) as exc:
+            unknown = _dds_unknown_folder(line, exc)
+            if unknown is None:
+                raise  # not the folder: an undefined notebook variable keeps its traceback
+            print(f"dds error: {unknown}")
+            return None
         if isinstance(result, PushReport):
             for dds_path in result.paths:
                 _notify_dds_pushed(self.shell, dds_path)
