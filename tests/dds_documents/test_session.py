@@ -18,7 +18,7 @@ from eea_datalakehouse.dds_documents.session import load_dds_creds
 from eea_datalakehouse.dds_ingestion.credentials import MissingCredentialsError
 from eea_datalakehouse.session_utils import find_dotenv, read_dotenv_value
 
-from .conftest import DATASET, DDS_URL, TARGET, file_url
+from .conftest import DATASET, DDS_URL, TARGET, file_url, list_url
 
 IDENTITY = {"_DREMIO_USER": "a", "_DREMIO_PWD": "pat-a"}
 ENV = {"DDS_BASE_URL": DDS_URL, **IDENTITY}
@@ -75,10 +75,84 @@ def test_root_context_is_refused_before_any_settings() -> None:
 
 @pytest.mark.parametrize("folder", ["metadata", "converted", 42])
 def test_a_folder_that_is_not_a_dds_folder_is_refused_before_any_settings(folder: object) -> None:
-    with pytest.raises(DdsSessionError, match="folder must be one of the DdsFolder values"):
-        _session(env={}).push(folder, REPORT)  # type: ignore[arg-type]
-    with pytest.raises(DdsSessionError, match="folder must be one of the DdsFolder values"):
-        _session(env={}).target(folder)  # type: ignore[arg-type]
+    calls = [
+        lambda session: session.push(folder, REPORT),
+        lambda session: session.list(folder),
+        lambda session: session.get(folder, "report.pdf"),
+        lambda session: session.target(folder),
+    ]
+    for call in calls:
+        with pytest.raises(DdsSessionError, match="folder must be a DdsFolder") as raised:
+            call(_session(env={}))
+        assert "valid folders are DERIVED, METADATA," in str(raised.value)
+        assert str(raised.value).endswith("DELIVERABLES, OTHERS")
+
+
+@respx.mock
+def test_list_shows_the_files_in_the_context_folder() -> None:
+    route = respx.get(list_url(TARGET)).mock(
+        return_value=httpx.Response(
+            200, json={"files": [{"path": f"{TARGET}/b.pdf"}, {"path": f"{TARGET}/a.pdf"}]}
+        )
+    )
+
+    listing = _session().list(DdsFolder.DELIVERABLES)
+
+    assert listing.names == ("a.pdf", "b.pdf")
+    request = route.calls.last.request
+    assert request.url.path == f"/api/v1/files/{TARGET}/"
+    assert request.headers["Authorization"] == "Bearer pat-a"
+
+
+@respx.mock
+def test_list_path_overrides_the_context() -> None:
+    route = respx.get(list_url("catalog/air/aq/metadata")).mock(
+        return_value=httpx.Response(200, json={"files": []})
+    )
+
+    _session().list(DdsFolder.METADATA, path="catalog.air.aq")
+
+    assert route.called
+
+
+@respx.mock
+def test_list_pattern_filters_the_names() -> None:
+    respx.get(list_url(TARGET)).mock(
+        return_value=httpx.Response(200, json=[f"{TARGET}/a.pdf", f"{TARGET}/b.docx"])
+    )
+    session = _session()
+
+    assert list(session.list(DdsFolder.DELIVERABLES, "*.PDF")) == ["a.pdf"]
+    assert list(session.list(DdsFolder.DELIVERABLES, [".pdf", ".docx"])) == ["a.pdf", "b.docx"]
+    assert list(session.list(DdsFolder.DELIVERABLES, pattern="b")) == ["b.docx"]
+
+
+@pytest.mark.parametrize(
+    ("pattern", "message"),
+    [(3, r"\(pattern\) must be str or list or tuple or None"), (["*.pdf", 3], "list of str")],
+)
+def test_a_bad_pattern_needs_no_settings(pattern: object, message: str) -> None:
+    with pytest.raises(DdsSessionError, match=message):
+        _session(env={}).list(DdsFolder.DELIVERABLES, pattern)  # type: ignore[arg-type]
+
+
+def test_list_without_a_context_or_with_a_bad_path_is_a_session_error() -> None:
+    with pytest.raises(DdsSessionError, match="no DDS target path"):
+        _session(None, env={}).list(DdsFolder.METADATA)
+    with pytest.raises(DdsSessionError, match="catalog root"):
+        _session("catalog", env={}).list(DdsFolder.METADATA)
+    with pytest.raises(DdsSessionError, match=r"\(path\) must be str"):
+        _session(env={}).list(DdsFolder.METADATA, path=3)  # type: ignore[arg-type]
+
+
+@respx.mock
+def test_list_server_error_is_a_session_error() -> None:
+    respx.get(list_url("catalog/water/bwd/metadata")).mock(
+        return_value=httpx.Response(500, text="down")
+    )
+
+    with pytest.raises(DdsSessionError, match="500"):
+        _session().list(DdsFolder.METADATA)
 
 
 def test_a_missing_file_is_a_session_error(tmp_path: Path) -> None:
@@ -321,3 +395,86 @@ def test_read_dotenv_value_last_assignment_wins(tmp_path: Path) -> None:
 
     assert read_dotenv_value(dotenv, "DDS_BASE_URL") == "two"
     assert read_dotenv_value(dotenv, "MISSING") is None
+
+
+# -- get ----------------------------------------------------------------------
+
+
+@respx.mock
+def test_get_saves_the_file_in_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    respx.get(file_url(f"{TARGET}/report.pdf")).mock(
+        return_value=httpx.Response(200, content=b"%PDF-1")
+    )
+
+    got = _session().get(DdsFolder.DELIVERABLES, "report.pdf")
+
+    assert got.path == tmp_path / "report.pdf"
+    assert (tmp_path / "report.pdf").read_bytes() == b"%PDF-1"
+    assert Path(got).read_bytes() == b"%PDF-1"  # os.PathLike: the local file
+    assert got.source == f"{TARGET}/report.pdf"
+    assert (got.size, got.content_type) == (6, "application/pdf")
+    assert repr(got) == f"got {TARGET}/report.pdf (6 bytes) -> {tmp_path / 'report.pdf'}"
+
+
+@respx.mock
+def test_get_path_and_output_dir(tmp_path: Path) -> None:
+    respx.get(file_url("catalog/air/aq/metadata/annex/aq.xml")).mock(
+        return_value=httpx.Response(200, content=b"<x/>" * 600)
+    )
+
+    got = _session().get(
+        DdsFolder.METADATA, "annex/aq.xml", path="catalog.air.aq", output_dir=str(tmp_path / "dl")
+    )
+
+    assert got.path == tmp_path / "dl" / "aq.xml"
+    assert got.path.read_bytes() == b"<x/>" * 600
+    assert "(2.3 KB)" in repr(got)
+
+
+@respx.mock
+def test_get_overwrite(tmp_path: Path) -> None:
+    respx.get(file_url(f"{TARGET}/report.pdf")).mock(
+        return_value=httpx.Response(200, content=b"new")
+    )
+    (tmp_path / "report.pdf").write_bytes(b"old")
+    session = _session()
+
+    with pytest.raises(DdsSessionError, match="already exists; pass overwrite=True"):
+        session.get(DdsFolder.DELIVERABLES, "report.pdf", output_dir=str(tmp_path), overwrite=False)
+    assert (tmp_path / "report.pdf").read_bytes() == b"old"
+
+    session.get(DdsFolder.DELIVERABLES, "report.pdf", output_dir=str(tmp_path))
+    assert (tmp_path / "report.pdf").read_bytes() == b"new"
+
+
+@respx.mock
+def test_get_a_missing_file_is_a_session_error(tmp_path: Path) -> None:
+    respx.get(file_url(f"{TARGET}/repot.pdf")).mock(return_value=httpx.Response(404))
+
+    with pytest.raises(DdsSessionError, match=f"^no file 'repot.pdf' in {TARGET}$"):
+        _session().get(DdsFolder.DELIVERABLES, "repot.pdf", output_dir=str(tmp_path))
+    assert not (tmp_path / "repot.pdf").exists()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"filename": 3}, r"\(filename\) must be str"),
+        ({"filename": "a/../b.pdf"}, "must not be a path"),
+        ({"path": "catalog"}, "catalog root"),
+        ({"overwrite": "yes"}, r"\(overwrite\) must be bool"),
+    ],
+)
+def test_get_bad_arguments_need_no_settings(kwargs: dict[str, object], message: str) -> None:
+    kwargs.setdefault("filename", "report.pdf")
+    with pytest.raises(DdsSessionError, match=message):
+        _session(env={}).get(DdsFolder.DELIVERABLES, **kwargs)  # type: ignore[arg-type]
+
+
+def test_get_into_a_folder_of_that_name_is_refused(tmp_path: Path) -> None:
+    (tmp_path / "report.pdf").mkdir()
+    with pytest.raises(DdsSessionError, match="is a folder"):
+        _session(env={}).get(DdsFolder.DELIVERABLES, "report.pdf", output_dir=str(tmp_path))

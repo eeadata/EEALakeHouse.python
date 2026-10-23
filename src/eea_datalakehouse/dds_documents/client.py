@@ -10,17 +10,19 @@ its endpoints.
 ================================  ============================================
 :meth:`DocumentsClient.put`       ``PUT /api/v1/files/{path}``
 :meth:`~DocumentsClient.get`      ``GET /api/v1/files/{path}``
-:meth:`~DocumentsClient.exists`   ``GET /api/v1/files/{path}``
-:meth:`~DocumentsClient.list`     ``GET /api/v1/files?prefix={folder}``
+:meth:`~DocumentsClient.exists`   ``HEAD /api/v1/files/{path}``
+:meth:`~DocumentsClient.list`     ``GET /api/v1/files/{folder}/`` (paged by ``cursor``)
 :meth:`~DocumentsClient.folders`  ``GET /api/v1/folders``
 ================================  ============================================
 
-``PUT`` and ``GET /api/v1/folders`` follow the Dremio Document Service's own
-routes: the upload body is the raw file, and overwriting is asked for with the
-``X-DDS-Overwrite: true`` header (an existing file otherwise answers 409). The
-other shapes are still **interface assumptions** to confirm with the DDS team
-(see ``docs/sdi-integration-plan.md``). Each one is a module constant so a
-confirmed contract is a one-line change.
+These are the Dremio Document Service's own routes (its ``/openapi.json``):
+the upload body is the raw file, and overwriting is asked for with the
+``X-DDS-Overwrite: true`` header (an existing file otherwise answers 409).
+``GET /api/v1/files/{path}`` downloads a file, or — when the path ends in
+``/`` — lists that folder, a page (``limit``, default 200) at a time. The
+service does not publish the listing's JSON shape, so :meth:`list` reads the
+usual ones (see :func:`_listing_entries`) and says which keys it found when a
+response is none of them.
 """
 
 from __future__ import annotations
@@ -34,11 +36,20 @@ import httpx
 from ..dds_ingestion.credentials import DremioCreds, load_base_url, load_creds
 
 DEFAULT_TIMEOUT = 60.0
-# Assumed DDS document contract — to confirm with the DDS team.
 FILES_ENDPOINT = "/api/v1/files/{path}"
-LIST_ENDPOINT = "/api/v1/files"
+# A trailing slash asks DDS for the folder's listing instead of a download;
+# without it, /api/v1/files redirects (307) to /api/v1/files/.
+LIST_ENDPOINT = "/api/v1/files/{path}/"
 FOLDERS_ENDPOINT = "/api/v1/folders"
 OVERWRITE_HEADER = "X-DDS-Overwrite"
+LIST_PAGE_SIZE = 200
+# A listing longer than this many pages is a server that keeps handing back a cursor.
+_MAX_LIST_PAGES = 10_000
+# Where a listing page keeps its entries, its next-page cursor, and an entry its path.
+_ENTRY_KEYS = ("items", "entries", "files", "children", "objects", "contents", "results", "data")
+_CURSOR_KEYS = ("next_cursor", "nextCursor", "cursor", "next")
+_PATH_KEYS = ("path", "key", "rel_path", "name", "filename")
+_FOLDER_TYPES = {"dir", "directory", "folder", "prefix", "collection"}
 # Error bodies are quoted back to the caller; cap them so an HTML error page
 # does not bury the status line it came with.
 _MAX_ERROR_CHARS = 500
@@ -146,21 +157,44 @@ class DocumentsClient:
         return resp.content
 
     def exists(self, path: str) -> bool:
-        """Whether a document is stored at ``path``."""
-        return self.get(path) is not None
+        """Whether a document is stored at ``path`` (a ``HEAD``: nothing is downloaded)."""
+        endpoint = self._file_endpoint(path)
+        resp = self._http.head(f"{self._base_url}{endpoint}", headers=self._auth_headers)
+        if resp.status_code == 404:
+            return False
+        _raise_for_status(resp, f"HEAD {endpoint}")
+        return True
 
     def list(self, folder: str) -> list[str]:
-        """Paths of the documents under ``folder``."""
-        prefix = _clean_path(folder)
-        resp = self._http.get(
-            f"{self._base_url}{LIST_ENDPOINT}",
-            params={"prefix": prefix},
-            headers=self._auth_headers,
+        """The files in ``folder``, as DDS names them (a path or a bare name),
+        every page of them; subfolders are left out. Empty if DDS has no such
+        folder (404)."""
+        endpoint = LIST_ENDPOINT.format(path=quote(_clean_path(folder), safe="/"))
+        params: dict[str, str | int] = {"limit": LIST_PAGE_SIZE}
+        found: list[str] = []
+        for _ in range(_MAX_LIST_PAGES):
+            resp = self._http.get(
+                f"{self._base_url}{endpoint}", params=params, headers=self._auth_headers
+            )
+            if resp.status_code == 404:
+                return found
+            _raise_for_status(resp, f"GET {endpoint}")
+            try:
+                payload: Any = resp.json()
+            except ValueError as exc:
+                raise DocumentsApiError(
+                    resp.status_code,
+                    f"expected a JSON folder listing, got {resp.headers.get('content-type')!r}",
+                    where=f"GET {endpoint}",
+                ) from exc
+            entries, cursor = _listing_entries(payload, where=f"GET {endpoint}")
+            found.extend(_entry_path(entry) for entry in entries if not _is_folder_entry(entry))
+            if not cursor or cursor == params.get("cursor"):
+                return found
+            params["cursor"] = cursor
+        raise DocumentsApiError(
+            200, f"listing did not end after {_MAX_LIST_PAGES} pages", where=f"GET {endpoint}"
         )
-        _raise_for_status(resp, f"GET {LIST_ENDPOINT}?prefix={prefix}")
-        payload: Any = resp.json()
-        rows = payload.get("files", []) if isinstance(payload, dict) else payload
-        return [row["path"] if isinstance(row, dict) else str(row) for row in rows]
 
     def folders(self) -> list[str]:
         """The document folder names DDS shows under every catalog node.
@@ -188,6 +222,43 @@ def _clean_path(path: str) -> str:
     if any(part in ("", ".", "..") for part in cleaned.split("/")):
         raise ValueError(f"invalid DDS document path {path!r}")
     return cleaned
+
+
+def _listing_entries(payload: Any, *, where: str) -> tuple[list[Any], str | None]:
+    """``(entries, next cursor)`` of one listing page: a bare list, or an object
+    keeping its entries under one of ``_ENTRY_KEYS`` and the next page's cursor
+    under one of ``_CURSOR_KEYS`` (or none on the last page)."""
+    if isinstance(payload, list):
+        return payload, None
+    if isinstance(payload, dict):
+        key = next((k for k in _ENTRY_KEYS if isinstance(payload.get(k), list)), None)
+        if key is not None:
+            cursor = next((payload[k] for k in _CURSOR_KEYS if payload.get(k)), None)
+            return payload[key], str(cursor) if cursor is not None else None
+    keys = ", ".join(map(str, payload)) if isinstance(payload, dict) else type(payload).__name__
+    raise DocumentsApiError(
+        200, f"unrecognised folder listing (top-level keys: {keys or 'none'})", where=where
+    )
+
+
+def _entry_path(entry: Any) -> str:
+    if isinstance(entry, dict):
+        for key in _PATH_KEYS:
+            if isinstance(entry.get(key), str) and entry[key]:
+                return str(entry[key])
+        raise DocumentsApiError(
+            200, f"listing entry without a path or name (keys: {', '.join(map(str, entry))})"
+        )
+    return str(entry)
+
+
+def _is_folder_entry(entry: Any) -> bool:
+    if isinstance(entry, dict):
+        kind = str(entry.get("type") or entry.get("kind") or "").lower()
+        if kind in _FOLDER_TYPES or entry.get("is_dir") is True or entry.get("isDir") is True:
+            return True
+        return any(isinstance(entry.get(k), str) and entry[k].endswith("/") for k in _PATH_KEYS)
+    return str(entry).endswith("/")
 
 
 def _error_message(resp: httpx.Response) -> str:
