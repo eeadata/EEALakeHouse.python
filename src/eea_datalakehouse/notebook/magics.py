@@ -1,5 +1,5 @@
-"""`%catalog`/`%%catalog`, `%ingest`, `%sdi` and `%dds` — thin syntactic
-sugar over `CatalogSession`/`IngestSession`/`SdiSession`/`DdsSession` (see
+"""`%catalog`/`%%catalog`, `%ingest`, `%sdi`, `%dds` and `%gpkg` — thin syntactic
+sugar over `CatalogSession`/`IngestSession`/`SdiSession`/`DdsSession`/`GpkgSession` (see
 `docs/notebook-facade-for-data-scientists.md`, "Two magics, two sessions").
 
 Available the moment this package is imported inside IPython — `import
@@ -103,9 +103,10 @@ from IPython.display import HTML, display
 
 from ..catalog import Catalog
 from ..catalog.session import CatalogSession, CatalogSessionError
-from ..dds_documents.controller import DdsFolder, PushReport
+from ..dds_documents.controller import DdsFolder, PushReport, closest_folder, valid_folders_hint
 from ..dds_documents.session import DdsSession, DdsSessionError
 from ..dds_ingestion.session import IngestSession, IngestSessionError
+from ..geopackage.session import GpkgSession, GpkgSessionError
 from ..sdi.session import SdiSession, SdiSessionError
 from ..session_utils import plain_param
 
@@ -119,9 +120,14 @@ _USAGE = {
         "  |  %ingest diagnose  |  %ingest commit"
     ),
     "sdi": '%sdi get_xml("<uuid>")  |  %sdi resolve_series("<series uuid>")',
+    "gpkg": (
+        '%gpkg export()  |  %gpkg export(tables=["stations"], limit=1000, srid=3035)'
+        "  (the %catalog use(...) folder, into the notebook's folder)"
+    ),
     "dds": (
         '%dds push(DELIVERABLES, "report.pdf")  |  %dds push(METADATA, "a.xml", "b.xml")'
-        "  (into the %catalog use(...) folder)"
+        '  |  %dds list(DELIVERABLES)  |  %dds get(DELIVERABLES, "report.pdf")'
+        "  (in the %catalog use(...) folder)"
     ),
 }
 
@@ -334,7 +340,8 @@ _DDS_HELP = [
         "compulsory and must be one of DDS's document folders, typed bare (no quotes): DERIVED, "
         "METADATA, METHODOLOGY, ASSESSMENTS, ANALYSES, REFERENCES, DELIVERABLES, OTHERS. "
         "files are one or more, given one after another or as a list: local paths (globs like "
-        '"annex/*.pdf" too) or %sdi get_xml records (stored as <uuid>.xml). Every file is '
+        '"annex/*.pdf" too), %sdi get_xml records (stored as <uuid>.xml) or %gpkg export '
+        "reports (the .gpkg written). Every file is "
         "read and checked before the first upload. target_name renames files in DDS: a string "
         'for a single file (target_name="bwd_2025.xml"), or a dict from each file\'s own name to '
         'its new name (target_name={"draft_v3.pdf": "report_2025.pdf"}); files left out, or an '
@@ -342,8 +349,27 @@ _DDS_HELP = [
         "overwrite=True (default) replaces a file "
         "already there; overwrite=False uploads nothing if any is.",
     ),
+    (
+        "list",
+        "Show the names of the files in path/folder/ in DDS, sorted. folder is compulsory, "
+        "as for push; path defaults to the %catalog use(...) context. pattern (optional) keeps "
+        'only the names that match it, ignoring case: a wildcard ("*.pdf", "report_202?.*", '
+        '"[ab]*"), an extension (".xlsx") or text in the name ("report"); a list keeps the '
+        'names matching any (["*.pdf", "*.docx"]). The result iterates '
+        'like a list of names, so `"report.pdf" in %dds list(DELIVERABLES)` works.',
+    ),
+    (
+        "get",
+        "Download one file from path/folder/ in DDS and return the local file. folder and "
+        'filename are compulsory (filename as list shows it, e.g. "annex/a.xlsx" for a '
+        "subfolder); path defaults to the %catalog use(...) context. The file is saved in "
+        "output_dir (default: the notebook's folder) under its own name; overwrite=True "
+        "(default) replaces a local file of that name, overwrite=False refuses. A file DDS does "
+        "not have there is an error. The result is the local path, "
+        "so open(f), pd.read_csv(f) or %dds push(OTHERS, f) take it as is.",
+    ),
     ("target", "Show the DDS folder push would upload to, without uploading anything."),
-    ("folders", "List the folders push accepts."),
+    ("folders", "List the folders push, list and get accept."),
     ("dds_base_url", "Show the DDS URL push uses, and where it came from."),
 ]
 _DDS_HELP_NOTE = (
@@ -357,6 +383,9 @@ _DDS_HELP_NOTE = (
     '    %dds push(DELIVERABLES, "report.pdf", "annex.xlsx")\n'
     '    %dds push(DELIVERABLES, ["report.pdf", "annex.xlsx"])\n'
     '    %dds push(ANALYSES, "results/*.csv")\n'
+    "  a GeoPackage from %gpkg export (the report is the file):\n"
+    "    report = %gpkg export()\n"
+    "    %dds push(DELIVERABLES, report)\n"
     "  an SDI record from %sdi get_xml (stored as <uuid>.xml):\n"
     '    record = %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")\n'
     "    %dds push(METADATA, record)\n"
@@ -381,6 +410,25 @@ _DDS_HELP_NOTE = (
     "  check first, without uploading:  %dds target(DELIVERABLES)  or  "
     '%dds target(DELIVERABLES, path="../wfd")\n'
     "\n"
+    "list examples — folder is compulsory, path= as for push:\n"
+    "    %dds list(DELIVERABLES)\n"
+    '    %dds list(METADATA, path="../wfd")\n'
+    "    names = %dds list(ASSESSMENTS)\n"
+    "  pattern — optional, ignores case; a wildcard, an extension, text in the name, or a list:\n"
+    '    %dds list(DELIVERABLES, "*.pdf")\n'
+    '    %dds list(DELIVERABLES, ".xlsx")\n'
+    '    %dds list(DELIVERABLES, "report")\n'
+    '    %dds list(DELIVERABLES, "report_202?.*")\n'
+    '    %dds list(DELIVERABLES, ["*.pdf", "*.docx"], path="../wfd")\n'
+    "\n"
+    "get examples — folder and filename are compulsory, path= as for push:\n"
+    '    %dds get(DELIVERABLES, "report.pdf")              # -> ./report.pdf\n'
+    '    f = %dds get(METADATA, "bwd.xml", path="../wfd", output_dir="downloads")\n'
+    '    %dds get(DELIVERABLES, "annex/a.xlsx", overwrite=False)\n'
+    "\n"
+    'A folder that is not one of the eight (DELIVERABLE, "deliverables", left out) is an '
+    "error that lists the valid ones.\n"
+    "\n"
     "Environment: DDS_BASE_URL — read from the first .env found in the notebook's folder or "
     "a parent when %dds starts, else from the kernel environment — and a Dremio identity: "
     "_DREMIO_USER/_DREMIO_PWD (as %ingest) or DREMIO_USERNAME/DREMIO_TOKEN (as %catalog)."
@@ -392,6 +440,116 @@ _DDS_NAMESPACE: dict[str, Any] = {
     "DdsFolder": DdsFolder,
     **{member.name: member for member in DdsFolder},
 }
+
+
+# %dds methods whose first argument is the compulsory DdsFolder.
+_DDS_FOLDER_METHODS = {
+    "push": 'push(DELIVERABLES, "report.pdf")',
+    "list": "list(DELIVERABLES)",
+    "get": 'get(DELIVERABLES, "report.pdf")',
+    "target": "target(DELIVERABLES)",
+}
+
+
+def _dds_folder_call(line: str) -> tuple[str, ast.expr | None] | None:
+    """``(method, folder argument)`` if ``line`` calls a %dds method that takes a
+    folder (the argument is ``None`` when it is left out), else ``None``."""
+    text = line.strip()
+    if text.isidentifier():
+        text = f"{text}()"
+    try:
+        call = ast.parse(text, mode="eval").body
+    except SyntaxError:
+        return None  # _dispatch explains it
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id in _DDS_FOLDER_METHODS
+    ):
+        return None
+    folder = next((kw.value for kw in call.keywords if kw.arg == "folder"), None)
+    if folder is None and call.args and not isinstance(call.args[0], ast.Starred):
+        folder = call.args[0]
+    return call.func.id, folder
+
+
+def _dds_missing_folder(line: str) -> str | None:
+    """The error for a %dds call that leaves out its compulsory folder, else ``None``."""
+    found = _dds_folder_call(line)
+    if found is None or found[1] is not None:
+        return None
+    example = _DDS_FOLDER_METHODS[found[0]]
+    return f"{found[0]} needs a folder first, e.g. {example}; {valid_folders_hint()}"
+
+
+def _dds_unknown_folder(line: str, exc: NameError | AttributeError) -> str | None:
+    """The error for a %dds folder that names no DdsFolder member —
+    ``push(DELIVERABLE, ...)`` or ``push(DdsFolder.REPORTS, ...)`` — else
+    ``None`` (the undefined name is something other than the folder)."""
+    found = _dds_folder_call(line)
+    if found is None or found[1] is None:
+        return None
+    node = found[1]
+    if isinstance(exc, NameError) and isinstance(node, ast.Name) and node.id == exc.name:
+        typed = node.id
+    elif (
+        isinstance(exc, AttributeError)
+        and isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "DdsFolder"
+        and node.attr == exc.name
+    ):
+        typed = node.attr
+    else:
+        return None
+    match = closest_folder(typed)
+    hint = f" (did you mean {match.name}?)" if match else ""
+    return f"{typed} is not a DDS folder{hint}; {valid_folders_hint()}"
+
+
+_GPKG_HELP = [
+    (
+        "export",
+        "Write the tables and views under path to a GeoPackage file: spatial ones as feature "
+        "layers, the rest as attribute tables. path defaults to the %catalog use(...) context "
+        "and is resolved like any %catalog path. tables picks some, by name below path "
+        '(["stations", "sub.areas"]); default all, at any depth. limit caps the rows per table. '
+        'srid reprojects every layer (3035 or "EPSG:3035"); default: each keeps its own CRS. '
+        "filename / output_dir default to <dataset>.gpkg in the notebook's folder; overwrite=True "
+        "(default) replaces an existing file. workers tables are streamed from Dremio at once, "
+        "each over its own Arrow Flight channel.",
+    ),
+]
+_GPKG_HELP_NOTE = (
+    "A table is spatial when a column holds geometries — WKB/EWKB, WKT/EWKT, hex WKB or "
+    "GeoJSON (columns named geom, geometry, wkt, shape, ... are tried first) — or, failing "
+    "that, it has latitude/longitude columns (points in EPSG:4326).\n"
+    "Each row's CRS: the SRID inside the geometry (EWKB/EWKT), else a CRS column (srid, sr_id, "
+    'epsg, crs, ...: 3035, "EPSG:3035", a URN or a CRS name). A layer with no CRS at all is '
+    "written with the undefined SRS (-1).\n"
+    "Streaming: rows are read over Arrow Flight a batch at a time — workers tables at once, "
+    "each on its own channel — decoded and encoded in those workers, and written by one "
+    "thread; memory stays a few batches per worker whatever the table size.\n"
+    "Progress: a line as each table/view is written (✓ rows, seconds) or fails (✗ with the "
+    "table's name — the export then stops and no file is written), and a total at the end.\n"
+    "\n"
+    "export examples:\n"
+    "    %gpkg export()\n"
+    '    %gpkg export(tables=["stations", "areas"])\n'
+    "    %gpkg export(limit=1000)\n"
+    "    %gpkg export(srid=3035)\n"
+    "    %gpkg export(workers=8)\n"
+    '    %gpkg export(path="../wfd", filename="wfd_2025.gpkg", output_dir="exports")\n'
+    '    %gpkg export(path="catalog.water.bwd", tables=["stations"], limit=100, srid="EPSG:4326", '
+    "overwrite=False, workers=2)\n"
+    "\n"
+    "then push the file to DDS — the returned report is the file:\n"
+    "    report = %gpkg export()\n"
+    "    %dds push(DELIVERABLES, report)\n"
+    "\n"
+    "Reads with %catalog's connection: DREMIO_BASE_URL / DREMIO_TOKEN. Written with sqlite3, "
+    "shapely and pyproj (no GDAL)."
+)
 
 
 def _build_catalog_session() -> CatalogSession:
@@ -408,6 +566,10 @@ def _build_catalog_session() -> CatalogSession:
 def _build_sdi_session() -> SdiSession:
     # Nothing to check up front: SDI_API_URL defaults to the public catalogue.
     return SdiSession()
+
+
+def _build_gpkg_session(resolve_path: Any, catalog: Any) -> GpkgSession:
+    return GpkgSession(resolve_path=resolve_path, catalog=catalog)
 
 
 def _build_dds_session(resolve_path: Any) -> DdsSession:
@@ -758,7 +920,7 @@ def _notify_dds_pushed(shell: Any, dds_path: str) -> None:
 
 @magics_class
 class EEALakehouseMagics(Magics):
-    """Registers `%catalog`, `%ingest`, `%sdi` and `%dds` — see this module's docstring."""
+    """Registers `%catalog`, `%ingest`, `%sdi`, `%dds` and `%gpkg` — see this module's docstring."""
 
     def __init__(self, shell: Any) -> None:
         super().__init__(shell)
@@ -766,6 +928,7 @@ class EEALakehouseMagics(Magics):
         self._ingest_session: IngestSession | None = None
         self._sdi_session: SdiSession | None = None
         self._dds_session: DdsSession | None = None
+        self._gpkg_session: GpkgSession | None = None
         self._pending_context: str | None = None
         _register_context_comm(shell, self)
 
@@ -886,8 +1049,8 @@ class EEALakehouseMagics(Magics):
         result = _dispatch(self._sdi_session, line, self.shell.user_ns, "sdi", SdiSessionError)
         return None if result is _DISPATCH_FAILED else result
 
-    def _dds_target(self, path: str | None) -> str | None:
-        """The catalog path `%dds` pushes under: `path` resolved like any
+    def _context_target(self, path: str | None) -> str | None:
+        """The catalog path `%dds` pushes under and `%gpkg` exports: `path` resolved like any
         `%catalog` path, or the current context when `path` is `None` —
         including one a frontend pushed before any `%catalog` cell ran."""
         session = self._catalog_session
@@ -907,25 +1070,64 @@ class EEALakehouseMagics(Magics):
 
             %dds push(DELIVERABLES, "report.pdf", "annex/*.xlsx")
             %dds push(METADATA, record, path="catalog.water.bwd", overwrite=False)
+            %dds list(DELIVERABLES)
+            %dds get(DELIVERABLES, "report.pdf")
             %dds target(ASSESSMENTS)
         """
         if _is_help(line):
             _print_help_table(DdsSession, _DDS_HELP, "dds", note=_DDS_HELP_NOTE)
             return None
+        missing = _dds_missing_folder(line)
+        if missing is not None:
+            print(f"dds error: {missing}")
+            return None
         if self._dds_session is None:
             # Looked up at push time, so a `use` run after %dds started still counts.
-            self._dds_session = _build_dds_session(self._dds_target)
-        result = _dispatch(
-            self._dds_session,
-            line,
-            self.shell.user_ns,
-            "dds",
-            DdsSessionError,
-            extra_ns=_DDS_NAMESPACE,
-        )
+            self._dds_session = _build_dds_session(self._context_target)
+        try:
+            result = _dispatch(
+                self._dds_session,
+                line,
+                self.shell.user_ns,
+                "dds",
+                DdsSessionError,
+                extra_ns=_DDS_NAMESPACE,
+            )
+        except (NameError, AttributeError) as exc:
+            unknown = _dds_unknown_folder(line, exc)
+            if unknown is None:
+                raise  # not the folder: an undefined notebook variable keeps its traceback
+            print(f"dds error: {unknown}")
+            return None
         if isinstance(result, PushReport):
             for dds_path in result.paths:
                 _notify_dds_pushed(self.shell, dds_path)
+        return None if result is _DISPATCH_FAILED else result
+
+    def _catalog_for_gpkg(self) -> Catalog:
+        """`%catalog`'s own Catalog, building its session if need be."""
+        if self._catalog_session is None:
+            self._catalog_session = _build_catalog_session()  # raises without credentials
+            if self._pending_context is not None:
+                self._catalog_session.set_context(self._pending_context)
+                self._pending_context = None
+        return self._catalog_session._catalog  # noqa: SLF001 — one login for both magics
+
+    @line_magic
+    def gpkg(self, line: str) -> Any:
+        """`%gpkg` — export the `%catalog` context's tables and views to a
+        GeoPackage file, streamed from Dremio, each call runs immediately::
+
+            %gpkg export()
+            %gpkg export(tables=["stations", "areas"], limit=1000, srid=3035)
+            %gpkg export(path="../wfd", filename="wfd_2025.gpkg", output_dir="exports")
+        """
+        if _is_help(line):
+            _print_help_table(GpkgSession, _GPKG_HELP, "gpkg", note=_GPKG_HELP_NOTE)
+            return None
+        if self._gpkg_session is None:
+            self._gpkg_session = _build_gpkg_session(self._context_target, self._catalog_for_gpkg)
+        result = _dispatch(self._gpkg_session, line, self.shell.user_ns, "gpkg", GpkgSessionError)
         return None if result is _DISPATCH_FAILED else result
 
 
