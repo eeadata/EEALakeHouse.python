@@ -119,7 +119,10 @@ _USAGE = {
         '%ingest ingest(folder="./data", target_catalog_path="a.b", data_format="parquet")'
         "  |  %ingest diagnose  |  %ingest commit"
     ),
-    "sdi": '%sdi get_xml("<uuid>")  |  %sdi resolve_series("<series uuid>")',
+    "sdi": (
+        '%sdi get_xml("<uuid>")  |  %sdi resolve_series("<series uuid>")'
+        '  |  %sdi validate("record.xml")'
+    ),
     "gpkg": (
         '%gpkg export()  |  %gpkg export(tables=["stations"], limit=1000, srid=3035)'
         "  (the %catalog use(...) folder, into the notebook's folder)"
@@ -139,6 +142,13 @@ _META_TAGS_EXAMPLE = '[{"tag_name": "owner", "tag_value": "bw-team", "tag_title"
 # Shared between copy/move/create_view's _CATALOG_HELP entries — all three
 # resolve create_target_folder the same way (see _resolve_target_path's
 # ensure_target_folder step in operations.py).
+# data_copy/data_move only — create_view's target is always the view itself.
+_TARGET_FOLDER_SLASH_NOTE = (
+    "A target_path ending in / is a folder, not the table: the folder is created first if "
+    "it doesn't exist (every missing level), and the table lands inside it under the source's "
+    'own name — data_copy("draft.t", "archive/2027/") makes archive.2027.t; "./" is the context '
+    "itself; undo removes the folders it created. "
+)
 _CREATE_TARGET_FOLDER_NOTE = (
     "create_target_folder=True creates every missing folder level of target_path — "
     "except the space/source itself, which must already exist (raises "
@@ -179,13 +189,15 @@ _CATALOG_HELP = [
         "data_copy",
         "Copy source_path to target_path. overwrite=False (default) raises "
         "CatalogOperationError if target_path already exists; overwrite=True replaces it "
-        "and is not undoable. " + _CREATE_TARGET_FOLDER_NOTE,
+        "and is not undoable. " + _TARGET_FOLDER_SLASH_NOTE + _CREATE_TARGET_FOLDER_NOTE,
     ),
     (
         "data_move",
         "Move source_path to target_path, always as a TABLE (use create_view for a view). "
         "overwrite=False (default) raises CatalogOperationError if target_path already "
-        "exists; overwrite=True replaces it and is not undoable. " + _CREATE_TARGET_FOLDER_NOTE,
+        "exists; overwrite=True replaces it and is not undoable. "
+        + _TARGET_FOLDER_SLASH_NOTE
+        + _CREATE_TARGET_FOLDER_NOTE,
     ),
     (
         "create_version",
@@ -220,7 +232,29 @@ _CATALOG_HELP = [
         "are skipped. An existing view "
         "is dropped and recreated over the version (overwrite=True, the default; not undoable) — "
         "overwrite=False makes it an error instead; an existing table is "
-        "always an error.",
+        "always an error. Each view is tagged #public, and #public is removed from every "
+        "table/view under versions, so only the latest release is public.",
+    ),
+    (
+        "publish",
+        "Copy every #public view of a dataflow folder (as update_latest_release leaves them) "
+        'into public_s3."dh-prod-data-public", as tables at the same full catalog path '
+        '(catalog.x.y.dataflow.a.t is copied to public_s3."dh-prod-data-public".catalog.x.y.'
+        "dataflow.a.t). The dataflow folder "
+        "is path when given (absolute, or relative to the context), else the %catalog use(...) "
+        "context; with neither it raises. It must have draft, versions and reference (or "
+        "references) folders just below it — raises at once otherwise. Views and tables in "
+        "those three folders are ignored; views without the tag are skipped and "
+        "the report's notes say which. An existing table is replaced "
+        "(overwrite=True, the default; not undoable) — overwrite=False makes it an error, "
+        "and then nothing is copied. Each table is checked once copied, and the report's "
+        "notes give its row count. All or nothing: if any table fails, everything the publish "
+        "did is rolled back (replaced tables are restored) and an error says which table "
+        "failed. partition_by (optional) partitions the tables "
+        'by existing fields, in order: a list for every view (partition_by=["year", "country"]), '
+        'or a dict for each view\'s own, keyed by its path below the Area '
+        '(partition_by={"eu_sdg.monitoringsites": ["year"]}; views left out are not '
+        "partitioned). A field a view doesn't have raises at once, when publish is called.",
     ),
     # -- table ----------------------------------------------------------------
     (
@@ -325,6 +359,13 @@ _SDI_HELP = [
         "resolve_series",
         "Return the UUID of the one release of series_uuid that is not superseded; raises, "
         "listing every release, if there are zero or several.",
+    ),
+    (
+        "validate",
+        "Check a metadata file against the ISO 19115-3 XML schema (XSD, bundled, so it works "
+        'offline): a local path ("record.xml", or a %dds get download), XML bytes or a '
+        "%sdi get_xml record. Shows every error with its line and element path; the result is "
+        "truthy when the file is valid. Schematron rules are not checked.",
     ),
 ]
 _SDI_HELP_NOTE = (
@@ -1040,6 +1081,7 @@ class EEALakehouseMagics(Magics):
 
         %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
         %sdi resolve_series("c3858959-90da-4c1b-b9ca-492db0e514df")
+        %sdi validate("070d9baa-448d-4168-8514-7dadb3ad876d.xml")
         """
         if _is_help(line):
             _print_help_table(SdiSession, _SDI_HELP, "sdi", note=_SDI_HELP_NOTE)
