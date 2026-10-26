@@ -11,6 +11,7 @@ Typical use (``SDI_API_URL`` comes from the kernel env; pushing to DDS is
         dds.push("catalog/water_management_resources/bathing_water/bwd",
                  DdsFolder.METADATA, metadata)
         # -> .../bwd/metadata/070d9baa-448d-4168-8514-7dadb3ad876d.xml
+        sdi.validate(metadata)  # truthy if it passes the ISO 19115-3 XSD
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from .errors import (
 )
 from .iso import IsoRecord
 from .session import SdiSession, SdiSessionError
+from .validation import SchemaIssue, SdiValidation
 
 __all__ = [
     "DEFAULT_SDI_API_URL",
@@ -38,6 +40,7 @@ __all__ = [
     "NotIso19115_3",
     "SdiApiError",
     "SdiAuthError",
+    "SchemaIssue",
     "SdiCatalogue",
     "SdiConfig",
     "SdiController",
@@ -46,6 +49,7 @@ __all__ = [
     "SdiNotFound",
     "SdiSession",
     "SdiSessionError",
+    "SdiValidation",
     "SeriesCandidate",
     "UuidMismatch",
 ]

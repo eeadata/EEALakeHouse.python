@@ -52,6 +52,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "eea_datalakehouse.geopackage" = ["epsg_definitions.json"]  # CRS definitions for reprojection
+"eea_datalakehouse.sdi" = ["schemas/**/*.xsd"]  # ISO 19115-3 XSDs, so validating works offline
 
 [tool.ruff]
 target-version = "py311"
@@ -67,7 +68,7 @@ strict = true
 warn_return_any = false
 
 [[tool.mypy.overrides]]
-module = ["respx.*", "pyarrow.*", "shapely.*"]  # none ships type stubs
+module = ["respx.*", "pyarrow.*", "shapely.*", "lxml.*"]  # none ships type stubs
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

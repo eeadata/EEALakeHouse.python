@@ -135,7 +135,49 @@ exact same arguments.
   are skipped. Every target is checked before any view is created: an existing view is dropped
   and created again over the version (`overwrite=True`, the default — re-pointing the views at a
   new version is the normal use; it can't be undone), `overwrite=False` makes it an error
-  instead, and an existing table is always an error.
+  instead, and an existing table is always an error. Each view gets the `#public` tag (other
+  tags are kept), and `#public` is removed from every table and view under `versions`, so only
+  the latest release carries it.
+- `%catalog publish(path=None, overwrite=True, partition_by=None)` — copies every `#public` view
+  of a dataflow folder into the public bucket as a Parquet table at the same full catalog path:
+  `catalog.<domain>.<subdomain>.<dataflow>.eu_sdg_06_30.monitoringsites` goes to
+  `public_s3."dh-prod-data-public".catalog.<domain>.<subdomain>.<dataflow>.eu_sdg_06_30.monitoringsites`.
+  Run it after `update_latest_release`. The dataflow folder is `path` when given (absolute, or relative to the
+  context), otherwise the `%catalog use(...)` context; with neither, it raises. It must have
+  `draft`, `versions` and `reference` (or `references`) folders just below it, checked as soon as
+  `publish` is called. Views and tables in those three folders are ignored, and views without the tag are skipped (listed
+  in the report's notes). Every target is checked before anything is copied: an existing table
+  is dropped and copied again (`overwrite=True`, the default; it can't be undone), and
+  `overwrite=False` makes it an error, so nothing is copied. Each copy first runs
+  `DROP TABLE IF EXISTS` on the target (always, since the check can't see a bucket folder Dremio
+  hasn't promoted), then `CREATE TABLE <target> STORE AS (type => 'parquet') AS SELECT * FROM
+  <view>`, so the bucket holds plain Parquet files. It then runs `ALTER TABLE <target> REFRESH
+  METADATA AUTO PROMOTION` and a `SELECT COUNT(*)` on the new table to check that it reads
+  back. The report's notes give each table's row count.
+
+  Publishing is all or nothing. Before anything is replaced, every table already in the bucket
+  is copied to `public_s3."dh-prod-data-public".<dataflow path>__publish_backup.<same path>` and
+  read back. If any table then fails (the copy, the refresh or the check), every table the
+  publish touched is dropped, the replaced ones are copied back from their backups, and the
+  publish raises an error that names the table that failed and says everything was rolled
+  back. The backups are dropped afterwards. One that could not be restored is kept, and the
+  error names it so it can be restored by hand. A restored table comes back unpartitioned.
+
+  `partition_by` (optional) partitions the Parquet tables by existing fields, in the order given
+  (`PARTITION BY ("year", "country")` in the `CREATE TABLE`). A list applies to every published
+  view; a dict gives each view its own fields, keyed by its path below the Area, and views it
+  leaves out are not partitioned. Field names are matched ignoring case, and a set is sorted
+  because it has no order. The fields are checked against the views as soon as `publish` is
+  called: a field a view doesn't have, or a dict key that names no published view, raises at
+  once and nothing is queued. They are checked again when the publish runs, before anything is
+  dropped or copied.
+
+  ```python
+  %catalog publish()                       # the %catalog use(...) dataflow
+  %catalog publish("catalog.water_management_resources.bathing_water.bwd")
+  %catalog publish(partition_by=["year", "country"])
+  %catalog publish(partition_by={"eu_sdg_06_30.monitoringsites": ["year"]})
+  ```
 - `draft2version(draft_path, version_path)` / `publishversion(consumer_view_path, version_path)`
   — **not implemented yet** (both raise `NotImplementedError`); promoting a draft table into a
   permanent version and repointing a consumer-facing view at it.
@@ -321,6 +363,7 @@ import eea_datalakehouse.notebook   # registers %catalog/%ingest/%sdi/%dds
 %catalog use("catalog.water_management_resources.bathing_water.bwd")
 %dds push(DELIVERABLES, "report.pdf", "annex/*.xlsx")
 record = %sdi get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
+%sdi validate(record)          # ISO 19115-3 XSD check; also a local path or a %dds get file
 %dds push(METADATA, record, overwrite=False)
 %dds list(DELIVERABLES)        # report.pdf and the annexes, sorted
 %dds list(DELIVERABLES, "*.pdf")   # filter: a wildcard, ".xlsx", "report", or a list of them
@@ -328,6 +371,12 @@ f = %dds get(DELIVERABLES, "report.pdf")   # -> ./report.pdf; f is the local fil
 %dds target(ASSESSMENTS)       # where a push would go
 %dds help
 ```
+
+`%sdi validate(...)` checks a metadata file against the ISO 19115-3 XML schema (`mdb` 2.0 and
+every schema it imports, bundled under `sdi/schemas/`, so it works offline). It lists each
+error with its line and element path, and the result is truthy when the file is valid. It
+checks only the XSD, not ISO 19115-3's Schematron rules. To refresh the bundled schemas, run
+`python scripts/fetch_iso19115_3_schemas.py`.
 
 `DDS_BASE_URL` is read from the first `.env` in the notebook's folder or a parent when `%dds`
 builds its session (the kernel environment's value only applies if that `.env` doesn't set one;
@@ -486,7 +535,18 @@ create_folder(".2027")   # creates bwd.reference.2027 for real, but leaves conte
 #                                          ^ starts with 'catalog' — absolute, not appended either
 %catalog data_copy(".water_temperature", "archive")
 #                                          ^ bare, no dot — relative too, appends to the context
+%catalog data_copy(".water_temperature", "archive/")
+#                                          ^ ends in '/' — a folder: creates
+#                                            bwd.reference.2027.archive if missing and copies
+#                                            into bwd.reference.2027.archive.water_temperature
 ```
+
+A `data_copy`/`data_move` `target_path` that ends in `/` names a folder, not the table. Everything
+before the `/` is resolved like any other path (`"archive/"`, `"./archive/"`, `"../archive/"`,
+`"catalog/x/archive/"`, or `"./"` for the context itself). That folder, with every missing level,
+is created first if it doesn't exist (the source/space itself never is), and the table lands
+inside it under the source's own name. Undo removes the folders the call created. Without the
+trailing `/`, the target is the table's own path, as before.
 
 `get_wiki(path)`, `get_tags(path)`, `list(path)` (every table/view under `path`, at any depth)
 and `schema(path)` (column types + row count) answer immediately, like `get_context()` — nothing
@@ -524,7 +584,8 @@ context itself — raises `CatalogSessionError` if none is set yet:
 | `geopackage/spatial.py` | spatial-or-tabular detection, geometry decoding, CRS lookup and reprojection |
 | `geopackage/writer.py` | `GeoPackageWriter` — the `.gpkg` file itself, with `sqlite3`, bulk-loaded |
 | `geopackage/session.py` | `GpkgSession` — what `%gpkg` dispatches onto |
-| `sdi/controller.py` | `SdiController` — `get_xml()`, `resolve_series()` |
+| `sdi/controller.py` | `SdiController` — `get_xml()`, `resolve_series()`, `validate()` |
+| `sdi/validation.py` | ISO 19115-3 XSD validation against the schemas bundled in `sdi/schemas/` |
 | `sdi/catalogue.py` | `SdiCatalogue` — read-only GeoNetwork REST client |
 | `sdi/session.py` | `SdiSession` — what `%sdi` dispatches onto |
 | `session_utils.py` | friendly session errors, strict argument types, `.env` lookup |
