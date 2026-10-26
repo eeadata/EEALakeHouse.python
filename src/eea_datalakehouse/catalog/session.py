@@ -41,6 +41,7 @@ from . import operations
 from .client import Catalog
 from .errors import CatalogAuthError, CatalogOperationError, EngineStartingError
 from .operations import TableInfo
+from .sql import SqlExecutor
 
 _Undo = Callable[[], None]
 
@@ -145,6 +146,20 @@ DRAFT_FOLDER = "draft"
 # debugger/bathing_water/README.md's layout (…bwd.draft / …bwd.versions).
 VERSIONS_FOLDER = "versions"
 
+# The tag update_latest_release puts on the views it creates (and removes from
+# everything under the Area's versions folder); publish copies the views that carry it.
+PUBLIC_TAG = "#public"
+# Where publish copies them: PUBLIC_ROOT.<the view's full catalog path>, so
+# catalog.a.b.c.v lands at "public_s3"."dh-prod-data-public"."catalog"."a"."b"."c"."v".
+PUBLIC_ROOT = "public_s3.dh-prod-data-public"
+
+# The Area's own folders publish never copies from: work in progress, the
+# frozen versions, and the shared reference data.
+REFERENCE_FOLDER = "reference"
+# Either spelling is a dataflow's reference folder.
+_REFERENCE_FOLDERS = (REFERENCE_FOLDER, "references")
+_NOT_PUBLISHED = (DRAFT_FOLDER, VERSIONS_FOLDER, *_REFERENCE_FOLDERS)
+
 _ROOT_SOURCE = "catalog"
 # This deployment's one real top-level source/space (see e.g. the "catalog." prefix
 # on every real path in debugger/test_catalog_magic.ipynb's TEST_ROOT) — a bare path
@@ -177,6 +192,42 @@ def _drop_entry(catalog: Catalog, path: str, *, idempotency_key: str) -> None:
         f"DROP {kind} IF EXISTS {operations._quote_path(path)}",  # noqa: SLF001
         idempotency_key=idempotency_key,
     )
+
+
+def _quote(path: str) -> str:
+    return operations._quote_path(path)  # noqa: SLF001 — same-package internal, as in _drop_entry
+
+
+def _quote_name(column: str) -> str:
+    """A column name as a quoted SQL identifier."""
+    return '"' + column.replace('"', '""') + '"'
+
+
+def _published_rows(executor: SqlExecutor, table: str, *, idempotency_key: str) -> int:
+    """``COUNT(*)`` of a table `publish` just created — proof Dremio can read it."""
+    try:
+        rows = executor.fetch_all(
+            f'SELECT COUNT(*) AS "row_count" FROM {_quote(table)}',
+            idempotency_key=idempotency_key,
+        )
+        return int(rows[0]["row_count"])
+    except (EngineStartingError, CatalogAuthError):
+        raise
+    except Exception as exc:
+        raise CatalogOperationError(f"{table!r} was not created successfully: {exc}") from exc
+
+
+def _create_folders(catalog: Catalog, folder: str | None) -> list[str]:
+    """Create every missing level of `folder` (if any); the levels created, top first."""
+    if folder is None:
+        return []
+    return catalog._catalog_rest.ensure_folder_path(folder)  # noqa: SLF001 — as in _drop_entry
+
+
+def _delete_folders(catalog: Catalog, folders: list[str], *, idempotency_key: str) -> None:
+    """Undo `_create_folders`: delete the levels it created, deepest first."""
+    for folder in reversed(folders):
+        catalog.deletefolder(folder, idempotency_key=idempotency_key)
 
 
 def _plan_version_views(
@@ -220,11 +271,276 @@ def _plan_version_views(
     return plan
 
 
+def _add_tag(catalog: Catalog, path: str, tag: str, *, idempotency_key: str) -> None:
+    """Add `tag` to `path`'s tags, keeping the others."""
+    tags = catalog.gettagsfrom(path, idempotency_key=f"{idempotency_key}-read")
+    if tag not in tags:
+        catalog.settagsto(path, [*tags, tag], idempotency_key=idempotency_key)
+
+
+def _remove_tag_under(
+    catalog: Catalog, folder: str, tag: str, removed: list[tuple[str, list[str]]], *, key: str
+) -> None:
+    """Remove `tag` from every table and view under `folder`, appending
+    ``(path, tags before)`` to `removed` as it goes, so an undo can restore them."""
+    rest = catalog._catalog_rest  # noqa: SLF001 — same-package internal, as in _drop_entry
+    for number, path in enumerate(rest.list_datasets(folder.split(".")), start=1):
+        tags = catalog.gettagsfrom(path, idempotency_key=f"{key}-{number}-read")
+        if tag in tags:
+            catalog.settagsto(
+                path, [t for t in tags if t != tag], idempotency_key=f"{key}-{number}"
+            )
+            removed.append((path, tags))
+
+
+# What `publish(partition_by=...)` takes: the same fields for every view, or
+# each view's own (keyed by its path below the Area).
+PartitionBy = list[str] | tuple[str, ...] | set[str] | dict[str, list[str]]
+
+
+def _partition_fields(value: Any, what: str) -> tuple[str, ...]:
+    """`value` as an ordered tuple of field names; a set is sorted, having no order."""
+    if isinstance(value, str) or not isinstance(value, list | tuple | set | frozenset):
+        raise CatalogSessionError(
+            f"{what} must be a list of field names, e.g. ['year'], not {type(value).__name__}"
+        )
+    fields = tuple(sorted(value) if isinstance(value, set | frozenset) else value)
+    if not fields:
+        raise CatalogSessionError(f"{what} must name at least one field")
+    bad = [f for f in fields if not isinstance(f, str) or not f.strip()]
+    if bad:
+        raise CatalogSessionError(f"{what} has fields that are not names: {bad!r}")
+    fields = tuple(f.strip() for f in fields)
+    repeated = sorted({f for f in fields if fields.count(f) > 1})
+    if repeated:
+        raise CatalogSessionError(f"{what} repeats {', '.join(repeated)}")
+    return fields
+
+
+def _partition_plan(
+    partition_by: PartitionBy | None,
+) -> tuple[str, ...] | dict[str, tuple[str, ...]]:
+    """`publish`'s `partition_by`, checked: one field tuple for every view, or
+    a dict from view path (below the Area, dotted) to its fields."""
+    if partition_by is None:
+        return ()
+    if not isinstance(partition_by, dict):
+        return _partition_fields(partition_by, "partition_by")
+    plan: dict[str, tuple[str, ...]] = {}
+    for view, fields in partition_by.items():
+        if not isinstance(view, str) or not view.strip(" ./"):
+            raise CatalogSessionError(f"partition_by key {view!r} is not a view path")
+        name = _dotted(view.strip()).strip(".")
+        plan[name] = _partition_fields(fields, f"partition_by[{view!r}]")
+    return plan
+
+
+def _view_columns(executor: SqlExecutor, view: str, *, idempotency_key: str) -> list[str]:
+    """The column names of `view`, in order, from ``INFORMATION_SCHEMA."COLUMNS"``."""
+    schema, _, leaf = view.rpartition(".")
+    quote = operations._quote_literal  # noqa: SLF001 — same-package internal
+    rows = executor.fetch_all(
+        'SELECT "COLUMN_NAME" FROM INFORMATION_SCHEMA."COLUMNS" '
+        f'WHERE "TABLE_SCHEMA" = {quote(schema)} AND "TABLE_NAME" = {quote(leaf)} '
+        'ORDER BY "ORDINAL_POSITION"',
+        idempotency_key=idempotency_key,
+    )
+    return [str(row["COLUMN_NAME"]) for row in rows]
+
+
+def _plan_publish(
+    catalog: Catalog,
+    area: str,
+    target_root: str,
+    overwrite: bool,
+    partitions: tuple[str, ...] | dict[str, tuple[str, ...]],
+    key: str,
+    notes: list[str],
+) -> list[tuple[str, str, bool, tuple[str, ...]]]:
+    """``(view, target, target_exists, partition columns)`` for every
+    `PUBLIC_TAG` view under `area` outside its draft, versions and reference
+    folders — see `CatalogSession.publish`. Checks every target and every
+    partition field first, so nothing is copied when one is refused."""
+    executor = catalog._executor  # noqa: SLF001 — same-package internal, as in _drop_entry
+    rest = catalog._catalog_rest  # noqa: SLF001
+    internal = tuple(f"{area}.{folder}." for folder in _NOT_PUBLISHED)
+    plan: list[tuple[str, str, bool, tuple[str, ...]]] = []
+    problems: list[str] = []
+    for number, (path, kind) in enumerate(rest.list_dataset_kinds(area.split(".")), start=1):
+        if kind != "VIEW" or path.startswith(internal):
+            continue
+        if PUBLIC_TAG not in rest.get_tags(path):
+            notes.append(f"skipped {path!r}: no {PUBLIC_TAG} tag")
+            continue
+        relative = path[len(area) + 1 :]
+        target = f"{target_root}.{relative}"
+        existed = operations._entry_exists(  # noqa: SLF001
+            executor, target, idempotency_key=f"{key}-check-{number}"
+        )
+        if existed and not overwrite:
+            problems.append(f"{target!r} already exists — pass overwrite=True")
+        fields = partitions.get(relative, ()) if isinstance(partitions, dict) else partitions
+        columns: tuple[str, ...] = ()
+        if fields:
+            # Dremio matches column names ignoring case; use the view's own spelling.
+            known = {
+                name.lower(): name
+                for name in _view_columns(
+                    executor, path, idempotency_key=f"{key}-columns-{number}"
+                )
+            }
+            missing = [field for field in fields if field.lower() not in known]
+            if missing:
+                problems.append(
+                    f"{path!r} has no field(s) {', '.join(missing)} to partition by "
+                    f"(its fields: {', '.join(known.values()) or 'none'})"
+                )
+            columns = tuple(known.get(field.lower(), field) for field in fields)
+        plan.append((path, target, existed, columns))
+    if isinstance(partitions, dict):
+        published = {view[len(area) + 1 :] for view, *_ in plan}
+        unknown = sorted(set(partitions) - published)
+        if unknown:
+            problems.append(
+                "partition_by names view(s) that are not published: "
+                + ", ".join(repr(view) for view in unknown)
+            )
+    if problems:
+        raise CatalogOperationError("nothing published: " + "; ".join(problems))
+    if not plan:
+        raise CatalogOperationError(
+            f"{area!r} has no views tagged {PUBLIC_TAG!r} — run update_latest_release first"
+        )
+    return plan
+
+
+# Where publish keeps a copy of each table it replaces until the publish is done:
+# a sibling of the Area's own folder in the bucket.
+_BACKUP_SUFFIX = "__publish_backup"
+
+
+class _Publication:
+    """One `CatalogSession.publish` run: back up, copy, verify — or roll back.
+
+    `run` first backs up every target that already exists, then publishes each
+    view. Any failure drops every table it touched, restores the replaced ones
+    from their backups and raises `CatalogOperationError`; the backups are
+    dropped at the end either way, unless one could not be restored."""
+
+    def __init__(self, executor: SqlExecutor, backup_root: str, key: str) -> None:
+        self._executor = executor
+        self._target_root, _, _ = backup_root.partition(_BACKUP_SUFFIX)
+        self._backup_root = backup_root
+        self._key = key
+        self._statement = 0
+        self.touched: list[str] = []  # targets dropped or created, in order
+        self.backups: list[tuple[str, str]] = []  # (target, its backup)
+        self.created: list[str] = []  # targets that did not exist before
+
+    def run(
+        self, plan: list[tuple[str, str, bool, tuple[str, ...]]], notes: list[str]
+    ) -> None:
+        current = "the backups"
+        try:
+            for _, target, existed, _ in plan:
+                if existed:
+                    current = f"the backup of {target!r}"
+                    backup = self._backup_of(target)
+                    self.backups.append((target, backup))
+                    self._copy(target, backup, ())
+            for view, target, existed, columns in plan:
+                current = f"{view!r} to {target!r}"
+                self.touched.append(target)
+                rows = self._copy(view, target, columns)
+                if not existed:
+                    self.created.append(target)
+                action = "replaced" if existed else "copied"
+                by = f", partitioned by {', '.join(columns)}" if columns else ""
+                notes.append(f"{action} {target!r} from {view!r} ({rows} rows{by})")
+        except Exception as exc:
+            kept = self._roll_back()
+            restored = len(self.backups) - len(kept)
+            outcome = (
+                f"rolled back: every table it touched was dropped and {restored} replaced "
+                "table(s) restored"
+                if not kept
+                else "rollback incomplete — restore these by hand from their backups: "
+                + "; ".join(f"{target!r} from {backup!r}" for target, backup in kept)
+            )
+            raise CatalogOperationError(f"publishing {current} failed: {exc}; {outcome}") from exc
+        problems = self._drop_backups([backup for _, backup in self.backups])
+        notes.extend(f"could not drop backup {problem}" for problem in problems)
+
+    def drop_published(self) -> None:
+        """Undo: drop the tables this publish created (only reversible ones)."""
+        for table in reversed(self.created):
+            self._sql(f"DROP TABLE IF EXISTS {_quote(table)}")
+
+    # -- internals ----------------------------------------------------------
+
+    def _backup_of(self, target: str) -> str:
+        return f"{self._backup_root}{target[len(self._target_root) :]}"
+
+    def _sql(self, statement: str) -> None:
+        self._statement += 1
+        self._executor.execute(statement, idempotency_key=f"{self._key}-{self._statement}")
+
+    def _copy(self, source: str, target: str, columns: tuple[str, ...]) -> int:
+        """Drop `target`, create it from `source` as Parquet, refresh it and
+        return its row count — raising if any of that fails."""
+        self._sql(f"DROP TABLE IF EXISTS {_quote(target)}")
+        partition = (
+            f"PARTITION BY ({', '.join(_quote_name(c) for c in columns)}) " if columns else ""
+        )
+        self._sql(
+            f"CREATE TABLE {_quote(target)} {partition}"
+            f"STORE AS (type => 'parquet') AS SELECT * FROM {_quote(source)}"
+        )
+        self._sql(f"ALTER TABLE {_quote(target)} REFRESH METADATA AUTO PROMOTION")
+        self._statement += 1
+        return _published_rows(
+            self._executor, target, idempotency_key=f"{self._key}-{self._statement}"
+        )
+
+    def _roll_back(self) -> list[tuple[str, str]]:
+        """Drop what was touched, restore what was replaced; the
+        ``(target, backup)`` pairs that could not be restored (kept)."""
+        for table in reversed(self.touched):
+            try:
+                self._sql(f"DROP TABLE IF EXISTS {_quote(table)}")
+            except Exception:  # noqa: BLE001, S112 — restoring below matters more
+                continue
+        replaced = set(self.touched)
+        kept: list[tuple[str, str]] = []
+        restored: list[str] = []
+        for target, backup in self.backups:
+            if target not in replaced:
+                restored.append(backup)  # never dropped: only its backup needs removing
+                continue
+            try:
+                self._copy(backup, target, ())
+                restored.append(backup)
+            except Exception:  # noqa: BLE001 — reported by the caller, backup kept
+                kept.append((target, backup))
+        self._drop_backups(restored)
+        return kept
+
+    def _drop_backups(self, backups: list[str]) -> list[str]:
+        """Drop `backups`; a ``'path': error`` for each that failed."""
+        problems: list[str] = []
+        for backup in backups:
+            try:
+                self._sql(f"DROP TABLE IF EXISTS {_quote(backup)}")
+            except Exception as exc:  # noqa: BLE001 — a leftover backup is reported, not fatal
+                problems.append(f"{backup!r}: {exc}")
+        return problems
+
+
 class CatalogSession:
     """Queue catalog verbs against `catalog`, then `commit()` them as one batch.
 
     Every queueing method (`data_copy`, `data_move`, `create_version`, `draft_to_version`,
-    `update_latest_release`, `create_view`, `set_tags`,
+    `update_latest_release`, `publish`, `create_view`, `set_tags`,
     `delete_tags`, `set_wiki`, `delete_wiki`, `create_folder`,
     `delete_folder`, `delete_view`, `delete_table`) only records the intent —
     nothing reaches Dremio until `commit()`. Each returns
@@ -387,6 +703,26 @@ class CatalogSession:
             )
         return f"{self._context}{path}"
 
+    def _resolve_target(self, source_path: str, target_path: str) -> tuple[str, str | None]:
+        """`data_copy`/`data_move`'s target: ``(the table path, the folder to
+        create first or None)``.
+
+        A `target_path` ending in ``/`` is a folder, resolved like any path
+        (``"archive/"``, ``".archive/"``, ``"../archive/"``, ``"./"`` for the
+        context itself): the table lands inside it under the source's own
+        name (``"archive/"`` -> ``{context}.archive.<source name>``), and the
+        folder is created when the step runs if it doesn't exist. Any other
+        `target_path` is resolved as usual and returned with no folder."""
+        if not isinstance(target_path, str) or not target_path.endswith("/"):
+            return self._resolve_path(target_path), None
+        stripped = target_path.rstrip("/")
+        if not stripped:
+            raise CatalogSessionError(
+                f"target_path {target_path!r} names no folder — use './' for the current context"
+            )
+        folder = self._resolve_path(stripped)
+        return f"{folder}.{source_path.rsplit('.', 1)[-1]}", folder
+
     def _resolve_parent_path(self, path: str) -> str:
         """The `..`/`../...` half of `_resolve_path` — walk `self._context`
         up one level per leading `../` (or the single `..`), then append
@@ -428,25 +764,36 @@ class CatalogSession:
         `target_path` is gone the moment this step runs; there is nothing to
         restore, so this step cannot be undone (see `CatalogCommitError`).
 
+        A `target_path` ending in ``/`` names a folder: the copy lands inside
+        it under the source's own name, and the folder (every missing level)
+        is created first — see `_resolve_target`. Undo deletes the folders
+        it created, too.
+
         Either path may be relative — with or without a leading `.` — to the session's
         current context — see `set_context`. Does not change the context itself — only
         `use` does that."""
         source_path = self._resolve_path(source_path)
-        target_path = self._resolve_path(target_path)
+        target_path, folder = self._resolve_target(source_path, target_path)
 
         def run(catalog: Catalog, key: str) -> _Undo | None:
-            catalog.datacopy(
-                source_path,
-                target_path,
-                overwrite=overwrite,
-                create_target_folder=create_target_folder,
-                idempotency_key=key,
-            )
+            created = _create_folders(catalog, folder)
+            try:
+                catalog.datacopy(
+                    source_path,
+                    target_path,
+                    overwrite=overwrite,
+                    create_target_folder=create_target_folder,
+                    idempotency_key=key,
+                )
+            except Exception:
+                _delete_folders(catalog, created, idempotency_key=f"{key}-cleanup")
+                raise
             if overwrite:
                 raise _Irreversible("overwrote an existing target; its previous content is gone")
 
             def undo() -> None:
                 _drop_entry(catalog, target_path, idempotency_key=f"{key}-undo")
+                _delete_folders(catalog, created, idempotency_key=f"{key}-undo-folder")
 
             return undo
 
@@ -465,23 +812,29 @@ class CatalogSession:
         to create a view over `source_path` without touching it. Reversible
         only when `overwrite=False` — undo is a `data_move` back from
         `target_path` to `source_path`. Same `overwrite=True` limitation as
-        `data_copy`.
+        `data_copy`. A `target_path` ending in ``/`` names a folder, created
+        first if missing, as in `data_copy`; undo deletes it again.
 
         Either path may be relative — with or without a leading `.` — to the session's
         current context — see `set_context`. Does not change the context itself — only
         `use` does that."""
         source_path = self._resolve_path(source_path)
-        target_path = self._resolve_path(target_path)
+        target_path, folder = self._resolve_target(source_path, target_path)
 
         def run(catalog: Catalog, key: str) -> _Undo | None:
-            catalog.datamove(
-                source_path,
-                target_path,
-                entry_type="TABLE",
-                overwrite=overwrite,
-                create_target_folder=create_target_folder,
-                idempotency_key=key,
-            )
+            created = _create_folders(catalog, folder)
+            try:
+                catalog.datamove(
+                    source_path,
+                    target_path,
+                    entry_type="TABLE",
+                    overwrite=overwrite,
+                    create_target_folder=create_target_folder,
+                    idempotency_key=key,
+                )
+            except Exception:
+                _delete_folders(catalog, created, idempotency_key=f"{key}-cleanup")
+                raise
             if overwrite:
                 raise _Irreversible("overwrote an existing target; its previous content is gone")
 
@@ -493,6 +846,7 @@ class CatalogSession:
                     overwrite=False,
                     idempotency_key=f"{key}-undo",
                 )
+                _delete_folders(catalog, created, idempotency_key=f"{key}-undo-folder")
 
             return undo
 
@@ -718,9 +1072,15 @@ class CatalogSession:
         ``overwrite=False`` makes it an error instead. An existing table is
         always an error — a view never replaces one.
 
+        Each view gets the `PUBLIC_TAG` (``#public``) tag, keeping any others,
+        and the tag is removed from every table and view under the Area's
+        ``versions`` folder — so only the latest release is public. `publish`
+        then copies the tagged views out.
+
         Undo drops the views this step created and the folders it created
-        for them. A view it replaced cannot be restored, so a step that
-        replaced any is irreversible (see `CatalogCommitError`)."""
+        for them, and puts back the tags it removed under ``versions``. A
+        view it replaced cannot be restored, so a step that replaced any is
+        irreversible (see `CatalogCommitError`)."""
         if not isinstance(version_name, str) or not version_name.strip():
             raise CatalogSessionError("version_name must not be empty")
         version_name = version_name.strip()
@@ -728,20 +1088,9 @@ class CatalogSession:
             raise CatalogSessionError(
                 f"version_name must be a single folder name, without '.' or '/': {version_name!r}"
             )
-        dataflow = self._require_dataflow_context()
+        dataflow = self._require_area()
         versions = f"{dataflow}.{VERSIONS_FOLDER}"
         version = f"{versions}.{version_name}"
-        missing = [
-            name
-            for name in (DRAFT_FOLDER, VERSIONS_FOLDER)
-            if not self._is_folder(f"{dataflow}.{name}")
-        ]
-        if missing:
-            raise CatalogSessionError(
-                f"{dataflow!r} is not an Area folder: it has no "
-                + " and no ".join(repr(name) for name in missing)
-                + " folder just below it — use() the Area folder first"
-            )
         if not self._is_folder(version):
             raise CatalogSessionError(f"{version!r} does not exist, or is not a folder")
         step = _Step(
@@ -753,8 +1102,11 @@ class CatalogSession:
             plan = _plan_version_views(catalog, dataflow, version, overwrite, key, step.notes)
             new_views: list[str] = []
             new_folders: list[str] = []
+            untagged: list[tuple[str, list[str]]] = []
 
             def undo() -> None:
+                for number, (path, tags) in enumerate(untagged, start=1):
+                    catalog.settagsto(path, tags, idempotency_key=f"{key}-undo-tag-{number}")
                 for number, view in enumerate(new_views, start=1):
                     _drop_entry(catalog, view, idempotency_key=f"{key}-undo-{number}")
                 for folder in reversed(new_folders):
@@ -772,12 +1124,20 @@ class CatalogSession:
                         step.notes.append(f"replaced view {target!r}")
                     else:
                         new_views.append(target)
+                for number, (_, target, _) in enumerate(plan, start=1):
+                    _add_tag(catalog, target, PUBLIC_TAG, idempotency_key=f"{key}-tag-{number}")
+                _remove_tag_under(catalog, versions, PUBLIC_TAG, untagged, key=f"{key}-untag")
             except Exception as exc:
                 try:
                     undo()
                 except Exception as cleanup_error:  # noqa: BLE001 — the original failure is raised
                     exc.add_note(f"cleanup failed, check {dataflow!r} by hand: {cleanup_error}")
                 raise
+            if untagged:
+                step.notes.append(
+                    f"removed {PUBLIC_TAG!r} from {len(untagged)} table(s)/view(s) "
+                    f"under {versions!r}"
+                )
             replaced = sum(existed for _, _, existed in plan)
             if replaced:
                 raise _Irreversible(f"replaced {replaced} existing view(s)")
@@ -787,6 +1147,151 @@ class CatalogSession:
         self._steps.append(step)
         return self
 
+    def publish(
+        self,
+        path: str | None = None,
+        *,
+        overwrite: bool = True,
+        partition_by: PartitionBy | None = None,
+    ) -> CatalogSession:
+        """Queue a copy of every released view of a dataflow into the public
+        bucket: each view under the dataflow folder tagged `PUBLIC_TAG` (``#public``,
+        as `update_latest_release` leaves them) becomes a table at
+        ``PUBLIC_ROOT.<the view's full catalog path>`` —
+        ``catalog.<domain>.<subdomain>.<dataflow>.eu_sdg_06_30.monitoringsites``
+        is copied to ``public_s3."dh-prod-data-public".catalog.<domain>.
+        <subdomain>.<dataflow>.eu_sdg_06_30.monitoringsites``.
+
+        The dataflow folder is `path` when given — resolved like any path,
+        absolute or relative to the context — else the context `use` set; with
+        neither (no `use` yet, the context still the catalog root),
+        `CatalogSessionError`. It must be a dataflow folder: one with
+        ``draft``, ``versions`` and ``reference`` (or ``references``) folders
+        just below it — checked now, `CatalogSessionError` otherwise. When the
+        step runs, it is listed: everything inside its ``draft``,
+        ``versions`` and ``reference``/``references`` folders, and every
+        table, is ignored; views without the
+        tag are skipped (the commit report's `notes` say which), and no
+        tagged view at all is an error. Every target is checked before
+        anything is copied: an existing one is replaced (``overwrite=True``,
+        the default — republishing after a new release is the normal use);
+        ``overwrite=False`` makes it an error instead.
+
+        Each copy is ``DROP TABLE IF EXISTS <target>`` — always, since a
+        bucket folder Dremio has not promoted is not seen by the check above
+        — then ``CREATE TABLE <target> STORE AS (type => 'parquet') AS SELECT
+        * FROM <view>``, so the bucket holds plain Parquet files, then
+        ``ALTER TABLE <target> REFRESH METADATA AUTO PROMOTION``, and finally a
+        ``SELECT COUNT(*)`` on it: a table that can't be read is a failure.
+        The notes give each row count.
+
+        All or nothing: before anything is replaced, every existing target is
+        copied to ``PUBLIC_ROOT.<dataflow path>__publish_backup.<same path>`` (and read
+        back). If any table then fails, every table this publish touched is
+        dropped, the replaced ones are copied back from their backups, and a
+        `CatalogOperationError` says which table failed and that everything
+        was rolled back. The backups are dropped once the publish succeeds or
+        is rolled back; one that could not be restored is kept, and the error
+        names it. A restored table is not partitioned, whatever it was before.
+
+        `partition_by` (optional) partitions the Parquet tables by existing
+        fields — ``PARTITION BY ("f1", "f2")`` in the ``CREATE TABLE``, in the
+        order given (a set is sorted, having no order of its own). A list
+        applies to every published view, so each must have those fields; a
+        dict gives each view its own, keyed by its path below the Area
+        (``{"eu_sdg.monitoringsites": ["year"]}``), and views it doesn't name
+        are not partitioned. Names are matched ignoring case. The fields are
+        checked against the views now, when `publish` is called: a missing
+        field, or a dict key that names no published view, raises
+        `CatalogSessionError` and nothing is queued. They are checked again
+        when the step runs, before anything is dropped or copied.
+
+        Undo (a later step of the same commit failing) drops the tables this
+        step created. The backups are gone by then, so a step that replaced
+        any table is irreversible (see `CatalogCommitError`)."""
+        partitions = _partition_plan(partition_by)
+        area = self._require_publish_dataflow(path)
+        target_root = f"{PUBLIC_ROOT}.{area}"
+        if partitions:
+            # Fields are checked now, so a typo fails here rather than at commit.
+            try:
+                _plan_publish(
+                    self._catalog, area, target_root, True, partitions, self._key("-fields"), []
+                )
+            except (CatalogOperationError, EngineStartingError, CatalogAuthError) as exc:
+                raise CatalogSessionError(str(exc)) from exc
+        step = _Step(
+            f"publish the {PUBLIC_TAG} views of {area!r} to {target_root!r}",
+            lambda catalog, key: None,  # replaced below, once `step` exists to report into
+        )
+
+        def run(catalog: Catalog, key: str) -> _Undo | None:
+            plan = _plan_publish(
+                catalog, area, target_root, overwrite, partitions, key, step.notes
+            )
+            publication = _Publication(
+                catalog._flight_executor,  # noqa: SLF001 — Flight, as Catalog.datacopy
+                f"{target_root}{_BACKUP_SUFFIX}",
+                key,
+            )
+            publication.run(plan, step.notes)
+            replaced = sum(existed for _, _, existed, _ in plan)
+            if replaced:
+                raise _Irreversible(f"replaced {replaced} published table(s)")
+            return publication.drop_published
+
+        step.run = run
+        self._steps.append(step)
+        return self
+
+    def _require_publish_dataflow(self, path: str | None) -> str:
+        """`publish`'s dataflow folder: `path` resolved, or the context `use`
+        set — checked against Dremio to have draft, versions and reference
+        folders just below it."""
+        if path is not None:
+            if not isinstance(path, str) or not path.strip(" ./"):
+                raise CatalogSessionError(f"path must be a catalog folder path, not {path!r}")
+            dataflow = self._resolve_path(path.strip())
+        elif self._context is None or self._context == _ROOT_SOURCE:
+            raise CatalogSessionError(
+                "no dataflow folder: run %catalog use(...) on the dataflow folder (the one with "
+                "draft, versions and reference folders) first, or pass path=, e.g. "
+                'publish(path="catalog.<domain>.<subdomain>.<dataflow>")'
+            )
+        else:
+            dataflow = self._context
+        missing = [
+            name
+            for name in (DRAFT_FOLDER, VERSIONS_FOLDER)
+            if not self._is_folder(f"{dataflow}.{name}")
+        ]
+        if not any(self._is_folder(f"{dataflow}.{name}") for name in _REFERENCE_FOLDERS):
+            missing.append(REFERENCE_FOLDER)
+        if missing:
+            raise CatalogSessionError(
+                f"{dataflow!r} is not a dataflow folder: it has no "
+                + " and no ".join(repr(name) for name in missing)
+                + " folder just below it — use() the dataflow folder, or pass path="
+            )
+        return dataflow
+
+    def _require_area(self) -> str:
+        """The context, checked against Dremio to be an Area folder: one with
+        both a ``draft`` and a ``versions`` folder just below it."""
+        area = self._require_dataflow_context()
+        missing = [
+            name
+            for name in (DRAFT_FOLDER, VERSIONS_FOLDER)
+            if not self._is_folder(f"{area}.{name}")
+        ]
+        if missing:
+            raise CatalogSessionError(
+                f"{area!r} is not an Area folder: it has no "
+                + " and no ".join(repr(name) for name in missing)
+                + " folder just below it — use() the Area folder first"
+            )
+        return area
+
     def _is_folder(self, path: str) -> bool:
         """Whether `path` is a folder, checked against Dremio now."""
         try:
@@ -795,8 +1300,7 @@ class CatalogSession:
             raise CatalogSessionError(f"could not check whether {path!r} exists: {exc}") from exc
 
     def _require_dataflow_context(self) -> str:
-        """The context — whether it is an Area folder is checked by
-        `update_latest_release` itself."""
+        """The context — whether it is an Area folder is checked by `_require_area`."""
         if self._context is None:
             raise CatalogSessionError(
                 "no context is set — use() the Area folder "
