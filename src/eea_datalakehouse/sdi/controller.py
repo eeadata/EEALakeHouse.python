@@ -3,6 +3,7 @@
 =================================  ================================================
 :meth:`SdiController.get_xml`      download a record's ISO 19115-3 XML from SDI
 :meth:`SdiController.resolve_series`  a series UUID's current release UUID
+:meth:`SdiController.validate`     check a file against the ISO 19115-3 XSD
 =================================  ================================================
 
 Pushing a record to DDS is :class:`~eea_datalakehouse.dds_documents.DdsController`'s
@@ -15,11 +16,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import TracebackType
+from typing import Any
 
-from . import iso
+from . import iso, validation
 from .catalogue import SdiCatalogue
 from .errors import NotCurrentError, NotIso19115_3
 from .iso import IsoRecord
+from .validation import SdiValidation
 
 XML_CONTENT_TYPE = "application/xml"
 
@@ -141,6 +144,16 @@ class SdiController:
         if len(current) != 1:
             raise NotCurrentError(series_uuid, candidates)
         return current[0].uuid
+
+    def validate(self, source: Any) -> SdiValidation:
+        """Check ``source`` against the ISO 19115-3 XSD; needs no SDI access.
+
+        ``source`` is a local file path, XML ``bytes`` or an :class:`SdiMetadata`.
+        The result is truthy when the file is valid and lists every schema
+        error (line, message, element path) when it is not; see
+        :func:`eea_datalakehouse.sdi.validation.validate`.
+        """
+        return validation.validate(source)
 
 
 def _require_uuid(uuid: str) -> str:

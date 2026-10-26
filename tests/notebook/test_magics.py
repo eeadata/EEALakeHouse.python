@@ -7,6 +7,7 @@ provides just as well.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -337,6 +338,14 @@ def test_catalog_help_lists_methods_without_needing_credentials(
     # create_view: a real command now, alongside data_move (which lost
     # entry_type — it always moves as a TABLE; create_view covers the VIEW case).
     assert "create_view" in table_html
+    assert ">publish<" in table_html and "dh-prod-data-public" in table_html
+    # data_copy/data_move (not create_view) explain a target_path ending in '/'.
+    assert table_html.count("A target_path ending in / is a folder") == 2
+    assert "Each view is tagged #public" in table_html
+    assert "partition_by (optional) partitions the tables" in table_html
+    publish_row = table_html[table_html.index(">publish<") : table_html.index(">list<")]
+    for detail in ("CTAS", "CREATE TABLE", "STORE AS", "parquet", "Parquet", "DROP TABLE"):
+        assert detail not in publish_row  # how tables are made is not the user's concern
     assert "leaving source_path untouched" in table_html
     assert "always as a TABLE" in table_html
     assert "entry_type" not in table_html  # no longer part of data_move's vocabulary
@@ -442,6 +451,16 @@ def test_sdi_session_error_is_printed_not_raised(
     assert ip.run_line_magic("sdi", 'get_xml("")') is None
 
     assert "sdi error: uuid must not be empty" in capsys.readouterr().out
+
+
+def test_sdi_validate_runs_on_a_real_session_and_prints_a_missing_file(
+    ip: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = tmp_path / "nope.xml"
+
+    assert ip.run_line_magic("sdi", f"validate({str(missing)!r})") is None
+
+    assert f"sdi error: no file {str(missing)!r}" in capsys.readouterr().out
 
 
 def test_dds_push_without_a_context_is_printed_not_raised(
@@ -677,6 +696,7 @@ def test_sdi_help_lists_methods_without_building_a_session(
     assert "SDI_API_URL" in out
     table_html = displayed[0].data
     assert ">get_xml<" in table_html and ">resolve_series<" in table_html
+    assert ">validate<" in table_html
     assert ">push_to_dds<" not in table_html  # pushing is %dds's job
     assert _magics_instance(ip)._sdi_session is None
 
