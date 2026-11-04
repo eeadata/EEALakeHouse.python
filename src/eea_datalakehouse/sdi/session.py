@@ -2,6 +2,7 @@
 
     sdi = SdiSession()                         # %sdi — reads the SDI catalogue
     sdi.get_xml("070d9baa-448d-4168-8514-7dadb3ad876d")
+    sdi.validate("metadata/070d9baa-448d-4168-8514-7dadb3ad876d.xml")
 
 - **`SdiSession` remembers the last record** `get_xml` fetched (`last`).
   Pushing it to DDS is `%dds`'s job (`eea_datalakehouse.dds_documents.session`):
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from typing import Any
 
 import httpx
 
@@ -25,11 +27,12 @@ from ..session_utils import call_usage, friendly_errors
 from .catalogue import SdiCatalogue
 from .controller import SdiController, SdiMetadata
 from .errors import SdiError
+from .validation import SdiValidation, validate
 
 __all__ = ["SdiSession", "SdiSessionError", "call_usage"]
 
 # Failures a notebook user can act on; anything else is a bug and keeps its traceback.
-_EXPECTED = (SdiError, ValueError, TypeError, httpx.HTTPError)
+_EXPECTED = (SdiError, ValueError, TypeError, OSError, httpx.HTTPError)
 
 
 class SdiSessionError(RuntimeError):
@@ -40,7 +43,7 @@ _friendly = friendly_errors(SdiSessionError, _EXPECTED)
 
 
 class SdiSession:
-    """`get_xml` / `resolve_series` for a notebook — what `%sdi` dispatches onto.
+    """`get_xml` / `resolve_series` / `validate` for a notebook — what `%sdi` dispatches onto.
 
     Reads the SDI catalogue only; pushing to DDS is `%dds`'s job.
     ``controller`` is built from the kernel environment if not given (see the
@@ -76,6 +79,11 @@ class SdiSession:
     def resolve_series(self, series_uuid: str) -> str:
         """The UUID of the one release of `series_uuid` that is not superseded."""
         return self._sdi().resolve_series(series_uuid)
+
+    @_friendly
+    def validate(self, source: Any) -> SdiValidation:
+        """Check a local file (or a `get_xml` record) against the ISO 19115-3 XSD."""
+        return validate(source)
 
     # -- internals --------------------------------------------------------
 

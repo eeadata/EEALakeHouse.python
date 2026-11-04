@@ -10,6 +10,7 @@ import pytest
 from eea_datalakehouse.catalog import retry_state
 from eea_datalakehouse.catalog.client import Catalog
 from eea_datalakehouse.catalog.session import (
+    PUBLIC_TAG,
     CatalogCommitError,
     CatalogSession,
     CatalogSessionError,
@@ -308,3 +309,52 @@ def test_slash_context_is_accepted() -> None:
     _session(rest, dremio, "catalog/water/surface/bod_rivers").update_latest_release("v1").commit()
 
     assert f"{DATAFLOW}.summary" in _views(dremio)
+
+
+# -- #public tag ------------------------------------------------------------------
+
+
+def test_each_view_is_tagged_public() -> None:
+    rest, dremio = _world()
+
+    _session(rest, dremio).update_latest_release("v1").commit()
+
+    for view in _views(dremio):
+        assert rest.get_tags(view) == [PUBLIC_TAG]
+
+
+def _with_older_version(rest: FakeCatalogRest, dremio: ViewDremio) -> str:
+    older = f"{VERSIONS}.v0.summary"
+    rest.existing.add(f"{VERSIONS}.v0")
+    rest.folders.add(f"{VERSIONS}.v0")
+    dremio.tables[older] = "TABLE"
+    rest.existing.add(older)
+    rest.set_tags(older, [PUBLIC_TAG, "reviewed"])
+    rest.set_tags(f"{VERSION}.summary", [PUBLIC_TAG])
+    return older
+
+
+def test_the_tag_is_removed_from_everything_under_versions() -> None:
+    rest, dremio = _world()
+    older = _with_older_version(rest, dremio)
+
+    report = _session(rest, dremio).update_latest_release("v1").commit()
+
+    assert rest.get_tags(older) == ["reviewed"]
+    assert rest.get_tags(f"{VERSION}.summary") == []
+    assert f"removed '{PUBLIC_TAG}' from 2 table(s)/view(s) under '{VERSIONS}'" in report.notes
+
+
+def test_rollback_puts_the_version_tags_back() -> None:
+    rest, dremio = _world()
+    older = _with_older_version(rest, dremio)
+    session = _session(rest, dremio)
+
+    session.update_latest_release("v1")
+    session.set_tags("catalog.water.missing", ["x"])
+    with pytest.raises(CatalogCommitError) as info:
+        session.commit()
+
+    assert info.value.rolled_back is True
+    assert rest.get_tags(older) == [PUBLIC_TAG, "reviewed"]
+    assert rest.get_tags(f"{VERSION}.summary") == [PUBLIC_TAG]
