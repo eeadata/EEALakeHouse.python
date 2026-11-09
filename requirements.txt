@@ -3,7 +3,7 @@ pyarrow>=25                 # parquet writer + the Arrow types the ingest lane e
 openpyxl>=3.1,<4            # .xlsx reader — handles sparse cells correctly (see bathing_water/README.md)
 xlrd>=2.0,<3                # legacy .xls, some older SDI deliveries
 lxml>=5.2,<7                # ISO 19115-3 metadata records
-duckdb>=1.1,<2              # validate parquet with SQL before it ever leaves the machine
+duckdb>=1.1,<3              # validate parquet with SQL before it ever leaves the machine
 
 # --- geometry: source encoding in, WKB out (see CLAUDE.md) -----------------
 # shapely 2.x only — the from_wkt/from_geojson/to_wkb vectorised API the
