@@ -1,3 +1,4 @@
 {
-    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python3"
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python3",
+    "python-envs.defaultEnvManager": "ms-python.python:system"
 }
